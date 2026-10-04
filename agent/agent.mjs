@@ -361,15 +361,18 @@ async function removeLeftovers(desired) {
   }
 }
 
+let rtt = null; // how long the last check-in took, machine to control plane and back: sent with the next one, shown as the machine's latency
 async function sync() {
   const status = Object.fromEntries([...projects].map(([name, p]) => [name, { v: p.v, s: p.s, e: p.e || undefined }]));
   const sent = metrics.payload();
+  const t0 = Date.now();
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
     method: "POST",
     headers: { authorization: `Bearer ${env.JOIN_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify({ machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent }),
+    body: JSON.stringify({ machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt }),
     signal: AbortSignal.timeout(15_000),
   });
+  rtt = Date.now() - t0;
   if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   metrics.confirm(sent);
   return res.json();

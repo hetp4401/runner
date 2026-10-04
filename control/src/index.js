@@ -512,6 +512,7 @@ export class Control {
       `CREATE TABLE IF NOT EXISTS metrics_1h (t INTEGER PRIMARY KEY, data TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS app_passwords (name TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, updated INTEGER NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS app_env (name TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated INTEGER NOT NULL, PRIMARY KEY (name, key))`,
+      `CREATE TABLE IF NOT EXISTS geo (ip TEXT PRIMARY KEY, text TEXT, at INTEGER NOT NULL)`,
     ]) {
       this.sql.exec(query);
     }
@@ -562,6 +563,8 @@ export class Control {
     this.lastRebalance = 0;
     this.failures = new Map(); // "address|fleet" or "address|app:<name>" -> { n, at }: wrong passwords
     this.appPasswords = new Map(this.all("SELECT name, salt, hash FROM app_passwords").map((x) => [x.name, x])); // never sent out
+    this.geo = new Map(this.all("SELECT ip, text, at FROM geo").map((x) => [x.ip, x])); // where an address is (see locate)
+    this.geoPending = new Set();
     this.appEnv = new Map(); // project -> Map(key -> value), its env (see putEnv): sent to machines in .env, never out to the API
     for (const x of this.all("SELECT name, key, value FROM app_env ORDER BY key")) {
       (this.appEnv.get(x.name) ?? this.appEnv.set(x.name, new Map()).get(x.name)).set(x.key, x.value);
@@ -813,7 +816,7 @@ export class Control {
     if (method === "GET" && route === "/status") return json(this.status());
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
-    if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body()));
+    if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip));
     if (method === "POST" && route === "/claim") {
       need(node, "the join token");
       const pool = url.searchParams.get("pool");
@@ -1539,7 +1542,7 @@ export class Control {
 
   // ---- machines ----
 
-  sync(body) {
+  sync(body, ip = null) {
     const now = Date.now();
     // Every machine silent for longer than the liveness window: this was unreachable, so give the fleet time to show
     // up again before anything counts as gone or gets placed (see SETTLE_MS).
@@ -1576,6 +1579,13 @@ export class Control {
       if (changed || now - r.savedSeen > 5 * 60_000) this.saveRun(r);
     }
     this.takeMetrics(r, body.metrics, now);
+    // What the pages show about the machine itself: its latency (the agent's last round trip here) and where it is.
+    const rtt = Number(body.rtt);
+    if (Number.isFinite(rtt) && rtt >= 0) r.rtt = Math.min(60_000, Math.round(rtt));
+    if (ip) {
+      r.ip = ip;
+      r.location = this.locate(ip) ?? r.location ?? null;
+    }
     if (body.leaving && !r.retire) {
       r.retire = 1; // going away for good: its replicas can be placed elsewhere right now
       this.saveRun(r);
@@ -1599,6 +1609,32 @@ export class Control {
       handover,
       start,
     };
+  }
+
+  // Where a machine is, from the address it checks in from, as "City, Region, CC · Network" (null until a free geo-IP
+  // lookup has answered; cached, one lookup per address, never retried within a run of this process once it failed).
+  locate(ip) {
+    if (!ip || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd])/i.test(ip)) return null;
+    const hit = this.geo.get(ip);
+    if (hit) return hit.text ?? null;
+    if (this.geoPending.has(ip) || this.geoPending.size >= 20) return null;
+    this.geoPending.add(ip);
+    fetch(`http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,message,city,regionName,countryCode,org`, { signal: AbortSignal.timeout(6000) })
+      .then((res) => res.json())
+      .then((g) => {
+        if (g?.status !== "success") throw new Error(g?.message || "no answer");
+        const place = [g.city, g.regionName, g.countryCode].filter(Boolean).join(", ");
+        const text = [place, g.org].filter(Boolean).join(" · ").slice(0, 120) || null;
+        this.geo.set(ip, { ip, text, at: Date.now() });
+        this.sql.exec("INSERT OR REPLACE INTO geo (ip, text, at) VALUES (?, ?, ?)", ip, text, Date.now());
+        for (const r of this.runs.values()) if (r.ip === ip) r.location = text;
+      })
+      .catch((e) => {
+        console.log(`geo lookup for a machine's address failed: ${e.message}`);
+        this.geo.set(ip, { ip, text: null, at: Date.now() }); // not written: tried again after a restart
+      })
+      .finally(() => this.geoPending.delete(ip));
+    return null;
   }
 
   // A run can go once a newer run of the same machine is online and healthy on everything it should run.
@@ -1829,6 +1865,7 @@ export class Control {
     this.sql.exec("DELETE FROM metrics_1m WHERE t < ?", now - KEEP_1M_MS);
     this.sql.exec("DELETE FROM metrics_10m WHERE t < ? AND t < ?", now - KEEP_10M_MS, Number(this.settings.get("rolled60") ?? 0)); // once rolled into hours
     this.sql.exec("DELETE FROM metrics_1h WHERE t < ?", now - KEEP_1H_MS);
+    this.sql.exec("DELETE FROM geo WHERE at < ?", now - 30 * 86400_000);
     for (const r of this.runs.values()) {
       if (now - r.seen > 2 * 3600_000) {
         this.runs.delete(r.id);
@@ -2006,6 +2043,8 @@ export class Control {
           pool: r.pool ?? null,
           draining: Boolean(r.drain),
           label: r.label,
+          rtt: r.rtt ?? null, // ms, the agent's last check-in round trip: the machine's latency to the control plane
+          location: r.location ?? null,
           projects: r.status,
         })),
     };
