@@ -1599,7 +1599,7 @@ function vEditor(name, sample) {
     html: `<a class="back" href="${name ? appHref(name) : "#/apps"}">← ${name ? esc(name) : "Apps"}</a>
       <h1>${name ? `Edit ${esc(name)}` : "New app"}</h1>
       <div class="sub">${name ? `Deploying makes a new version, and every replica switches to it. If it fails, its page shows each machine's error; edit it again, or roll back from Versions.${locked(name)
-          ? " You'll be asked for its password (or the admin password) when you deploy." : ""}`
+          ? " The password typed to open this editor is used to deploy." : ""}`
         : "An app is a Docker Compose file, a Dockerfile, or both, plus any text files the build needs."}</div>
       ${name ? "" : `<div class="row" style="margin-top:12px"><span class="meta">Start from an example:</span><button type="button" class="small" data-act="sample" data-s="whoami">whoami (an image)</button><button type="button" class="small" data-act="sample" data-s="hello">hello (a Dockerfile)</button><a class="meta" href="#/guide">Deploy guide →</a></div>`}
       <div class="errbox" id="ed-error" role="alert" hidden></div>
@@ -1633,6 +1633,25 @@ function vEditor(name, sample) {
         <div class="formfoot">${name ? `<button type="button" data-act="changes">Show changes</button><span class="spacer"></span>` : ""}<a class="btn" href="${name ? appHref(name) : "#/apps"}">Cancel</a><button type="submit" class="primary" id="ed-save">Deploy</button></div>
       </form>`,
     async mount() {
+      // An app with a password: the editor shows only once the password (or the admin password) has been typed and
+      // checked with the control plane. Every opening asks, including through the browser's back and forward; the
+      // password then serves the deploy, and nothing outlives this view.
+      if (name) {
+        if (!S.status) await loadStatus();
+        if (locked(name)) {
+          const page = main.innerHTML;
+          main.innerHTML = `<a class="back" href="${appHref(name)}">← ${esc(name)}</a><h1>Edit ${esc(name)}</h1>
+            <p class="meta">${esc(name)} has an app password: editing it takes that password, or the admin password.</p>`;
+          const secret = await withPassword({ app: name }, async (sec) => {
+            await api("POST", sec.app ? `/projects/${enc(name)}/unlock` : "/unlock", null, { secret: sec });
+            return sec;
+          });
+          if (location.hash !== current) return; // left meanwhile
+          if (!secret) { location.hash = appHref(name); return; }
+          this.secret = secret;
+          main.innerHTML = page;
+        }
+      }
       dirty = false;
       const form = $("#ed-form");
       form.addEventListener("input", (e) => {
@@ -1668,7 +1687,12 @@ function vEditor(name, sample) {
         $("#ed-save").disabled = true;
         $("#ed-save").textContent = "Deploying…";
         try {
-          const p = name ? await withPassword({ app: n }, (secret) => api("PUT", `/projects/${enc(n)}`, body, { secret })) : await api("PUT", `/projects/${enc(n)}`, body);
+          const put = (secret) => api("PUT", `/projects/${enc(n)}`, body, { secret });
+          let p;
+          if (!name) p = await put({});
+          else if (this.secret) { // typed when the editor opened; asked for again only if it stopped working meanwhile
+            try { p = await put(this.secret); } catch (e) { if (e.status !== 401) throw e; p = await withPassword({ app: n }, put); }
+          } else p = await withPassword({ app: n }, put);
           if (!p) return;
           dirty = false;
           fast();
