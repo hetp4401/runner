@@ -643,8 +643,10 @@ export class Control {
     return Object.values(this.pools()).reduce((a, b) => a + Number(b), 0);
   }
 
+  // How many machines can have a slot (a tunnel each): MAX_SLOTS if it's set to a number above 0, else no cap.
   maxSlots() {
-    return Number(this.env.MAX_SLOTS ?? 50);
+    const n = Number(this.env.MAX_SLOTS);
+    return Number.isInteger(n) && n > 0 ? n : Infinity;
   }
 
   live(run, now) {
@@ -1110,7 +1112,7 @@ export class Control {
       const next = { ...JSON.parse(this.settings.get("pools") ?? "{}") };
       for (const [name, size] of Object.entries(pools)) {
         if (!/^[a-z0-9-]{1,30}$/.test(name)) throw new HttpError(400, "a pool name is lowercase letters, digits and dashes");
-        if (!(Number.isInteger(size) && size >= 0 && size <= this.maxSlots())) throw new HttpError(400, `a pool's size is 0-${this.maxSlots()}`);
+        if (!(Number.isInteger(size) && size >= 0 && size <= this.maxSlots())) throw new HttpError(400, Number.isFinite(this.maxSlots()) ? `a pool's size is 0-${this.maxSlots()}` : "a pool's size is a whole number, 0 or more");
         next[name] = size;
       }
       this.setSetting("pools", JSON.stringify(next));
