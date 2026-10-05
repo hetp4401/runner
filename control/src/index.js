@@ -229,10 +229,10 @@ function sandboxProblems(doc) {
       !(typeof s.network_mode === "string" && s.network_mode.startsWith("service:") && services.includes(s.network_mode.slice(8)))) {
       no(`${at}.network_mode`, `${s.network_mode}`);
     }
-    for (const h of [s.extra_hosts ?? []].flat()) if (JSON.stringify(h).includes("host-gateway")) no(`${at}.extra_hosts`, "host-gateway reaches the machine");
+    for (const h of [s.extra_hosts ?? []].flat()) if (JSON.stringify(h).includes("host-gateway")) no(`${at}.extra_hosts`, "host-gateway reaches the server");
     for (const p of [s.ports ?? []].flat()) {
       const host = isMap(p) ? p.published : String(p).split("/")[0].split(":").slice(-2, -1)[0];
-      if (String(host ?? "").includes("$") || RESERVED_PORTS.has(Number(host))) no(`${at}.ports`, `${JSON.stringify(p)}: that port is the machine's`);
+      if (String(host ?? "").includes("$") || RESERVED_PORTS.has(Number(host))) no(`${at}.ports`, `${JSON.stringify(p)}: that port is the server's`);
     }
     if (isMap(s.logging) && s.logging.driver && !["json-file", "local", "none"].includes(s.logging.driver)) no(`${at}.logging.driver`);
     if (isMap(s.deploy)) {
@@ -456,12 +456,12 @@ function buildSpec(body, { trusted = false } = {}) {
 // code comes from agentUrl (the repo's main branch unless AGENT_URL says otherwise).
 function installScript(origin, agentUrl) {
   return `#!/bin/sh
-# Adds this machine to the fleet at ${origin}. Needs Docker.
+# Adds this server to the fleet at ${origin}. Needs Docker.
 #   curl -fsSL ${origin}/install.sh | sudo JOIN_TOKEN=<token> sh
 # Optional: LABEL=<name> names it on the status pages (default: its hostname).
 # The agent runs in the container runner-agent, takes a free slot n, and runs the replicas placed on this
-# machine. It fetches the latest agent code each time it starts.
-# Remove the machine:  docker rm -f runner-agent tunnel router
+# server. It fetches the latest agent code each time it starts.
+# Remove the server:  docker rm -f runner-agent tunnel router
 set -eu
 : "\${JOIN_TOKEN:?set JOIN_TOKEN; the fleet's owner gets it from the Contribute page or with: runnerctl join-token}"
 DATA=\${RUNNER_DATA:-/var/lib/runner}
@@ -968,7 +968,7 @@ export class Control {
   putProject(name, body, { trusted = false } = {}) {
     if (!NAME.test(name)) throw new HttpError(400, "app names are lowercase letters, digits and dashes");
     if (!this.projects.has(name) && NUMBERED.test(name)) {
-      throw new HttpError(400, "an app name can't end in -<number> or -m<number>: those are the URLs of its replicas and machines");
+      throw new HttpError(400, "an app name can't end in -<number> or -m<number>: those are the URLs of its replicas and servers");
     }
     const p = this.projects.get(name);
     const latest = p && this.version(name, p.version);
@@ -1184,7 +1184,7 @@ export class Control {
       const group = [...newest.values()].filter((r) => this.runsOn(p.name, r.machine));
       if (!group.length) continue;
       const failed = group.find((r) => r.status[p.name]?.v === p.version && r.status[p.name]?.s === "failed");
-      if (failed) p.halted = `machine ${failed.machine}: ${failed.status[p.name].e || "failed"}`.slice(0, 600);
+      if (failed) p.halted = `server ${failed.machine}: ${failed.status[p.name].e || "failed"}`.slice(0, 600);
       else if (group.every((r) => r.status[p.name]?.v === p.version && r.status[p.name]?.s === "healthy")) p.stable = p.version;
       else continue;
       p.updated = now;
@@ -1303,7 +1303,7 @@ export class Control {
     if (moved.length) {
       x.ports = ports;
       x.reason = `${best.doubling ? `copy ${best.doubling + 1} on this machine, every machine having one; ` : ""}port${moved.length > 1 ? "s" : ""} ${moved.map(([a, b]) => `${a}→${b}`).join(", ")} moved aside; ${reason}`;
-    } else if (best.doubling) x.reason = `copy ${best.doubling + 1} on this machine, every machine having one; ${reason}`;
+    } else if (best.doubling) x.reason = `copy ${best.doubling + 1} on this server, every server having one; ${reason}`;
     return x;
   }
 
@@ -1312,9 +1312,9 @@ export class Control {
     const empty = [...up.keys()].filter((m) => !this.copiesOn(name, m).length);
     if (empty.length) {
       const clash = empty.map((m) => this.clash(name, m)).find(Boolean);
-      return clash ? `every other machine already has an app using ${clash.what} (${clash.other})` : "no machine can take it";
+      return clash ? `every other server already has an app using ${clash.what} (${clash.other})` : "no server can take it";
     }
-    return `every machine already runs it, and it can't run twice on one machine (${spec?.nodup ?? "its compose file"})`;
+    return `every server already runs it, and it can't run twice on one server (${spec?.nodup ?? "its compose file"})`;
   }
 
   // Host ports for a copy of a project on a machine: each of the project's published ports as it is when nothing on
@@ -1400,24 +1400,24 @@ export class Control {
     const now = Date.now();
     const onFrom = this.copiesOn(name, from);
     const x = replica != null ? onFrom.find((y) => y.replica === Number(replica)) : onFrom.find((y) => !y.leaving) ?? onFrom[0];
-    if (!x) throw new HttpError(400, replica != null ? `replica ${replica} of ${name} isn't on machine ${from}` : `${name} isn't placed on machine ${from}`);
-    if (x.leaving) throw new HttpError(409, `replica ${x.replica} of ${name} is already moving from machine ${from} to ${x.leaving.to}`);
+    if (!x) throw new HttpError(400, replica != null ? `replica ${replica} of ${name} isn't on server ${from}` : `${name} isn't placed on server ${from}`);
+    if (x.leaving) throw new HttpError(409, `replica ${x.replica} of ${name} is already moving from server ${from} to ${x.leaving.to}`);
     const spec = this.version(name, p.version);
     const up = this.liveMachines(now);
     let dest;
     if (to) {
       const m = Number(to);
-      if (!up.has(m)) throw new HttpError(400, `machine ${to} isn't up`);
-      if (m === from) throw new HttpError(400, `replica ${x.replica} of ${name} is on machine ${to} already`);
+      if (!up.has(m)) throw new HttpError(400, `server ${to} isn't up`);
+      if (m === from) throw new HttpError(400, `replica ${x.replica} of ${name} is on server ${to} already`);
       const doubling = this.copiesOn(name, m).length;
-      if (doubling && spec?.nodup) throw new HttpError(409, `machine ${to} already runs ${name}, which can't run twice on one machine (${spec.nodup})`);
+      if (doubling && spec?.nodup) throw new HttpError(409, `server ${to} already runs ${name}, which can't run twice on one server (${spec.nodup})`);
       const clash = this.clash(name, m);
-      if (clash) throw new HttpError(409, `machine ${to} already has ${clash.other}, which uses ${clash.what} too`);
-      dest = { machine: m, doubling, reason: `moved here from machine ${from} by hand` };
+      if (clash) throw new HttpError(409, `server ${to} already has ${clash.other}, which uses ${clash.what} too`);
+      dest = { machine: m, doubling, reason: `moved here from server ${from} by hand` };
     } else {
       const best = this.bestMachine(name, new Map([...up].filter(([m]) => m !== from)), this.placementCounts(), now);
-      if (!best) throw new HttpError(409, `no other machine is up for ${name}`);
-      dest = { ...best, reason: `moved here from machine ${from}: ${best.reason}` };
+      if (!best) throw new HttpError(409, `no other server is up for ${name}`);
+      dest = { ...best, reason: `moved here from server ${from}: ${best.reason}` };
     }
     this.saveCopy(name, this.newCopy(name, spec, x.replica, dest, now, dest.reason));
     this.saveCopy(name, { ...x, leaving: { to: dest.machine, at: now } });
@@ -1493,12 +1493,12 @@ export class Control {
       try {
         this.move(name, from, String(dest.machine), replica);
         const x = this.copiesOn(name, dest.machine).find((y) => y.replica === replica);
-        x.reason = `moved here from machine ${from} automatically: ${why}; ${reasonOnDest}`;
+        x.reason = `moved here from server ${from} automatically: ${why}; ${reasonOnDest}`;
         this.saveCopy(name, x);
         if (cooldown) this.autoMoved.set(name, now);
-        this.logRebalance(now, `moved replica ${replica} of ${name} from machine ${from} to machine ${dest.machine}: ${why}`);
+        this.logRebalance(now, `moved replica ${replica} of ${name} from server ${from} to server ${dest.machine}: ${why}`);
       } catch (e) {
-        this.logRebalance(now, `couldn't move replica ${replica} of ${name} off machine ${from}: ${e.message}`);
+        this.logRebalance(now, `couldn't move replica ${replica} of ${name} off server ${from}: ${e.message}`);
       }
     };
     // First: a machine running two or more copies of a project while a settled machine with room runs none of it.
@@ -1512,7 +1512,7 @@ export class Control {
       const dest = this.bestMachine(name, new Map([...up].filter(([m]) => !by.has(m) && settled.some((r) => r.machine === m) && this.hasRoom(m, now))), counts, now);
       if (!dest) continue;
       const replica = Math.max(...list.filter((x) => x.machine === from[0] && !x.leaving).map((x) => x.replica));
-      return tryMove(name, from[0], dest, replica, `machine ${from[0]} ran ${from[1]} copies of ${name} and machine ${dest.machine} none`, dest.reason, { cooldown: false });
+      return tryMove(name, from[0], dest, replica, `server ${from[0]} ran ${from[1]} copies of ${name} and server ${dest.machine} none`, dest.reason, { cooldown: false });
     }
     if (now - (this.rebalanceLog[0]?.t ?? 0) < COOLDOWN_MS) return;
     // Hot machines first, busiest first; then the most loaded machine if the spread is uneven.
@@ -1523,20 +1523,20 @@ export class Control {
     if (hot.length) {
       from = hot[0].machine;
       const h = this.liveMetrics.get(from).h;
-      why = `machine ${from} is hot (cpu ${Math.round(h.cpu)}%, memory ${Math.round((100 * h.memUsed) / h.memTotal)}%)`;
+      why = `server ${from} is hot (cpu ${Math.round(h.cpu)}%, memory ${Math.round((100 * h.memUsed) / h.memTotal)}%)`;
     } else {
       const byCount = settled.map((r) => ({ machine: r.machine, n: counts.get(r.machine) ?? 0 })).sort((a, b) => b.n - a.n);
       const most = byCount[0];
       const least = byCount[byCount.length - 1];
       if (most.n - least.n < SPREAD_GAP) return;
       from = most.machine;
-      why = `machine ${from} has ${most.n} ${most.n === 1 ? "copy" : "copies"} placed and the emptiest machine has ${least.n}`;
+      why = `server ${from} has ${most.n} ${most.n === 1 ? "copy" : "copies"} placed and the emptiest server has ${least.n}`;
     }
     const pick = this.heaviestOn(from, now);
     if (!pick) return;
     const dest = this.bestMachine(pick.name, new Map([...up].filter(([m]) => m !== from && this.hasRoom(m, now) && settled.some((r) => r.machine === m))), counts, now);
     if (!dest) {
-      if (now - (this.rebalanceLog[0]?.t ?? 0) > COOLDOWN_MS * 3) this.logRebalance(now, `${why}, but no machine has room for ${pick.name}`);
+      if (now - (this.rebalanceLog[0]?.t ?? 0) > COOLDOWN_MS * 3) this.logRebalance(now, `${why}, but no server has room for ${pick.name}`);
       return;
     }
     tryMove(pick.name, from, dest, pick.replica, why, dest.reason);
@@ -1632,7 +1632,7 @@ export class Control {
         for (const r of this.runs.values()) if (r.ip === ip) r.location = text;
       })
       .catch((e) => {
-        console.log(`geo lookup for a machine's address failed: ${e.message}`);
+        console.log(`geo lookup for a server's address failed: ${e.message}`);
         this.geo.set(ip, { ip, text: null, at: Date.now() }); // not written: tried again after a restart
       })
       .finally(() => this.geoPending.delete(ip));
@@ -1645,7 +1645,7 @@ export class Control {
       Object.entries(this.desiredFor(x.machine)).every(([name, d]) => x.status[name]?.v === d.v && x.status[name]?.s === "healthy"));
   }
 
-  // "This machine is going down soon": from whatever runs it. Its handover is scheduled like a requested roll.
+  // "This server is going down soon": from whatever runs it. Its handover is scheduled like a requested roll.
   drain(body) {
     const now = Date.now();
     const runId = body?.run != null ? String(body.run) : null;
@@ -1653,7 +1653,7 @@ export class Control {
     const machine = Number(body?.machine);
     const runs = [...this.runs.values()].filter((x) => this.live(x, now) && !x.retire &&
       ((runId && x.id === runId) || (agent && x.agent === agent) || (Number.isInteger(machine) && x.machine === machine)));
-    if (!runs.length) throw new HttpError(404, "no live run matches that run, agent or machine");
+    if (!runs.length) throw new HttpError(404, "no live run matches that run, agent or server");
     for (const x of runs) {
       if (!x.drain) {
         x.drain = now;
@@ -1740,7 +1740,7 @@ export class Control {
       // machine's tunnel.
       const others = this.liveRuns(now).filter((x) => x.machine === want && x.agent !== agent);
       const asked = others.every((x) => x.handover) || now - (this.starts.get(want) ?? 0) < START_WAIT_MS;
-      if (others.length && !asked) throw new HttpError(409, `machine ${want} is up and hasn't asked for a replacement`);
+      if (others.length && !asked) throw new HttpError(409, `server ${want} is up and hasn't asked for a replacement`);
       slot = want;
     } else {
       const before = this.agents.get(agent)?.slot;
@@ -1803,8 +1803,8 @@ export class Control {
   // (A pool that's short of machines takes the lowest free slot, so it may come back as a fresh slot.)
   async retireSlot(n) {
     const now = Date.now();
-    if (!Number.isInteger(n) || n < 1) throw new HttpError(400, "slot must be a machine number");
-    if (this.liveRuns(now).some((r) => r.machine === n)) throw new HttpError(409, `machine ${n} is still up; stop it first`);
+    if (!Number.isInteger(n) || n < 1) throw new HttpError(400, "slot must be a server number");
+    if (this.liveRuns(now).some((r) => r.machine === n)) throw new HttpError(409, `server ${n} is still up; stop it first`);
     const slot = this.slots.get(n);
     if (slot) {
       // Its <project>-m<n> names first: the regular DNS sync only touches records of tunnels it still knows.
@@ -2112,7 +2112,7 @@ export class Control {
       const r = rs.find((x) => x.type === "CNAME");
       if (!rs.length) posts.push({ type: "CNAME", name, content, proxied: true, comment: DNS_COMMENT });
       else if (r && r.content !== content && ours.has(r.content)) patches.push({ id: r.id, content });
-      else if (!r || !ours.has(r.content)) notes.push(`${name} is already used by another DNS record, so it can't point at its machine`);
+      else if (!r || !ours.has(r.content)) notes.push(`${name} is already used by another DNS record, so it can't point at its server`);
     }
     // At most 100 changes per batch (the free plan's limit is 200), deletes first; a batch applies its own deletes
     // before its posts, and nothing at all if one change fails.

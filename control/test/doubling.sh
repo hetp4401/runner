@@ -61,7 +61,7 @@ echo "== an app on the machine's own network can't run twice on a machine: the 6
 put hostnet '{"port":9100,"compose":"services:\n  h:\n    image: y\n    network_mode: host\n","replicas":6}'
 tick; tick
 check "5 copies placed" 5 "$(copies hostnet | wc -w)"
-check "why the 6th waits" "every machine already runs it, and it can't run twice on one machine (services.h.network_mode: host)" "$(blocked hostnet)"
+check "why the 6th waits" "every server already runs it, and it can't run twice on one server (services.h.network_mode: host)" "$(blocked hostnet)"
 check "moving it onto a machine that has it is refused" 409 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/projects/hostnet/move?from=1&to=2" -H "$A")"
 grep -i "error\|exception" /tmp/runner-test-dev.log | grep -v "Cloudflare API" | head -5
 . "$HERE/stop.sh"

@@ -43,7 +43,7 @@ put named2 '{"port":9001,"compose":"services:\n  n:\n    image: z\n    container
 for i in 1 2; do for m in 1 2 3; do sync $m r$m > /dev/null; done; done
 check "named on one machine" 1 "$(placed named | tr ',' '\n' | grep -c .)"
 check "named2 on the other two" 2 "$(placed named2 | tr ',' '\n' | grep -c .)"
-check "named2's third replica waits: the name clashes elsewhere, and it can't double up" "every other machine already has an app using container name shared (named)" "$(blocked named2)"
+check "named2's third replica waits: the name clashes elsewhere, and it can't double up" "every other server already has an app using container name shared (named)" "$(blocked named2)"
 echo "== moving named2 by hand onto the machine that has named (same container name) is refused; onto a machine that only has its port is fine"
 to=$(placed named); from=$(placed named2 | cut -d, -f1)
 check "move to a machine with the same container name" 409 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$B/api/projects/named2/move?from=$from&to=$to" -H "$A")"

@@ -254,7 +254,7 @@
     <nav class="tabs" aria-label="Sections">
       <a href="#/" data-nav=""><i aria-hidden="true">⌂</i>Overview</a>
       <a href="#/apps" data-nav="apps"><i aria-hidden="true">▦</i>Apps</a>
-      <a href="#/machines" data-nav="machines"><i aria-hidden="true">▤</i>Machines</a>
+      <a href="#/machines" data-nav="machines"><i aria-hidden="true">▤</i>Servers</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
     </nav>
@@ -527,7 +527,7 @@ const rangeSeg = () => `<span class="seg" role="group" aria-label="Time range">$
 
 // ======================================================================== fleet facts
 // The run that speaks for each machine: its newest live one that's ready, or its newest if none is ready yet. While a
-// newer run is still starting (the machine replacing itself), the older one is still the one serving, so it's shown.
+// newer run is still starting (the server replacing itself), the older one is still the one serving, so it's shown.
 function runsBy() {
   const by = new Map();
   for (const r of S.status.runs) if (r.live && !r.retiring) (by.get(r.machine) ?? by.set(r.machine, []).get(r.machine)).push(r);
@@ -541,7 +541,7 @@ function runsBy() {
 }
 // A slot whose only live run is on its way out.
 const leavingSlot = (n) => S.status.runs.some((r) => r.machine === n && r.live && r.retiring);
-// A slot with no live machine whose last run was a pool member, with that pool whole again: the machine was replaced
+// A slot with no live server whose last run was a pool member, with that pool whole again: the server was replaced
 // (pool members are interchangeable; a replacement takes whatever slot is free), which is routine, not a problem. A
 // standalone host, or a member of a pool that's short, is down.
 const replacedSlot = (n) => {
@@ -561,13 +561,13 @@ function machineState(n, r) {
   return { kind: "healthy", text: `online · ${ago(S.status.now - r.started)}` };
 }
 const APP_STATE = { live: ["healthy", "live"], deploying: ["deploying", "deploying"], failing: ["failed", "failing"], disabled: ["gone", "disabled"] };
-// A machine reports each copy it runs by key: the app's name for the lowest-numbered replica it has of the app,
+// A server reports each copy it runs by key: the app's name for the lowest-numbered replica it has of the app,
 // <name>-r<k> for any other copy of it there.
 function keyOn(p, machine, k) {
   const here = p.placed.filter((x) => x.machine === machine).map((x) => x.replica);
   return here.length && k === Math.min(...here) ? p.name : `${p.name}-r${k}`;
 }
-// What an app is doing, from its replicas: failing if any machine reports a copy failed, deploying until every replica
+// What an app is doing, from its replicas: failing if any server reports a copy failed, deploying until every replica
 // is healthy on the latest version. (A failing version stays until it's fixed or rolled back by hand.)
 function appState(p, runs) {
   if (!p.enabled) return "disabled";
@@ -596,7 +596,7 @@ function progress(p, runs) {
   }
   return { target, ok, busy, bad, total: p.replicas };
 }
-// Every copy of the app that's failing, with its machine and error.
+// Every copy of the app that's failing, with its server and error.
 function appFailures(p, runs) {
   const out = [];
   for (const x of p.placed) {
@@ -623,30 +623,30 @@ function problems() {
   for (const p of st.projects) {
     const href = appHref(p.name);
     const state = appState(p, runs);
-    if (state === "failing") out.push({ kind: "failed", href, text: `${p.name}: failing on machine ${[...new Set(appFailures(p, runs).map((x) => x.machine))].join(", ")}` });
+    if (state === "failing") out.push({ kind: "failed", href, text: `${p.name}: failing on server ${[...new Set(appFailures(p, runs).map((x) => x.machine))].join(", ")}` });
     else if (state === "deploying") {
       const g = progress(p, runs);
       out.push({ kind: "deploying", href, text: `${p.name}: deploying v${p.version} (${g.ok} of ${p.replicas} healthy)` });
     }
     if (p.enabled && p.staying < p.replicas && upCount()) {
-      out.push({ kind: "deploying", href, text: `${p.name}: ${plural(p.replicas - p.staying, "replica")} waiting for a machine${p.blocked ? `: ${p.blocked}` : ""}` });
+      out.push({ kind: "deploying", href, text: `${p.name}: ${plural(p.replicas - p.staying, "replica")} waiting for a server${p.blocked ? `: ${p.blocked}` : ""}` });
     }
   }
-  // Just after the control plane (re)started, or became reachable again, machines it hasn't heard from yet aren't down.
+  // Just after the control plane (re)started, or became reachable again, servers it hasn't heard from yet aren't down.
   const waiting = st.settling ? st.slots.filter((n) => !runs.has(n) && !(st.starting ?? []).includes(n)).length : 0;
-  if (waiting) out.push({ kind: "deploying", href: "#/machines", text: `The control plane just (re)started: ${plural(waiting, "machine")} not heard from yet` });
-  else for (const n of st.slots) if (!runs.has(n) && !(st.starting ?? []).includes(n) && !leavingSlot(n) && !replacedSlot(n)) out.push({ kind: "gone", href: machineHref(n), text: `Machine ${n} is down` });
-  for (const n of st.rebalance.hot) out.push({ kind: "failed", href: machineHref(n), text: `Machine ${n} is hot (CPU or memory high for 5 minutes)` });
-  const short = st.pools.reduce((n, x) => n + Math.max(0, x.size - x.live), 0); // the machines the fleet should have that aren't up
+  if (waiting) out.push({ kind: "deploying", href: "#/machines", text: `The control plane just (re)started: ${plural(waiting, "server")} not heard from yet` });
+  else for (const n of st.slots) if (!runs.has(n) && !(st.starting ?? []).includes(n) && !leavingSlot(n) && !replacedSlot(n)) out.push({ kind: "gone", href: machineHref(n), text: `Server ${n} is down` });
+  for (const n of st.rebalance.hot) out.push({ kind: "failed", href: machineHref(n), text: `Server ${n} is hot (CPU or memory high for 5 minutes)` });
+  const short = st.pools.reduce((n, x) => n + Math.max(0, x.size - x.live), 0); // the servers the fleet should have that aren't up
   const starting = (st.starting ?? []).length;
-  if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "machine")} missing${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
+  if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "server")} missing${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
   return out;
 }
 const problemList = (list) => list.length
   ? `<div class="problems">${list.map((x) => `<${x.href ? `a href="${esc(x.href)}"` : "div"} class="problem">${pill(x.kind, { failed: "problem", deploying: "in progress", gone: "down", leaving: "leaving", healthy: "ok" }[x.kind])}<span class="t">${esc(x.text)}</span>${x.href ? '<span aria-hidden="true">›</span>' : ""}</${x.href ? "a" : "div"}>`).join("")}</div>`
   : `<div class="card ok-line">✓ Everything is running as it should</div>`;
 
-// The progress of a deploy, and every failing machine's error.
+// The progress of a deploy, and every failing server's error.
 function appStatusBlock(p, runs, { full = false } = {}) {
   let html = "";
   const g = p.enabled ? progress(p, runs) : null;
@@ -657,8 +657,8 @@ function appStatusBlock(p, runs, { full = false } = {}) {
   }
   const f = p.enabled ? appFailures(p, runs) : [];
   if (f.length) {
-    html += `<div class="errbox"><b>Failing on ${plural(f.length, "machine")}.</b>${full ? " It stays on this version until it's fixed: edit it, or roll back from Versions." : ""}
-      ${f.map((x) => `<div class="item"><a href="${machineHref(x.machine)}">Machine ${x.machine}</a>, replica ${x.replica} (v${esc(x.v)})<pre>${esc(x.e)}</pre></div>`).join("")}
+    html += `<div class="errbox"><b>Failing on ${plural(f.length, "server")}.</b>${full ? " It stays on this version until it's fixed: edit it, or roll back from Versions." : ""}
+      ${f.map((x) => `<div class="item"><a href="${machineHref(x.machine)}">Server ${x.machine}</a>, replica ${x.replica} (v${esc(x.v)})<pre>${esc(x.e)}</pre></div>`).join("")}
       ${full ? `<div class="actions"><a class="btn small" href="#/apps/${enc(p.name)}/edit">Edit v${p.version}</a></div>` : ""}</div>`;
   }
   return html;
@@ -670,7 +670,7 @@ function replicaChips(p, runs, { links = true } = {}) {
   return `<div class="chips">${copies(p).map((x) => {
     const s = x.machine != null ? runs.get(x.machine)?.projects[keyOn(p, x.machine, x.replica)] : null;
     const kind = x.machine == null ? "gone" : runKind(s);
-    const where = x.machine == null ? "not placed yet" : !s ? `machine ${x.machine}, not running` : `machine ${x.machine}, v${s.v} ${s.s}`;
+    const where = x.machine == null ? "not placed yet" : !s ? `server ${x.machine}, not running` : `server ${x.machine}, v${s.v} ${s.s}`;
     const inner = `<i aria-hidden="true">${ICON[kind]}</i>${x.replica}${s && s.v !== p.version ? `<sub>v${s.v}</sub>` : ""}`;
     const label = `replica ${x.replica}: ${where}`;
     return links && p.port
@@ -1041,7 +1041,7 @@ function fleetTiles() {
   const live = liveRows();
   const memTotal = sumLive((r) => r.h.memTotal), memUsed = sumLive((r) => r.h.memUsed);
   return tiles([
-    { label: "CPU, fleet average", value: F.pct(live.length ? sumLive((r) => r.h.cpu) / live.length : null), sub: S.status && runsBy().size !== live.length ? `${live.length} of ${plural(runsBy().size, "machine")} reporting` : `${plural(live.length, "machine")} reporting` },
+    { label: "CPU, fleet average", value: F.pct(live.length ? sumLive((r) => r.h.cpu) / live.length : null), sub: S.status && runsBy().size !== live.length ? `${live.length} of ${plural(runsBy().size, "server")} reporting` : `${plural(live.length, "server")} reporting` },
     { label: "Memory used", value: memTotal ? F.pct((100 * memUsed) / memTotal) : "–", sub: `${bytes(memUsed)} of ${bytes(memTotal)}` },
     { label: "Disk read", value: F.rate(sumLive((r) => r.h.diskRead)), sub: `write ${F.rate(sumLive((r) => r.h.diskWrite))}` },
     { label: "Network in", value: F.rate(sumLive((r) => r.h.netRx)), sub: `out ${F.rate(sumLive((r) => r.h.netTx))}` },
@@ -1131,7 +1131,7 @@ async function showDiff(name, version) {
   } catch (e) { fail(e); }
 }
 async function setEnabled(name, on) {
-  if (!on && !(await confirmSheet(`Disable ${name}?`, `Its containers stop on every machine and its URLs stop answering. Its spec and versions are kept, so you can enable it again.`, "Disable", "danger"))) return;
+  if (!on && !(await confirmSheet(`Disable ${name}?`, `Its containers stop on every server and its URLs stop answering. Its spec and versions are kept, so you can enable it again.`, "Disable", "danger"))) return;
   try {
     if (!(await withPassword({ app: name }, (secret) => api("POST", `/projects/${enc(name)}/${on ? "enable" : "disable"}`, null, { secret })))) return;
     fast();
@@ -1143,7 +1143,7 @@ async function deleteApp(name) {
   const p = S.status.projects.find((x) => x.name === name);
   const ok = await sheet({
     title: `Delete ${name}?`, ok: "Delete for good", okKind: "primary danger",
-    html: `<p>It stops on every machine, ${p.port ? "its URLs stop answering, " : ""}and ${p.version === 1 ? "its only version is" : `all ${p.version} versions are`} deleted. This can't be undone.</p>
+    html: `<p>It stops on every server, ${p.port ? "its URLs stop answering, " : ""}and ${p.version === 1 ? "its only version is" : `all ${p.version} versions are`} deleted. This can't be undone.</p>
       <label class="f" for="del-name">Type <b>${esc(name)}</b> to confirm</label><input id="del-name" autocomplete="off" autocapitalize="off" spellcheck="false">`,
     onOpen: (d) => $("#del-name", d).focus(),
     onOk: async (d) => {
@@ -1192,12 +1192,12 @@ async function moveSheet(name, from, replica) {
     const count = S.status.projects.reduce((n, q) => n + q.placed.filter((x) => x.machine === r.machine && !x.leaving).length, 0);
     const dis = r.machine === from;
     return `<label class="opt${dis ? " dis" : ""}"><input type="radio" name="to" value="${r.machine}"${dis ? " disabled" : ""}>
-      <span><b>Machine ${r.machine}</b> <span class="meta">${h ? `CPU ${F.pct(h.cpu)} · memory ${F.pct(pctOf(h.memUsed, h.memTotal))} · ` : ""}${count} ${count === 1 ? "copy" : "copies"} placed${dis ? " · where it is now" : on.has(r.machine) ? " · already runs a copy of it" : ""}</span></span></label>`;
+      <span><b>Server ${r.machine}</b> <span class="meta">${h ? `CPU ${F.pct(h.cpu)} · memory ${F.pct(pctOf(h.memUsed, h.memTotal))} · ` : ""}${count} ${count === 1 ? "copy" : "copies"} placed${dis ? " · where it is now" : on.has(r.machine) ? " · already runs a copy of it" : ""}</span></span></label>`;
   }).join("");
   const res = await sheet({
-    title: `Move replica ${replica} of ${name} off machine ${from}`, ok: "Move",
-    html: `<p class="meta">The new copy starts first and the old one is removed once the new one is healthy, so nothing goes down. The replica keeps its number and URL. A machine that already runs a copy of ${esc(name)} gets a second one with its ports moved aside.</p>
-      <label class="opt"><input type="radio" name="to" value="" checked><span><b>The machine with the most room</b></span></label>${opts}`,
+    title: `Move replica ${replica} of ${name} off server ${from}`, ok: "Move",
+    html: `<p class="meta">The new copy starts first and the old one is removed once the new one is healthy, so nothing goes down. The replica keeps its number and URL. A server that already runs a copy of ${esc(name)} gets a second one with its ports moved aside.</p>
+      <label class="opt"><input type="radio" name="to" value="" checked><span><b>The server with the most room</b></span></label>${opts}`,
     onOk: (d) => ({ to: $("input[name=to]:checked", d).value }),
   });
   if (!res) return;
@@ -1205,7 +1205,7 @@ async function moveSheet(name, from, replica) {
     if (!(await withPassword({ app: name }, (secret) => api("POST", `/projects/${enc(name)}/move?from=${from}&replica=${replica}${res.to ? `&to=${res.to}` : ""}`, null, { secret })))) return;
   } catch (e) { return fail(e); }
   fast();
-  toast(`Moving replica ${replica} of ${name} off machine ${from}${res.to ? ` to machine ${res.to}` : ""}`);
+  toast(`Moving replica ${replica} of ${name} off server ${from}${res.to ? ` to server ${res.to}` : ""}`);
   loadStatus();
 }
 async function saveReplicas(name) {
@@ -1218,31 +1218,31 @@ async function saveReplicas(name) {
 }
 
 // ======================================================================== fleet actions
-// A machine that can start its own replacement hands over to it; a contributed machine (no pool) restarts its agent
+// A server that can start its own replacement hands over to it; a contributed server (no pool) restarts its agent
 // in place, and its replicas are unreachable meanwhile.
 const inPlace = (r) => r && !r.pool;
 async function restartMachine(n) {
-  const text = inPlace(runsBy().get(n)) ? "This is a contributed machine, so its agent restarts in place: the replicas on it are unreachable for a minute or two."
+  const text = inPlace(runsBy().get(n)) ? "This is a contributed server, so its agent restarts in place: the replicas on it are unreachable for a minute or two."
     : "A replacement takes over before the old one leaves, so nothing goes down.";
-  if (!(await confirmSheet(`Restart machine ${n}?`, text, "Restart"))) return;
+  if (!(await confirmSheet(`Restart server ${n}?`, text, "Restart"))) return;
   try {
-    if (await withPassword({ admin: true }, (secret) => api("POST", `/roll?machine=${n}`, null, { secret }))) { fast(); toast(`Machine ${n} is being replaced`); loadStatus(); }
+    if (await withPassword({ admin: true }, (secret) => api("POST", `/roll?machine=${n}`, null, { secret }))) { fast(); toast(`Server ${n} is being replaced`); loadStatus(); }
   } catch (e) { fail(e); }
 }
 async function evict(n) {
-  if (!(await confirmSheet(`Move every app off machine ${n}?`, "Each one goes to the machine with the most room; the new copy starts first and the old one is removed once it's healthy.", "Move apps off"))) return;
+  if (!(await confirmSheet(`Move every app off server ${n}?`, "Each one goes to the server with the most room; the new copy starts first and the old one is removed once it's healthy.", "Move apps off"))) return;
   try {
     const r = await withPassword({ admin: true }, (secret) => api("POST", `/machines/${n}/evict`, null, { secret }));
     if (!r) return;
     fast();
-    const parts = [r.moved.length ? `Moving ${r.moved.join(", ")} off machine ${n}` : `Nothing to move off machine ${n}`];
+    const parts = [r.moved.length ? `Moving ${r.moved.join(", ")} off server ${n}` : `Nothing to move off server ${n}`];
     if (r.failed.length) parts.push(`couldn't move: ${r.failed.join("; ")}`);
     toast(parts.join("; "), r.failed.length ? { kind: "failed" } : {});
     loadStatus();
   } catch (e) { fail(e); }
 }
 async function retireSlot(n) {
-  if (!(await confirmSheet(`Retire slot ${n}?`, `Its Cloudflare tunnel <code>runner-${n}</code> and every <code>&lt;app&gt;-m${n}</code> DNS name are deleted. A machine joining later gets a fresh slot.`, "Retire slot", "primary danger"))) return;
+  if (!(await confirmSheet(`Retire slot ${n}?`, `Its Cloudflare tunnel <code>runner-${n}</code> and every <code>&lt;app&gt;-m${n}</code> DNS name are deleted. A server joining later gets a fresh slot.`, "Retire slot", "primary danger"))) return;
   try {
     const r = await withPassword({ admin: true }, (secret) => api("DELETE", `/slots/${n}`, null, { secret }));
     if (r) { toast(`Slot ${n} retired`); location.hash = "#/machines"; loadStatus(); }
@@ -1251,10 +1251,10 @@ async function retireSlot(n) {
 async function restartAll() {
   const runs = [...runsBy().values()], own = runs.filter(inPlace).length;
   const text = `They're replaced one at a time, each by a fresh one that takes over before it leaves, so nothing goes down.${own
-    ? ` ${plural(own, "contributed machine")} restart${own === 1 ? "s" : ""} in place instead, so the replicas there are unreachable for a minute or two.` : ""} With ${plural(runs.length, "machine")} this takes a while.`;
-  if (!(await confirmSheet("Restart every machine?", text, "Restart all"))) return;
+    ? ` ${plural(own, "contributed server")} restart${own === 1 ? "s" : ""} in place instead, so the replicas there are unreachable for a minute or two.` : ""} With ${plural(runs.length, "server")} this takes a while.`;
+  if (!(await confirmSheet("Restart every server?", text, "Restart all"))) return;
   try {
-    if (await withPassword({ admin: true }, (secret) => api("POST", "/roll", null, { secret }))) { fast(); toast("Restarting machines one at a time"); loadStatus(); }
+    if (await withPassword({ admin: true }, (secret) => api("POST", "/roll", null, { secret }))) { fast(); toast("Restarting servers one at a time"); loadStatus(); }
   } catch (e) { fail(e); }
 }
 async function setRebalance(on) {
@@ -1284,17 +1284,17 @@ function vOverview() {
       <h2>Needs attention</h2><div id="ov-problems"></div>
       <h2><span class="grow">Fleet now</span><a href="#/metrics">Metrics →</a></h2><div id="ov-tiles"><div class="meta">Loading…</div></div>
       <h2><span class="grow">Apps</span><a href="#/apps">All apps →</a></h2><div class="cards" id="ov-apps"></div>
-      <h2><span class="grow">Machines</span><a href="#/machines">All machines →</a></h2><div class="cards two" id="ov-machines"></div>
+      <h2><span class="grow">Servers</span><a href="#/machines">All servers →</a></h2><div class="cards two" id="ov-machines"></div>
       <h2>Rebalancing</h2><div class="card" id="ov-activity"></div>`,
     status() {
       const st = S.status, runs = runsBy();
-      $("#ov-sub").textContent = `${plural(runs.size, "machine")} up · ${plural(st.projects.length, "app")} · ${st.domain}`;
+      $("#ov-sub").textContent = `${plural(runs.size, "server")} up · ${plural(st.projects.length, "app")} · ${st.domain}`;
       setHtml($("#ov-problems"), problemList(problems()));
       setHtml($("#ov-apps"), st.projects.map((p) => `<a class="card" href="${appHref(p.name)}">
           <div class="row"><span class="name grow">${esc(p.name)}</span>${appPill(p, runs)}</div>
           <div class="meta">v${p.version} · ${placedText(p)}</div>${replicaChips(p, runs, { links: false })}</a>`).join("")
         || `<div class="card empty">No apps yet. <a href="#/apps/new">Deploy your first app</a></div>`);
-      setHtml($("#ov-machines"), machineCards(true) || `<div class="card empty">No machines have checked in. <a href="#/fleet">Add a machine</a></div>`);
+      setHtml($("#ov-machines"), machineCards(true) || `<div class="card empty">No servers have checked in. <a href="#/fleet">Add a server</a></div>`);
       setHtml($("#ov-activity"), rebalanceLog(5));
     },
     charts() { setHtml($("#ov-tiles"), fleetTiles()); },
@@ -1303,14 +1303,14 @@ function vOverview() {
 
 function rebalanceLog(limit) {
   const r = S.status.rebalance;
-  return `<div class="meta">${r.on ? "On: a machine that stays hot (CPU over 85% or memory over 90% for 5 minutes) has its heaviest app moved off, and uneven spreads even out. One move every 10 minutes at most." : "Off: apps stay where they're placed until their machine goes away."}</div>
+  return `<div class="meta">${r.on ? "On: a server that stays hot (CPU over 85% or memory over 90% for 5 minutes) has its heaviest app moved off, and uneven spreads even out. One move every 10 minutes at most." : "Off: apps stay where they're placed until their server goes away."}</div>
     ${r.log.length ? `<div class="log">${r.log.slice(0, limit).map((x) => `<div>${esc(ago(S.status.now - x.t))} ago: ${esc(x.text)}</div>`).join("")}</div>` : `<div style="margin-top:8px" class="meta">Nothing moved yet.</div>`}`;
 }
 
-// Machine cards: state, label, live CPU and memory, and what runs there.
-// "Boydton, Virginia, US · Microsoft · 38 ms": where the machine is (from the address it checks in from) and its latency
+// Server cards: state, label, live CPU and memory, and what runs there.
+// "Boydton, Virginia, US · Microsoft · 38 ms": where the server is (from the address it checks in from) and its latency
 // (the agent's last check-in round trip to the control plane). Either part may be missing until it's known.
-const whereAndHowFar = (r) => (r ? [r.location, isNum(r.rtt) ? `<span title="latency: the machine's last check-in round trip to the control plane">${r.rtt} ms</span>` : null].filter(Boolean).map((x) => (x.startsWith("<") ? x : esc(x))).join(" · ") : "");
+const whereAndHowFar = (r) => (r ? [r.location, isNum(r.rtt) ? `<span title="latency: the server's last check-in round trip to the control plane">${r.rtt} ms</span>` : null].filter(Boolean).map((x) => (x.startsWith("<") ? x : esc(x))).join(" · ") : "");
 
 function machineCards(compact = false) {
   const st = S.status, runs = runsBy(), live = S.metrics?.live ?? {};
@@ -1324,7 +1324,7 @@ function machineCards(compact = false) {
     }).join("");
     const errs = r ? Object.entries(r.projects).filter(([, s]) => s.s === "failed") : [];
     return `<a class="card" href="${machineHref(n)}">
-      <div class="row"><span class="name grow">Machine ${n}</span>${pill(ms.kind, ms.text)}</div>
+      <div class="row"><span class="name grow">Server ${n}</span>${pill(ms.kind, ms.text)}</div>
       <div class="meta">${r ? [r.label ? esc(r.label) : "", whereAndHowFar(r)].filter(Boolean).join(" · ") : ms.kind === "deploying" ? "a replacement is starting" : "not checking in"}</div>
       ${h ? `<div class="meta" style="margin-top:6px">CPU ${F.pct(h.cpu)}${meter(h.cpu)} &nbsp; memory ${F.pct(pctOf(h.memUsed, h.memTotal))}${meter(pctOf(h.memUsed, h.memTotal))} ${compact ? "" : spark(hcol(n, "cpu"))}</div>` : ""}
       ${chips ? `<div class="chips">${chips}</div>` : compact ? "" : `<div class="meta" style="margin-top:6px">No apps placed here</div>`}
@@ -1337,7 +1337,7 @@ function vApps() {
   return {
     title: "Apps",
     html: `<div class="row"><h1 class="grow">Apps</h1><a class="btn primary" href="#/apps/new">New app</a></div>
-      <div class="sub">Anyone can deploy, change or remove an app, unless it has an app password; then changing it asks for that password (or the admin password). Each app runs as many replicas as it asks for, on the machines with the most room (two on one machine when there are more replicas than machines).</div>
+      <div class="sub">Anyone can deploy, change or remove an app, unless it has an app password; then changing it asks for that password (or the admin password). Each app runs as many replicas as it asks for, on the servers with the most room (two on one server when there are more replicas than servers).</div>
       <div id="apps-filter"></div><div class="cards" id="apps-list" style="margin-top:14px"></div>`,
     status() {
       const st = S.status, runs = runsBy();
@@ -1428,25 +1428,25 @@ function vApp(name) {
         const s = r?.projects[keyOn(p, x.machine, x.replica)];
         const target = !p.enabled ? null : p.version;
         const kind = x.leaving ? "leaving" : !p.enabled || x.machine == null || !r ? "gone" : runKind(s);
-        const text = !p.enabled ? "disabled" : x.leaving ? `moving to machine ${x.leaving.to}` : x.machine == null ? "waiting for a machine" : !r ? "machine down" : s ? s.s : "not running yet";
+        const text = !p.enabled ? "disabled" : x.leaving ? `moving to server ${x.leaving.to}` : x.machine == null ? "waiting for a server" : !r ? "server down" : s ? s.s : "not running yet";
         return { cells: [
           `<b><span class="mob">Replica </span>${x.replica}</b>`,
-          x.machine != null ? `<a href="${machineHref(x.machine)}">Machine ${x.machine}</a>${whereAndHowFar(r) ? `<div class="s">${whereAndHowFar(r)}</div>` : ""}` : "–",
+          x.machine != null ? `<a href="${machineHref(x.machine)}">Server ${x.machine}</a>${whereAndHowFar(r) ? `<div class="s">${whereAndHowFar(r)}</div>` : ""}` : "–",
           `${s ? `v${esc(s.v)}` : "–"}${target != null && s && s.v !== target ? ` <span class="s">→ v${target}</span>` : ""}`,
           `${pill(kind, text)}${x.since && !x.leaving ? `<div class="s">placed ${esc(ago(S.status.now - x.since))} ago: ${esc(x.reason)}</div>` : ""}${
             p.enabled && x.machine == null && p.blocked ? `<div class="s">${esc(p.blocked)}</div>` : ""}${s?.e ? `<div class="errbox"><pre>${esc(s.e)}</pre></div>` : ""}`,
           p.port && p.enabled && !x.leaving ? `<a class="url" href="${esc(replicaUrl(p, x.replica))}" target="_blank" rel="noopener">${esc(replicaUrl(p, x.replica).slice(8, -1))}</a>` : `<span class="s">${p.port ? "" : "no port"}</span>`,
-          x.since && !x.leaving && p.enabled ? `<button type="button" class="small" data-act="move" data-machine="${x.machine}" data-replica="${x.replica}" aria-label="Move replica ${x.replica} off machine ${x.machine}">Move</button>` : "",
+          x.since && !x.leaving && p.enabled ? `<button type="button" class="small" data-act="move" data-machine="${x.machine}" data-replica="${x.replica}" aria-label="Move replica ${x.replica} off server ${x.machine}">Move</button>` : "",
         ] };
       });
       setHtml($("#ad-replicas"), `<div class="card" style="margin-bottom:10px"><div class="row">
-          <span style="flex:1 1 14em;min-width:0"><b>Replicas</b><div class="meta">1–${MAX_REPLICAS}, spread over the machines with the most room; replica k is always at ${esc(name)}-k.</div></span>
+          <span style="flex:1 1 14em;min-width:0"><b>Replicas</b><div class="meta">1–${MAX_REPLICAS}, spread over the servers with the most room; replica k is always at ${esc(name)}-k.</div></span>
           <span class="stepper"><button type="button" data-act="rep" data-d="-1" aria-label="Fewer replicas"${want <= 1 ? " disabled" : ""}>−</button><b aria-live="polite">${want}</b><button type="button" data-act="rep" data-d="1" aria-label="More replicas"${want >= MAX_REPLICAS ? " disabled" : ""}>+</button></span>
           ${want !== p.replicas ? `<button type="button" class="primary" data-act="saverep">Save (${p.replicas} → ${want})</button><button type="button" data-act="cancelrep">Cancel</button>` : ""}</div>
           ${!p.enabled ? `<div class="hint">Disabled: it runs nowhere until it's enabled again.</div>` : ""}
-          ${want > up && up ? `<div class="hint">${plural(up, "machine")} up, so ${want - up === 1 ? "one machine runs two copies" : `${want - up} machines run two copies`} (the least busy ones), each copy with its own URL.</div>` : ""}
+          ${want > up && up ? `<div class="hint">${plural(up, "server")} up, so ${want - up === 1 ? "one server runs two copies" : `${want - up} servers run two copies`} (the least busy ones), each copy with its own URL.</div>` : ""}
           ${want !== p.replicas ? `<div class="hint">Saving makes a new version with the same files.</div>` : ""}</div>
-        ${table(["Replica", "Machine", "Version", "State", "URL", ""], rows)}`);
+        ${table(["Replica", "Server", "Version", "State", "URL", ""], rows)}`);
       const versions = st.spec?.versions ?? [];
       setHtml($("#ad-versions"), table(["Version", "", "Port", "Replicas", "Created", ""], [...versions].reverse().map((v) => ({
         cls: v.version === st.shown ? "shown" : "",
@@ -1464,7 +1464,7 @@ function vApp(name) {
       const inst = liveRows().filter((r) => r.a?.[name]).map((r) => ({ r, v: r.a[name] }));
       const total = (k) => inst.reduce((s, x) => s + (x.v[k] ?? 0), 0);
       box.insertAdjacentHTML("beforeend", tiles([
-        { label: "CPU", value: F.cores(total("cpu")), sub: `${plural(inst.length, "machine")} running it` },
+        { label: "CPU", value: F.cores(total("cpu")), sub: `${plural(inst.length, "server")} running it` },
         { label: "Memory", value: bytes(total("mem")), sub: "all replicas" },
         { label: "Disk read", value: F.rate(total("diskRead")), sub: `write ${F.rate(total("diskWrite"))}` },
         { label: "Network in", value: F.rate(total("netRx")), sub: `out ${F.rate(total("netTx"))}` },
@@ -1474,8 +1474,8 @@ function vApp(name) {
       g.previousElementSibling.style.marginTop = "18px";
       lineChart(ccard(g, "CPU"), [{ name: "CPU", values: A("cpu") }], { unit: "cores" });
       lineChart(ccard(g, "Memory"), [{ name: "memory", values: A("mem") }], { unit: "bytes" });
-      const heat = section(box, "Per machine");
-      heatmap(ccard(heat, "CPU", "cores, per machine", true), ms.filter((m) => acol(m, name, "cpu")?.some(isNum)).map((m) => ({ name: `machine ${m}`, values: acol(m, name, "cpu"), href: machineHref(m) })), { unit: "cores" });
+      const heat = section(box, "Per server");
+      heatmap(ccard(heat, "CPU", "cores, per server", true), ms.filter((m) => acol(m, name, "cpu")?.some(isNum)).map((m) => ({ name: `server ${m}`, values: acol(m, name, "cpu"), href: machineHref(m) })), { unit: "cores" });
       moreSection(box, (mg) => {
         lineChart(ccard(mg, "Disk I/O"), [{ name: "read", values: A("diskRead") }, { name: "write", values: A("diskWrite") }], { unit: "rate" });
         lineChart(ccard(mg, "Network I/O", "apps on host networking aren't counted"), [{ name: "in", values: A("netRx") }, { name: "out", values: A("netTx") }], { unit: "rate" });
@@ -1557,7 +1557,7 @@ function vEditor(name, sample) {
     if (name) return true;
     const v = $("#ed-name").value.trim();
     const msg = !v ? "" : !NAME.test(v) ? "Lowercase letters, digits and dashes; it can't start or end with a dash"
-      : /-m?\d+$/.test(v) ? "It can't end in -<number> or -m<number>: those are the URLs of replicas and machines"
+      : /-m?\d+$/.test(v) ? "It can't end in -<number> or -m<number>: those are the URLs of replicas and servers"
       : taken(v) ? `There's already an app with this name: <a href="${appHref(v)}">open it</a> to edit it` : "";
     $("#ed-name-hint").innerHTML = msg || `Replica k will be at https://${esc(v || "name")}-k.${esc(S.status?.domain ?? "…")}`;
     $("#ed-name-hint").className = "hint" + (msg ? " bad" : "");
@@ -1598,7 +1598,7 @@ function vEditor(name, sample) {
     title: name ? `Edit ${name}` : "New app",
     html: `<a class="back" href="${name ? appHref(name) : "#/apps"}">← ${name ? esc(name) : "Apps"}</a>
       <h1>${name ? `Edit ${esc(name)}` : "New app"}</h1>
-      <div class="sub">${name ? `Deploying makes a new version, and every replica switches to it. If it fails, its page shows each machine's error; edit it again, or roll back from Versions.${locked(name)
+      <div class="sub">${name ? `Deploying makes a new version, and every replica switches to it. If it fails, its page shows each server's error; edit it again, or roll back from Versions.${locked(name)
           ? " The password typed to open this editor is used to deploy." : ""}`
         : "An app is a Docker Compose file, a Dockerfile, or both, plus any text files the build needs."}</div>
       ${name ? "" : `<div class="row" style="margin-top:12px"><span class="meta">Start from an example:</span><button type="button" class="small" data-act="sample" data-s="whoami">whoami (an image)</button><button type="button" class="small" data-act="sample" data-s="hello">hello (a Dockerfile)</button><a class="meta" href="#/guide">Deploy guide →</a></div>`}
@@ -1610,7 +1610,7 @@ function vEditor(name, sample) {
           <div><label class="f" for="ed-replicas">Replicas</label><input id="ed-replicas" inputmode="numeric" placeholder="1" style="width:100px" autocomplete="off" aria-describedby="ed-replicas-hint ed-fields-hint"></div>
         </div>
         <p class="hint bad" id="ed-replicas-hint" aria-live="polite" hidden></p>
-        <p class="hint" id="ed-fields-hint">Port: what the app listens on (or <code>x-runner.port</code> in the compose file); without one the app has no URL. Replicas: 1–${MAX_REPLICAS} (default 1), spread over the machines with the most room; more replicas than machines means some machines run two or more.</p>
+        <p class="hint" id="ed-fields-hint">Port: what the app listens on (or <code>x-runner.port</code> in the compose file); without one the app has no URL. Replicas: 1–${MAX_REPLICAS} (default 1), spread over the servers with the most room; more replicas than servers means some servers run two or more.</p>
         <label class="f" for="ed-compose">Docker Compose</label>
         <textarea id="ed-compose" spellcheck="false" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports: [&quot;8080:80&quot;]&#10;    restart: unless-stopped"></textarea>
         <p class="hint">Optional with a Dockerfile: then one service is made that builds it and publishes the port.</p>
@@ -1758,20 +1758,20 @@ function vEditor(name, sample) {
 
 function vMachines() {
   return {
-    title: "Machines", wantsMetrics: true,
-    html: `<h1>Machines</h1><div class="sub" id="mc-sub"></div><div class="cards two" id="mc-list" style="margin-top:14px"></div>`,
+    title: "Servers", wantsMetrics: true,
+    html: `<h1>Servers</h1><div class="sub" id="mc-sub"></div><div class="cards two" id="mc-list" style="margin-top:14px"></div>`,
     status() {
       const runs = runsBy();
-      setHtml($("#mc-sub"), `${plural(runs.size, "machine")} up · <a href="#/fleet">Fleet settings</a>`);
-      setHtml($("#mc-list"), machineCards() || `<div class="card empty">No machines have checked in. <a href="#/fleet">Add a machine</a></div>`);
+      setHtml($("#mc-sub"), `${plural(runs.size, "server")} up · <a href="#/fleet">Fleet settings</a>`);
+      setHtml($("#mc-list"), machineCards() || `<div class="card empty">No servers have checked in. <a href="#/fleet">Add a server</a></div>`);
     },
   };
 }
 
 function vMachine(n) {
   return {
-    title: `Machine ${n}`, wantsMetrics: true,
-    html: `<a class="back" href="#/machines">← Machines</a><div id="md-head"></div>
+    title: `Server ${n}`, wantsMetrics: true,
+    html: `<a class="back" href="#/machines">← Servers</a><div id="md-head"></div>
       <h2>Apps here</h2><div id="md-apps"></div>
       <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div id="md-charts"><div class="meta">Loading…</div></div>
       <h2>Fleet actions</h2><div id="md-actions"></div>`,
@@ -1779,20 +1779,20 @@ function vMachine(n) {
       const st = S.status, runs = runsBy(), r = runs.get(n), ms = machineState(n, r);
       const known = st.slots.includes(n) || r;
       const startingHere = !r && ((st.starting ?? []).includes(n) || leavingSlot(n));
-      setHtml($("#md-head"), `<div class="row"><h1 class="grow">Machine ${n}</h1>${pill(ms.kind, ms.text)}</div>
-        <div class="sub">${r ? `${r.label ? `${esc(r.label)} · ` : ""}up ${ago(st.now - r.started)}${whereAndHowFar(r) ? ` · ${whereAndHowFar(r)}` : ""}${r.replacing ? " · a fresh machine is starting to take over" : ""}`
-          : (st.starting ?? []).includes(n) ? "A machine is being started for this slot." : leavingSlot(n) ? "On its way out."
-          : known ? "Not checking in right now; the charts show what it sent earlier." : "No machine has used this slot recently."}</div>`);
+      setHtml($("#md-head"), `<div class="row"><h1 class="grow">Server ${n}</h1>${pill(ms.kind, ms.text)}</div>
+        <div class="sub">${r ? `${r.label ? `${esc(r.label)} · ` : ""}up ${ago(st.now - r.started)}${whereAndHowFar(r) ? ` · ${whereAndHowFar(r)}` : ""}${r.replacing ? " · a fresh server is starting to take over" : ""}`
+          : (st.starting ?? []).includes(n) ? "A server is being started for this slot." : leavingSlot(n) ? "On its way out."
+          : known ? "Not checking in right now; the charts show what it sent earlier." : "No server has used this slot recently."}</div>`);
       const apps = st.projects.flatMap((p) => p.placed.filter((x) => x.machine === n).map((x) => ({ p, x })));
       setHtml($("#md-apps"), table(["App", "Replica", "Version", "State"], apps.map(({ p, x }) => {
         const s = r?.projects[keyOn(p, n, x.replica)];
         const kind = x.leaving ? "leaving" : !r ? "gone" : runKind(s);
         return { href: appHref(p.name), cells: [`<a href="${appHref(p.name)}"><b>${esc(p.name)}</b></a>`, `#${x.replica}`, s ? `v${esc(s.v)}` : "–",
-          `${pill(kind, x.leaving ? `moving to machine ${x.leaving.to}` : !r ? "machine down" : s ? s.s : "not running yet")}${s?.e ? `<div class="errbox"><pre>${esc(s.e)}</pre></div>` : ""}`] };
+          `${pill(kind, x.leaving ? `moving to server ${x.leaving.to}` : !r ? "server down" : s ? s.s : "not running yet")}${s?.e ? `<div class="errbox"><pre>${esc(s.e)}</pre></div>` : ""}`] };
       }), { empty: "No apps are placed here" }));
       setHtml($("#md-actions"), `<div class="card"><p class="meta" style="margin-top:0">These change the fleet, so they need the password.</p><div class="actions">
         ${r ? `<button type="button" data-act="restart">Restart</button><button type="button" data-act="evict">Move apps off</button>`
-          : startingHere ? `<span class="meta">Nothing to do while a machine is on its way.</span>`
+          : startingHere ? `<span class="meta">Nothing to do while a server is on its way.</span>`
           : `<button type="button" class="danger" data-act="retire">Retire slot ${n}</button>`}</div></div>`);
     },
     charts() {
@@ -1807,10 +1807,10 @@ function vMachine(n) {
         { label: "Disk read", value: F.rate(x.diskRead), sub: `write ${F.rate(x.diskWrite)}` },
         { label: "Network in", value: F.rate(x.netRx), sub: `out ${F.rate(x.netTx)}` },
       ]));
-      const g = section(box, "Machine");
+      const g = section(box, "Server");
       lineChart(ccard(g, "CPU", "average and peak, % of all cores"), [{ name: "average", values: H("cpu") }, { name: "peak", values: H("cpuMax") }], { unit: "pct" });
       lineChart(ccard(g, "Memory used"), [{ name: "used", values: H("memUsed") }], { unit: "bytes", ref: { name: "installed", value: x.memTotal ?? Math.max(0, ...(H("memTotal") ?? []).filter(isNum)) } });
-      const apps = section(box, "Apps on this machine");
+      const apps = section(box, "Apps on this server");
       const A = (k) => (a) => acol(n, a, k);
       lineChart(ccard(apps, "CPU by app"), appStack(A("cpu")), { unit: "cores", stacked: true });
       lineChart(ccard(apps, "Memory by app"), appStack(A("mem")), { unit: "bytes", stacked: true });
@@ -1847,27 +1847,27 @@ function vMetrics() {
       if (!box) return;
       rebuild(box, () => {
       $("#mx-sub").textContent = `${S.metrics.step / 60000}-minute points · updated ${ago(Date.now() - S.metricsAt)} ago`;
-      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}<h2>Machines now</h2>`);
-      box.insertAdjacentHTML("beforeend", table(["Machine", "CPU", "Memory", "Disk read / write", "Network in / out"], liveRows().map((r) => ({
+      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}<h2>Servers now</h2>`);
+      box.insertAdjacentHTML("beforeend", table(["Server", "CPU", "Memory", "Disk read / write", "Network in / out"], liveRows().map((r) => ({
         href: machineHref(r.m),
-        cells: [`<a href="${machineHref(r.m)}"><b>Machine ${r.m}</b></a>${r.ready ? "" : ' <span class="s">starting</span>'}`,
+        cells: [`<a href="${machineHref(r.m)}"><b>Server ${r.m}</b></a>${r.ready ? "" : ' <span class="s">starting</span>'}`,
           `${spark(hcol(r.m, "cpu"))} ${F.pct(r.h.cpu)}${meter(r.h.cpu)}`,
           `${F.pct(pctOf(r.h.memUsed, r.h.memTotal))}${meter(pctOf(r.h.memUsed, r.h.memTotal))} <span class="s">${bytes(r.h.memUsed)}</span>`,
           io(r.h.diskRead, r.h.diskWrite), io(r.h.netRx, r.h.netTx)],
       })), { empty: "Nothing reporting right now", num: [1, 2, 3, 4] }));
       const ms = machineNums();
-      const heat = section(box, "Per machine", `<span class="seg" role="group" aria-label="Heatmap shows"><button type="button" data-heat="cpu" aria-pressed="${S.heat === "cpu"}">CPU</button><button type="button" data-heat="mem" aria-pressed="${S.heat === "mem"}">Memory</button></span>`);
-      const rows = ms.map((m) => ({ name: `machine ${m}`, href: machineHref(m),
+      const heat = section(box, "Per server", `<span class="seg" role="group" aria-label="Heatmap shows"><button type="button" data-heat="cpu" aria-pressed="${S.heat === "cpu"}">CPU</button><button type="button" data-heat="mem" aria-pressed="${S.heat === "mem"}">Memory</button></span>`);
+      const rows = ms.map((m) => ({ name: `server ${m}`, href: machineHref(m),
         values: S.heat === "cpu" ? hcol(m, "cpu") : map2(hcol(m, "memUsed"), hcol(m, "memTotal"), (u, t) => (100 * u) / t) }));
-      heatmap(ccard(heat, S.heat === "cpu" ? "CPU" : "Memory", `% ${S.heat === "cpu" ? "of all cores" : "used"} · tap a machine's name to open it`, true), rows, { unit: "pct", max: 100 });
+      heatmap(ccard(heat, S.heat === "cpu" ? "CPU" : "Memory", `% ${S.heat === "cpu" ? "of all cores" : "used"} · tap a server's name to open it`, true), rows, { unit: "pct", max: 100 });
       const g = section(box, "Whole fleet");
-      lineChart(ccard(g, "CPU", "average across machines, and the busiest machine"), [{ name: "average", values: fleetH("cpu", "avg") }, { name: "busiest machine", values: fleetH("cpu", "max") }], { unit: "pct" });
-      lineChart(ccard(g, "Memory by app", "summed over machines"), appStack((a) => combine(ms.map((m) => acol(m, a, "mem")), "sum")), { unit: "bytes", stacked: true });
-      lineChart(ccard(g, "CPU by app", "summed over machines"), appStack((a) => combine(ms.map((m) => acol(m, a, "cpu")), "sum")), { unit: "cores", stacked: true });
-      lineChart(ccard(g, "Memory used", "all machines"), [{ name: "used", values: fleetH("memUsed") }], { unit: "bytes", ref: { name: "installed", value: Math.max(0, ...fleetH("memTotal").filter(isNum)) } });
+      lineChart(ccard(g, "CPU", "average across servers, and the busiest server"), [{ name: "average", values: fleetH("cpu", "avg") }, { name: "busiest server", values: fleetH("cpu", "max") }], { unit: "pct" });
+      lineChart(ccard(g, "Memory by app", "summed over servers"), appStack((a) => combine(ms.map((m) => acol(m, a, "mem")), "sum")), { unit: "bytes", stacked: true });
+      lineChart(ccard(g, "CPU by app", "summed over servers"), appStack((a) => combine(ms.map((m) => acol(m, a, "cpu")), "sum")), { unit: "cores", stacked: true });
+      lineChart(ccard(g, "Memory used", "all servers"), [{ name: "used", values: fleetH("memUsed") }], { unit: "bytes", ref: { name: "installed", value: Math.max(0, ...fleetH("memTotal").filter(isNum)) } });
       moreSection(box, (mg) => {
-        lineChart(ccard(mg, "Disk I/O", "all machines"), [{ name: "read", values: fleetH("diskRead") }, { name: "write", values: fleetH("diskWrite") }], { unit: "rate" });
-        lineChart(ccard(mg, "Network I/O", "all machines"), [{ name: "in", values: fleetH("netRx") }, { name: "out", values: fleetH("netTx") }], { unit: "rate" });
+        lineChart(ccard(mg, "Disk I/O", "all servers"), [{ name: "read", values: fleetH("diskRead") }, { name: "write", values: fleetH("diskWrite") }], { unit: "rate" });
+        lineChart(ccard(mg, "Network I/O", "all servers"), [{ name: "in", values: fleetH("netRx") }, { name: "out", values: fleetH("netTx") }], { unit: "rate" });
       });
       });
     },
@@ -1886,14 +1886,14 @@ function vFleet() {
     title: "Fleet",
     html: `<h1>Fleet</h1><div class="sub">Everyone can see this page; changing anything here needs the admin password.</div>
       <h2>Rebalancing</h2><div id="fl-rebalance"></div>
-      <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta">Restart every machine, one at a time (for example after changing the agent). A machine that can start its own replacement hands over to it first; a contributed machine restarts its agent in place.</span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
-      <h2>Add a machine</h2><div id="fl-join"></div>`,
+      <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta">Restart every server, one at a time (for example after changing the agent). A server that can start its own replacement hands over to it first; a contributed server restarts its agent in place.</span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
+      <h2>Add a server</h2><div id="fl-join"></div>`,
     status() {
       const st = S.status;
       setHtml($("#fl-rebalance"), `<div class="card"><div class="row"><span class="grow"><b>Automatic rebalancing</b></span>
         <button type="button" class="switch" role="switch" data-act="rebalance" aria-checked="${st.rebalance.on}" aria-pressed="${st.rebalance.on}" aria-label="Automatic rebalancing">${st.rebalance.on ? "✓ On" : "○ Off"}</button></div>${rebalanceLog(10)}</div>`);
       setHtml($("#fl-roll"), `Restart all`);
-      setHtml($("#fl-join"), `<div class="card"><p class="meta" style="margin:0">Any Linux machine with Docker can join the fleet with one command.</p><div class="actions"><a class="btn" href="#/contribute">How to contribute a machine</a></div></div>`);
+      setHtml($("#fl-join"), `<div class="card"><p class="meta" style="margin:0">Any Linux server with Docker can join the fleet with one command.</p><div class="actions"><a class="btn" href="#/contribute">How to contribute a server</a></div></div>`);
     },
     click(e) {
       const b = e.target.closest("[data-act]");
@@ -1909,8 +1909,8 @@ function vFleet() {
 function joinBlock() {
   const st = S.status;
   const newcomers = joinInfo ? st.runs.filter((r) => !joinInfo.slots.has(r.id) && r.live) : [];
-  if (joinInfo) return `${codebox(joinInfo.command)}<p class="hint">The token in it is a secret: anyone who has it can add a machine to the fleet.</p>
-    <div style="margin-top:10px">${newcomers.length ? newcomers.map((r) => `<div class="ok-line">✓ Machine ${r.machine} joined${r.label ? ` (${esc(r.label)})` : ""} <a href="${machineHref(r.machine)}">Open</a></div>`).join("") : `<span class="meta">${pill("deploying", "waiting")} for a new machine to check in…</span>`}</div>`;
+  if (joinInfo) return `${codebox(joinInfo.command)}<p class="hint">The token in it is a secret: anyone who has it can add a server to the fleet.</p>
+    <div style="margin-top:10px">${newcomers.length ? newcomers.map((r) => `<div class="ok-line">✓ Server ${r.machine} joined${r.label ? ` (${esc(r.label)})` : ""} <a href="${machineHref(r.machine)}">Open</a></div>`).join("") : `<span class="meta">${pill("deploying", "waiting")} for a new server to check in…</span>`}</div>`;
   return `<div class="row" style="align-items:flex-end">
       <div><label class="f" for="cj-label">Name (optional)</label><input id="cj-label" placeholder="its hostname" style="width:180px"></div>
       <button type="button" class="primary" data-act="join">Show the join command</button></div>
@@ -1920,27 +1920,27 @@ function joinBlock() {
 function vContribute() {
   const o = location.origin;
   return {
-    title: "Contribute a machine",
-    html: `<h1>Contribute a machine</h1><div class="sub">Add a computer to the fleet: it gets a machine number and its own Cloudflare tunnel, and runs the app replicas placed on it.</div>
+    title: "Contribute a server",
+    html: `<h1>Contribute a server</h1><div class="sub">Add a computer to the fleet: it gets a server number and its own Cloudflare tunnel, and runs the app replicas placed on it.</div>
       <div class="card guide" style="margin-top:12px">
         <h3 style="margin-top:4px">What you need</h3>
-        <ol><li>A Linux machine (a VM, a server, a spare PC) with <a href="https://docs.docker.com/engine/install/" target="_blank" rel="noopener">Docker</a> installed. 2 CPU cores and 2 GB of memory or more is a good start.</li>
-          <li>Outbound internet. No open ports, port forwarding or public IP: the machine dials out through its tunnel.</li>
+        <ol><li>A Linux server (a VM, a server, a spare PC) with <a href="https://docs.docker.com/engine/install/" target="_blank" rel="noopener">Docker</a> installed. 2 CPU cores and 2 GB of memory or more is a good start.</li>
+          <li>Outbound internet. No open ports, port forwarding or public IP: the server dials out through its tunnel.</li>
           <li>The join command, which carries the fleet's join token (below).</li></ol>
-        <div class="warnbox"><b>Only contribute a machine you're happy for others to run code on.</b> Anyone can deploy apps to this fleet, and an app placed on your machine runs as Docker containers with whatever its compose file asks for, which can include host folders and privileged access. A dedicated VM is the safe choice.</div>
+        <div class="warnbox"><b>Only contribute a server you're happy for others to run code on.</b> Anyone can deploy apps to this fleet, and an app placed on your server runs as Docker containers with whatever its compose file asks for, which can include host folders and privileged access. A dedicated VM is the safe choice.</div>
         <h3>1. Get the join command</h3>
         <div id="cj-join"></div>
-        <h3>2. Run it on the machine</h3>
-        <p>It runs <a href="/install.sh" target="_blank" rel="noopener">install.sh</a> from the control plane (read it first if you like), which starts the agent in the container <code>runner-agent</code>. The agent downloads its latest code each time it starts, joins, and keeps its machine number across restarts.</p>
+        <h3>2. Run it on the server</h3>
+        <p>It runs <a href="/install.sh" target="_blank" rel="noopener">install.sh</a> from the control plane (read it first if you like), which starts the agent in the container <code>runner-agent</code>. The agent downloads its latest code each time it starts, joins, and keeps its server number across restarts.</p>
         ${codebox(`curl -fsSL ${o}/install.sh | sudo JOIN_TOKEN=<token> sh`, { copy: false })}
         <p>That's the shape of it; copy the real one, token filled in, from step 1. Options, as more <code>NAME=value</code> before <code>sh</code>:</p>
         <ul><li><code>LABEL=&lt;name&gt;</code>: what the pages call it (default: its hostname).</li>
           <li><code>RUNNER_DATA=&lt;folder&gt;</code>: where it keeps its files (default <code>/var/lib/runner</code>).</li></ul>
         <h3>3. Check it joined</h3>
-        <p>Within a minute it shows up under <a href="#/machines">Machines</a>, and new replicas start going to it. Follow it on the machine with <code>docker logs -f runner-agent</code>.</p>
+        <p>Within a minute it shows up under <a href="#/machines">Servers</a>, and new replicas start going to it. Follow it on the server with <code>docker logs -f runner-agent</code>.</p>
         <h3>Leave the fleet</h3>
         ${codebox("docker rm -f runner-agent tunnel router")}
-        <p>Its replicas move to other machines within about a minute. Then the fleet's owner can retire its slot (on its machine page) so its tunnel and DNS names are removed.</p>
+        <p>Its replicas move to other servers within about a minute. Then the fleet's owner can retire its slot (on its server page) so its tunnel and DNS names are removed.</p>
       </div>`,
     status() {
       // A poll mustn't redraw the form while someone's typing in it; once the command is shown, it follows newcomers.
@@ -1965,16 +1965,16 @@ function vGuide() {
       if ($("#guide").childElementCount) return;
       const d = esc(dom());
       $("#guide").innerHTML = `
-      <p>An app is a <b>Docker Compose file</b>, a <b>Dockerfile</b>, or both, plus any text files the build needs. It runs as many <b>replicas</b> as it asks for (1 to ${MAX_REPLICAS}, 1 by default), spread over the machines with the most free CPU and memory, one per machine while there are machines without one; with more replicas than machines, some machines run two copies (the second one's ports are moved aside for it).
-        Each replica has its own URL: replica <i>k</i> is always at <code>https://&lt;name&gt;-<i>k</i>.${d}</code>, whichever machine it's on. There's no shared URL that spreads visitors across replicas, so hand out the replica URL you want people on.
-        Each deploy is a new version, and every replica switches to it at once. If it fails, it stays failing (the app's page shows each machine's error) until you deploy a fix or roll back.</p>
+      <p>An app is a <b>Docker Compose file</b>, a <b>Dockerfile</b>, or both, plus any text files the build needs. It runs as many <b>replicas</b> as it asks for (1 to ${MAX_REPLICAS}, 1 by default), spread over the servers with the most free CPU and memory, one per server while there are servers without one; with more replicas than servers, some servers run two copies (the second one's ports are moved aside for it).
+        Each replica has its own URL: replica <i>k</i> is always at <code>https://&lt;name&gt;-<i>k</i>.${d}</code>, whichever server it's on. There's no shared URL that spreads visitors across replicas, so hand out the replica URL you want people on.
+        Each deploy is a new version, and every replica switches to it at once. If it fails, it stays failing (the app's page shows each server's error) until you deploy a fix or roll back.</p>
       <h3>From this site</h3>
       <ol><li>Open <a href="#/apps/new">New app</a>, or start from one of its examples.</li>
         <li><b>Name:</b> lowercase letters, digits and dashes, like <code>my-app</code>.</li>
         <li><b>Port:</b> what the app listens on (or <code>x-runner.port</code> in the compose file).</li>
         <li>Paste a compose file and/or a Dockerfile, and add (or upload) anything the build <code>COPY</code>s.</li>
         <li><b>App password</b> (optional): leave it empty and anyone can change or remove the app; with one, changing it needs that app password (or the admin password). If it's lost, the fleet's owner can set a new one with the admin password.</li>
-        <li><b>Deploy.</b> The app's page shows each replica come up, and every machine's error if one fails.</li></ol>
+        <li><b>Deploy.</b> The app's page shows each replica come up, and every server's error if one fails.</li></ol>
       <p class="hint">Roll back from the app's Versions list: <b>Roll back</b> deploys that version's files again (it becomes the newest version) and keeps the replica count. The app's page also sets or changes an app's password.</p>
       <h3>With the API</h3>
       <p>Send JSON to <code>PUT ${esc(o)}/api/projects/&lt;name&gt;</code>, no credentials needed. Fields: <code>compose</code>, <code>dockerfile</code>, <code>files</code> (<code>{"path": "text"}</code>), <code>port</code>, <code>replicas</code> (1–${MAX_REPLICAS}, default 1), and optionally <code>password</code> (${MIN_APP_PASSWORD} characters or more), which locks the app. Sending only <code>{"replicas": N}</code> to an existing app changes the count and keeps its files.
@@ -1983,10 +1983,10 @@ function vGuide() {
       ${codebox(`curl -X PUT ${o}/api/projects/whoami \\\n  -H 'Content-Type: application/json' \\\n  -d '{"port": 8080, "replicas": 2, "compose": "services:\\n  web:\\n    image: traefik/whoami\\n    command: [\\"--port\\", \\"8080\\"]\\n    ports: [\\"8080:8080\\"]\\n"}'`)}
       <p class="hint">Files on disk: let <code>jq</code> build the body. Add <code>password: $pw</code> to give the app a password; updating it then takes <code>-H "x-app-password: $PW"</code>.</p>
       ${codebox(`jq -n --rawfile df my-app/Dockerfile --rawfile app my-app/app.py \\\n  '{port: 8000, dockerfile: $df, files: {"app.py": $app}}' |\ncurl -X PUT ${o}/api/projects/my-app -H 'Content-Type: application/json' --data-binary @-`)}
-      ${codebox(`B=${o}/api\ncurl $B/status                            # every app and machine\ncurl $B/projects/my-app                   # the current spec and its versions\ncurl $B/projects/my-app?version=2         # an earlier version\ncurl -X POST $B/projects/my-app/disable   # stop it everywhere, keep its versions\ncurl -X POST $B/projects/my-app/enable\ncurl -X DELETE $B/projects/my-app         # delete it and its versions`)}
-      <p class="hint">With the repo checked out, <code>bin/runnerctl apply &lt;folder or file&gt; [name] --port N</code> does this for you. Limits: 30 files, 250 KB, text only; ports 2019 and 19080 are taken. Two apps that publish the same host port are never placed on the same machine.</p>
-      <h3>Add a machine</h3>
-      <p>Any Linux machine with Docker can join: see <a href="#/contribute">Contribute a machine</a>.</p>`;
+      ${codebox(`B=${o}/api\ncurl $B/status                            # every app and server\ncurl $B/projects/my-app                   # the current spec and its versions\ncurl $B/projects/my-app?version=2         # an earlier version\ncurl -X POST $B/projects/my-app/disable   # stop it everywhere, keep its versions\ncurl -X POST $B/projects/my-app/enable\ncurl -X DELETE $B/projects/my-app         # delete it and its versions`)}
+      <p class="hint">With the repo checked out, <code>bin/runnerctl apply &lt;folder or file&gt; [name] --port N</code> does this for you. Limits: 30 files, 250 KB, text only; ports 2019 and 19080 are taken. Two apps that publish the same host port are never placed on the same server.</p>
+      <h3>Add a server</h3>
+      <p>Any Linux server with Docker can join: see <a href="#/contribute">Contribute a server</a>.</p>`;
     },
   };
 }
@@ -2014,7 +2014,7 @@ function route() {
   current = location.hash;
   document.title = `${view.title} · Runners`;
   hideTip();
-  main.innerHTML = view.html + `<footer class="foot"><a href="#/guide">Deploy guide</a> · <a href="#/contribute">Contribute a machine</a> · <a href="/install.sh" target="_blank" rel="noopener">install.sh</a></footer>`;
+  main.innerHTML = view.html + `<footer class="foot"><a href="#/guide">Deploy guide</a> · <a href="#/contribute">Contribute a server</a> · <a href="/install.sh" target="_blank" rel="noopener">install.sh</a></footer>`;
   main.onclick = (e) => {
     const tr = e.target.closest("tr[data-href]");
     if (tr && !e.target.closest("a,button,input,select")) location.hash = tr.dataset.href;
