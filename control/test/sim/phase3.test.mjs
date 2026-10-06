@@ -36,7 +36,7 @@ function watcher(c, f, apps) {
   for (const p of ["a", "b", "c"]) await f.startPool(p);
   await f.run(5 * MIN);
   deploy(c, "web", app("web", 12));
-  deploy(c, "kv", app("kv", 5, "  stateful: true\n  resync: 120\n", 7000));
+  deploy(c, "kv", app("kv", 5, "", 7000));
   await f.run(10 * MIN);
   const w = watcher(c, f, { web: 12, kv: 5 });
   await f.run(7 * 60 * MIN, w.each);

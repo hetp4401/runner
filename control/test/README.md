@@ -30,7 +30,7 @@ take seconds. Each prints ok or WRONG per check and exits non-zero on a WRONG.
 
 ```sh
 node control/test/sim/phase1.test.mjs   # gaps and mass silences, stable copy keys, moves that keep the old copy, events
-node control/test/sim/phase2.test.mjs   # stateful apps one copy at a time, pool shares, readiness, replica changes, budgets
+node control/test/sim/phase2.test.mjs   # every app alike, readiness, replica changes, placement filters, budgets
 node control/test/sim/phase3.test.mjs   # scheduled departures and their gates, same-slot handovers, capped pools, losses
 node control/test/sim/phase4.test.mjs   # failing copies, sick servers, the hot rule, the thrash breaker, moves in flight
 node control/test/sim/phase5.test.mjs   # dark and lit replicas, cold departures, churn, wait reasons, the alert webhook

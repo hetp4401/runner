@@ -1,9 +1,8 @@
-// Phase 2: stateful apps change one copy at a time, spread across pools, readiness, replica changes recreate nothing,
-// placement filters (deadline, starting servers), budgeted evictions.
+// Phase 2: every app is treated alike (an x-runner.stateful left in a spec changes nothing), readiness, replica changes
+// recreate nothing, placement filters (deadline, starting servers), budgeted evictions, spreading across pools.
 import { makeControl, Fleet, deploy, ok, summary, placed, MIN, T } from "./lib.mjs";
 
 const app = (name, replicas, xr = "", port = 8080) => ({ port, replicas, compose: `x-runner:\n  port: ${port}\n  replicas: ${replicas}\n${xr}services:\n  app:\n    image: ${name}\n    ports: ["${port}:${port}"]\n` });
-const kv = (replicas, more = "") => app("kv", replicas, `  stateful: true\n  resync: 120\n${more}`, 7000);
 const poolsOf = (c, f, name) => {
   const by = {};
   for (const x of c.copiesOf(name).filter((y) => !y.leaving)) {
@@ -13,37 +12,16 @@ const poolsOf = (c, f, name) => {
   return by;
 };
 
-{ // 1. a new stateful app is placed at once (nothing to protect); once it has had its quorum, lost copies come back
-  //    one at a time, each healthy for its resync window before the next; no pool holds more than its share
+{ // 1. x-runner.stateful is gone: a spec that still says it deploys, and is placed like any app (here, with more
+  //    replicas than servers, a server runs two copies)
   const c = makeControl();
-  const f = new Fleet(c, { a: { size: 3, cap: 20 }, b: { size: 3, cap: 20 }, c: { size: 3, cap: 20 } }, { drainAt: () => null, build: 60_000 });
-  for (const p of ["a", "b", "c"]) await f.startPool(p);
+  const f = new Fleet(c, { a: { size: 2, cap: 20 } }, { drainAt: () => null });
+  await f.startPool("a");
   await f.run(4 * MIN);
-  deploy(c, "kv", kv(5));
-  await f.run(3 * MIN);
-  ok("a new stateful app gets all 5 copies at once", c.copiesOf("kv").length === 5, placed(c, "kv").join(" "));
-  await f.run(5 * MIN);
-  const by = poolsOf(c, f, "kv");
-  ok("no pool holds more than replicas - quorum (2)", Object.values(by).every((n) => n <= 2), JSON.stringify(by));
-  // Two of its servers stop for good (no successor): their copies come back one at a time.
-  const victims = [...new Set(c.copiesOf("kv").map((x) => x.machine))].slice(0, 2);
-  for (const s of f.alive().filter((y) => victims.includes(y.machine))) { await f.sync(s, { leaving: true }); f.stop(s, "test"); }
-  const firstSeen = new Map();
-  let maxNew = 0;
-  await f.run(15 * MIN, () => {
-    for (const x of c.copiesOf("kv")) if (x.cause === "lost" && !firstSeen.has(`${x.replica}@${x.machine}`)) firstSeen.set(`${x.replica}@${x.machine}`, x.since);
-    maxNew = Math.max(maxNew, c.copiesOf("kv").filter((x) => x.leaving?.lost).length); // rebuilds in flight
-  });
-  const times = [...firstSeen.values()].sort((a, b) => a - b);
-  ok("both lost copies came back", c.copiesOf("kv").length === 5, placed(c, "kv").join(" "));
-  ok("one at a time: never two rebuilds in flight together", maxNew <= 1, `max ${maxNew}`);
-  ok("the second came after the first's build and resync window", times.length === 2 && times[1] - times[0] >= 170_000, `${(times[1] - times[0]) / 1000} s`);
-  // 2. lowering 5 -> 3 removes one copy per resync window, highest first (after the new version is applied)
-  deploy(c, "kv", kv(3));
-  await f.run(3 * MIN);
-  ok("one replica cut, the highest first", c.copiesOf("kv").length === 4 && !c.copiesOf("kv").some((x) => x.replica === 5), placed(c, "kv").join(" "));
-  await f.run(3 * MIN);
-  ok("then the next, a resync window later", c.copiesOf("kv").length === 3, placed(c, "kv").join(" "));
+  deploy(c, "kv", app("kv", 3, "  stateful: true\n  resync: 120\n", 7000));
+  await f.run(4 * MIN);
+  ok("all 3 copies placed on 2 servers", c.copiesOf("kv").length === 3 && c.blocked.get("kv") == null, placed(c, "kv").join(" "));
+  ok("the budget is the usual one: a fifth of the replicas, at least one", c.budget("kv") === 1);
 }
 
 { // 3. a replica-count change recreates nothing: the copies that stay get the same files and .env
@@ -114,7 +92,7 @@ const poolsOf = (c, f, name) => {
   await f.startPool("a");
   await f.startPool("b");
   await f.run(4 * MIN);
-  deploy(c, "kv", kv(3));
+  deploy(c, "kv", app("kv", 3, "", 7000));
   await f.run(20 * MIN);
   const [x1, x2] = c.copiesOf("kv");
   c.move("kv", x1.machine, null, x1.replica); // one copy is changing now
