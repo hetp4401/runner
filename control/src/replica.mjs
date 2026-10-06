@@ -90,17 +90,29 @@ export class Lease {
     const cur = await this.read();
     if (cur && cur.holder !== this.me.id && cur.until > now - 5_000) return { taken: false, cur };
     const v = await this.store.put(LEASE, this.body(now), { version: cur ? cur.version : NEW });
-    if (v == null) return { taken: false, cur: await this.read() };
+    if (v == null) {
+      const after = await this.read();
+      if (after?.holder !== this.me.id) return { taken: false, cur: after };
+      this.version = after.version; // (an earlier try of this write went through: see renew)
+      return { taken: true, cur };
+    }
     this.version = v;
     return { taken: true, cur };
   }
 
   // Renews it: throws LostLease when another copy has it now. A store that doesn't answer leaves it as it is (the
-  // other copies can't take it either while the store is down).
+  // other copies can't take it either while the store is down). A write is tried again on another zkmetadata replica
+  // when the first doesn't answer, and the first may have written it all the same: then the retry finds the key a
+  // version on, written by this copy. So a conflict is only another copy's doing if the lease says so.
   async renew(now = Date.now()) {
     const v = await this.store.put(LEASE, this.body(now), { version: this.version });
-    if (v == null) throw new LostLease("another copy holds the lease now");
-    this.version = v;
+    if (v != null) {
+      this.version = v;
+      return;
+    }
+    const cur = await this.read();
+    if (cur?.holder !== this.me.id) throw new LostLease(`${cur?.holder ?? "nobody"} holds the lease now`);
+    this.version = cur.version;
   }
 
   // Hands it on at once (a clean stop): it runs out now.
@@ -201,10 +213,15 @@ export class Snapshots {
     const n = Math.ceil(sealed.length / CHUNK);
     for (let i = 0; i < n; i++) await this.store.put(`${SNAP}.${gen}.${i}`, sealed.subarray(i * CHUNK, (i + 1) * CHUNK));
     const m = { gen, n, sha256: sha256(sealed), t: Date.now(), by: this.me.id, bytes: sealed.length };
-    const v = await this.store.put(SNAP, JSON.stringify(m), { version: this.version ?? NEW });
-    if (v == null) {
-      for (let i = 0; i < n; i++) await this.store.del(`${SNAP}.${gen}.${i}`).catch(() => {});
-      throw new LostLease("another copy saved a snapshot since: it's the leader now");
+    let v = await this.store.put(SNAP, JSON.stringify(m), { version: this.version ?? NEW });
+    if (v == null) { // another copy's snapshot, or this very write's earlier try (see Lease.renew)
+      const got = await this.store.get(SNAP);
+      const cur = got && JSON.parse(got.data.toString());
+      if (cur?.by === this.me.id && cur.gen === gen) v = got.version;
+      else {
+        for (let i = 0; i < n; i++) await this.store.del(`${SNAP}.${gen}.${i}`).catch(() => {});
+        throw new LostLease("another copy saved a snapshot since: it's the leader now");
+      }
     }
     const old = this.manifest;
     this.version = v;
