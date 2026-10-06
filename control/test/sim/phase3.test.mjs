@@ -65,7 +65,7 @@ function watcher(c, f, apps) {
   const s0 = f.alive("a")[0];
   c.drain({ agent: s0.agent });
   await f.run(40 * MIN, w.each);
-  ok("pool a was marked capped", c.recentEvents.some((e) => e.kind === "capped" && e.cause === "a"), c.recentEvents.filter((e) => e.kind === "capped").map((e) => e.detail).join(" | "));
+  ok("new servers not arriving was noticed (capped)", c.recentEvents.some((e) => e.kind === "capped") && c.capped("a", T), c.recentEvents.filter((e) => e.kind === "capped").map((e) => e.detail).join(" | "));
   ok("the drained server left after moving its copies out", !s0.alive && c.recentEvents.some((e) => e.kind === "retire" && e.cause === "evicted" && e.machine === s0.machine));
   ok("no replica went dark", Object.keys(w.dark).length === 0, JSON.stringify(w.dark));
 }

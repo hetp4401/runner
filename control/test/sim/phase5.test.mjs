@@ -33,7 +33,7 @@ const onMachine = (c, name, k) => c.copiesOf(name).find((x) => x.replica === k &
   ok("it went dark, blamed on the stopped server's run", dark.length === 1 && dark[0].run === s.run, dark.map((e) => `${e.cause}: ${e.detail}`).join(" | "));
   ok("and lit again once placed elsewhere, with how long it was dark", lit.length === 1 && lit[0].other >= 300 && onMachine(c, "solo", 1) !== m, lit.map((e) => `${e.other} s: ${e.detail}`).join(" | "));
   const st = c.status();
-  ok("the pool counts a lost server", st.departures.pools.find((p) => p.pool === "a")?.lost === 1, JSON.stringify(st.departures.pools));
+  ok("the day counts a lost server", st.departures.day.lost === 1, JSON.stringify(st.departures.day));
   ok("a day's dark time is on the status", st.cold.spells === 1 && st.cold.seconds >= 300, JSON.stringify(st.cold));
   ok("5 minutes dark raised an alert", events(c, "alert", { cause: "dark", app: "solo" }).length === 1);
   await new Promise((r) => setTimeout(r, 300));
@@ -55,10 +55,10 @@ const onMachine = (c, name, k) => c.copiesOf(name).find((x) => x.replica === k &
   const list = c.status().departures.list;
   const second = list.find((d) => d.machine === s2.machine);
   ok("the first is handing over", list.find((d) => d.machine === s1.machine)?.leaving === "handover", JSON.stringify(list.map((d) => [d.machine, d.leaving, d.wait])));
-  ok("the second waits, and says why", second?.due && !second.leaving && /pool a is leaving/.test(second.wait ?? ""), second?.wait);
+  ok("the second waits, and says why", second?.due && !second.leaving && /same group is leaving/.test(second.wait ?? ""), second?.wait);
   await f.run(25 * MIN);
   const st = c.status();
-  const a = st.departures.pools.find((p) => p.pool === "a");
+  const a = st.departures.day;
   ok("both left warm: nothing went dark", a?.planned === 2 && a.plannedCold === 0 && events(c, "dark").length === 0, JSON.stringify(a));
   ok("handover times recorded", a?.handover?.n === 2 && a.handover.build > 0, JSON.stringify(a?.handover));
   ok("the successors' rebuilds count as churn", st.churn.h1.successor === 2, JSON.stringify(st.churn.h1));

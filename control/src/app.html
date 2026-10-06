@@ -657,7 +657,7 @@ function problems() {
     out.push({ kind: "failed", href: machineHref(r.machine), text: `Server ${r.machine} is quarantined for ${fmtDur(r.quarantine.until - st.now)} more: ${r.quarantine.why ?? "it stayed hot after an app was moved off it"}` });
   }
   if (st.rebalance.state === "paused") out.push({ kind: "failed", href: "#/activity", text: `Automatic moves are paused until ${clock(st.rebalance.paused)}: they looked like thrashing` });
-  for (const c of st.departures?.capped ?? []) out.push({ kind: "deploying", href: "#/activity", text: `Pool ${c.pool} can't start servers right now: its departures move apps out first` });
+  if (st.departures?.capped) out.push({ kind: "deploying", href: "#/activity", text: "New servers aren't arriving right now: servers that leave move their apps out first" });
   // What automation gave up on in the last 2 hours (dark replicas, the pause and capped pools have their own lines while they last).
   // The newest alert per cause and subject; more than 3 of one cause are one line (a roll's waits, say).
   const seenAlert = new Set(), byCause = new Map();
@@ -1356,7 +1356,7 @@ function rebalanceLog(limit) {
 }
 // Copy starts by cause: "3 placed · 1 moved · 4 successor · 2 version" (the non-zero ones).
 const churnSub = (b) => [[b.placed, "placed"], [b.moved, "moved"], [b.successor, "by successors"], [b.version, "new versions"]].filter(([n]) => n).map(([n, w]) => `${n} ${w}`).join(" · ") || "none";
-const MOVE_CAUSE = { hot: "hot server", failed: "failing copy", unstack: "spread out", spread: "pool share", evict: "server leaving", hand: "by hand", lost: "server lost", lostMove: "server lost" };
+const MOVE_CAUSE = { hot: "hot server", failed: "failing copy", unstack: "spread out", spread: "spread out", evict: "server leaving", hand: "by hand", lost: "server lost", lostMove: "server lost" };
 const movesSub = (m) => Object.entries(m).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${n} ${MOVE_CAUSE[c] ?? c}`).join(" · ") || "none";
 const depText = (d) => d.leaving === "handover" ? `handing over · ${fmtDur(S.status.now - d.since)}`
   : d.leaving === "evict" ? `moving its apps out · ${fmtDur(S.status.now - d.since)}`
@@ -1367,7 +1367,7 @@ function departureStrip(limit) {
   const st = S.status;
   const list = st.departures.list.filter((d) => d.leaving || d.due || (d.dueAt && d.dueAt - st.now < 3600_000)).slice(0, limit);
   if (!list.length) return `<div class="meta" style="margin-top:10px">No server leaves in the next hour.</div>`;
-  return `<div class="strip">${list.map((d) => `<a class="dep${d.leaving ? " on" : d.due ? " due" : ""}" href="${machineHref(d.machine)}"><span><b>Server ${d.machine}</b>${d.pool ? ` <span class="meta">· pool ${esc(d.pool)}</span>` : ""}</span><span class="meta">${esc(depText(d))}</span>${d.deadline ? `<span class="meta">stops by ${esc(clock(d.deadline))}</span>` : ""}</a>`).join("")}</div>`;
+  return `<div class="strip">${list.map((d) => `<a class="dep${d.leaving ? " on" : d.due ? " due" : ""}" href="${machineHref(d.machine)}"><span><b>Server ${d.machine}</b></span><span class="meta">${esc(depText(d))}</span>${d.deadline ? `<span class="meta">stops by ${esc(clock(d.deadline))}</span>` : ""}</a>`).join("")}</div>`;
 }
 // Event groups for the feed. "All" leaves out the busiest kinds (copies started by successors and new versions, DNS).
 const FEED = {
@@ -1385,13 +1385,12 @@ const eventLines = (list) => list.length
   ? `<div class="log">${list.map((e) => `<div><span class="meta">${esc(clock(e.t))}</span> ${esc(e.text ?? e.detail ?? e.kind)}</div>`).join("")}</div>`
   : `<div class="meta" style="margin-top:8px">Nothing yet.</div>`;
 function activitySummary(limit) {
-  const st = S.status, ch = st.churn, pools = st.departures.pools;
-  const sum = (f) => pools.reduce((n, p) => n + f(p), 0);
+  const st = S.status, ch = st.churn, day = st.departures.day;
   return `${rebalanceLine()}
     <div style="margin-top:12px">${tiles([
       { label: "Copies started, last hour", value: String(ch.h1.starts), sub: churnSub(ch.h1) },
       { label: "Copies started, last day", value: String(ch.h24.starts), sub: churnSub(ch.h24) },
-      { label: "Departures, last day", value: String(sum((p) => p.planned + p.stopped)), sub: `${sum((p) => p.plannedCold + p.stoppedCold)} cold · ${sum((p) => p.lost)} lost` },
+      { label: "Departures, last day", value: String(day.planned + day.stopped), sub: `${day.plannedCold + day.stoppedCold} cold · ${day.lost} lost` },
       { label: "Dark time, last day", value: st.cold.seconds ? fmtDur(st.cold.seconds * 1000) : "none", sub: plural(st.cold.spells, "dark spell") },
     ])}</div>
     ${departureStrip(6)}
@@ -1452,7 +1451,7 @@ function vActivity() {
       <div id="ac-feed"><div class="meta">Loading…</div></div>`,
     mount() { load(); },
     status() {
-      const st = S.status, ch = st.churn, dep = st.departures;
+      const st = S.status, ch = st.churn, dep = st.departures, day = dep.day;
       setHtml($("#ac-rebalance"), `${rebalanceLine(false)}${st.rebalance.hot.length ? `<div class="meta" style="margin-top:4px">Hot now: ${st.rebalance.hot.map((n) => `server ${n}`).join(", ")}</div>` : ""}`);
       setHtml($("#ac-churn"), `${tiles([
           { label: "Copies started, last hour", value: String(ch.h1.starts), sub: churnSub(ch.h1) },
@@ -1466,15 +1465,18 @@ function vActivity() {
         ${table(["App", "At once", "Last 2 min", "Last 10 min", "Last hour"], ch.stateful.map((x) => ({ href: appHref(x.app), cells: [`<b>${esc(x.app)}</b>`, String(x.budget), String(x.m2), String(x.m10), String(x.m60)] })), { num: [1, 2, 3, 4] })}` : ""}`);
       setHtml($("#ac-deps"), `${departureStrip(12)}
         <h3>Every server's departure</h3>
-        ${table(["Server", "Pool", "Leaving", "Stops by"], dep.list.map((d) => ({ href: machineHref(d.machine), cells: [`<b>Server ${d.machine}</b>`, esc(d.pool ?? "–"), esc(depText(d) || "–"), d.deadline ? esc(clock(d.deadline)) : "–"] })),
+        ${table(["Server", "Leaving", "Stops by"], dep.list.map((d) => ({ href: machineHref(d.machine), cells: [`<b>Server ${d.machine}</b>`, esc(depText(d) || "–"), d.deadline ? esc(clock(d.deadline)) : "–"] })),
           { empty: "No server says when it stops" })}
-        <h3>Last day, per pool</h3>
-        <p class="meta">Planned: the control plane's (handovers and evictions). Stopped: by the platform at the job's limit. Cold: a replica had no healthy copy because of it. Handover: a successor's start, its build, and the overlap before the old server leaves (medians).</p>
-        ${table(["Pool", "Planned", "Stopped", "Lost", "Handover"], dep.pools.map((x) => ({ cells: [esc(x.pool ?? "standalone"),
-          `${x.planned}${x.plannedCold ? ` (${x.plannedCold} cold)` : ""}`, `${x.stopped}${x.stoppedCold ? ` (${x.stoppedCold} cold)` : ""}`, String(x.lost),
-          x.handover ? `${fmtDur(x.handover.queue)} · ${fmtDur(x.handover.build)} · ${fmtDur(x.handover.overlap)} <span class="meta">(${x.handover.n})</span>` : "–"] })),
-          { empty: "No departures in the last day", num: [1, 2, 3] })}
-        ${dep.capped.length ? `<p class="meta">Can't start servers right now: ${dep.capped.map((c) => `pool ${esc(c.pool)} (until ${esc(clock(c.until))})`).join(", ")}</p>` : ""}`);
+        <h3>Last day</h3>
+        <p class="meta">Planned: the control plane's (handovers and evictions). Stopped: the server was stopped on its own. Cold: a replica had no healthy copy because of it. Handover: a successor's start, its build, and the overlap before the old server leaves (medians).</p>
+        ${tiles([
+          { label: "Planned", value: String(day.planned), sub: day.plannedCold ? `${day.plannedCold} cold` : "none cold" },
+          { label: "Stopped", value: String(day.stopped), sub: day.stoppedCold ? `${day.stoppedCold} cold` : "none cold" },
+          { label: "Lost", value: String(day.lost), sub: "went silent" },
+          { label: "Handover", value: day.handover ? fmtDur(day.handover.queue + day.handover.build + day.handover.overlap) : "–",
+            sub: day.handover ? `start ${fmtDur(day.handover.queue)} · build ${fmtDur(day.handover.build)} · overlap ${fmtDur(day.handover.overlap)}` : "none yet" },
+        ])}
+        ${dep.capped ? `<p class="meta">New servers aren't arriving right now: servers that leave move their apps out first.</p>` : ""}`);
       setHtml($("#ac-dark"), `${st.dark.length
           ? table(["Replica", "Dark for", "Why"], st.dark.map((d) => ({ href: appHref(d.app), cells: [`<b>${esc(d.app)}</b> #${d.replica}`, fmtDur(st.now - d.since), esc(d.why)] })))
           : `<div class="card ok-line">✓ Every replica has a healthy copy</div>`}

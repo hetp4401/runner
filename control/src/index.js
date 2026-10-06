@@ -93,7 +93,7 @@ const QUARANTINE_MS = 60 * 60_000; // a sick or stubbornly hot server isn't a de
 const SICK_DRAIN_GAP_MS = 30 * 60_000; // at most one sick server per pool is asked to leave per this long
 const HOT_DEST_MS = 30 * 60_000; // a server that took a hot move isn't a hot move's destination again for this long
 const PAUSE_MS = 60 * 60_000; // the thrash breaker pauses automatic moves this long
-const DEFAULT_CPUS = 4; // cores assumed for a server whose agent doesn't say (GitHub's hosted runners have 4)
+const DEFAULT_CPUS = 4; // cores assumed for a server whose agent doesn't say
 // Metrics: agents send one summary per machine per minute; the fleet's minute is stored as one row (few writes),
 // and rolled up into 10-minute rows for the day view
 const MIN = 60_000;
@@ -604,7 +604,7 @@ export class Control {
       if (!runColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE runs ADD COLUMN ${col}`);
     }
     if (!columns("agents").has("pool")) this.sql.exec("ALTER TABLE agents ADD COLUMN pool TEXT");
-    if (!columns("events").has("pool")) this.sql.exec("ALTER TABLE events ADD COLUMN pool TEXT");
+    if (columns("events").has("pool")) this.sql.exec("ALTER TABLE events DROP COLUMN pool"); // (briefly had one)
     const copyColumns = columns("copies");
     for (const col of ["key TEXT", "cause TEXT"]) if (!copyColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE copies ADD COLUMN ${col}`);
     // Working state lives in memory (the object is single-threaded); SQLite keeps it across restarts,
@@ -702,7 +702,7 @@ export class Control {
     this.dark = new Map(); // "app|k" -> { since, run, machine, why, alerted }: replicas with no copy serving now
     this.lastDarkCheck = 0;
     this.dueWait = new Map(); // run -> { since, why }: a due departure waiting at its gate
-    this.handoverTimes = []; // [{ t, pool, machine, queue, build, overlap }] (ms), the last 24 hours
+    this.handoverTimes = []; // [{ t, machine, queue, build, overlap }] (ms), the last 24 hours
     this.webhookLog = []; // when alerts were last posted to ALERT_WEBHOOK (at most 30 an hour)
     this.recentEvents = this.all("SELECT * FROM events ORDER BY id DESC LIMIT 200").reverse(); // the newest, for the pages
     this.slots = new Map(this.all("SELECT n, tunnel, token FROM slots").map((x) => [x.n, x])); // slot -> its tunnel
@@ -780,10 +780,9 @@ export class Control {
   // One row per change the control plane makes or sees, with its cause: what the pages show as activity and churn.
   logEvent(kind, f = {}) {
     const e = { t: f.t ?? Date.now(), kind, app: f.app ?? null, replica: f.replica ?? null, machine: f.machine ?? null,
-      other: f.other ?? null, run: f.run ?? null, cause: f.cause ?? null, detail: f.detail != null ? String(f.detail).slice(0, 500) : null,
-      pool: f.pool ?? (f.run ? this.runs.get(f.run)?.pool : null) ?? null };
-    const row = this.all(`INSERT INTO events (t, kind, app, replica, machine, other, run, cause, detail, pool) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING id`, e.t, e.kind, e.app, e.replica, e.machine, e.other, e.run, e.cause, e.detail, e.pool)[0];
+      other: f.other ?? null, run: f.run ?? null, cause: f.cause ?? null, detail: f.detail != null ? String(f.detail).slice(0, 500) : null };
+    const row = this.all(`INSERT INTO events (t, kind, app, replica, machine, other, run, cause, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id`, e.t, e.kind, e.app, e.replica, e.machine, e.other, e.run, e.cause, e.detail)[0];
     this.recentEvents.push({ id: row?.id, ...e });
     if (this.recentEvents.length > 200) this.recentEvents.splice(0, this.recentEvents.length - 200);
   }
@@ -794,7 +793,7 @@ export class Control {
     const since = Number(q.get("since") ?? 0);
     where.push("t >= ?");
     args.push(Number.isFinite(since) ? since : 0);
-    for (const f of ["app", "kind", "cause", "pool"]) if (q.get(f)) { where.push(`${f} = ?`); args.push(q.get(f)); }
+    for (const f of ["app", "kind", "cause"]) if (q.get(f)) { where.push(`${f} = ?`); args.push(q.get(f)); }
     const kinds = String(q.get("kinds") ?? "").split(",").filter((k) => /^[a-z-]{1,20}$/.test(k)).slice(0, 20);
     if (kinds.length) {
       where.push(`kind IN (${kinds.map(() => "?").join(", ")})`);
@@ -1857,7 +1856,7 @@ export class Control {
     if (spec?.policy.stateful) {
       const N = spec.replicas;
       const cap = Math.max(1, N - (spec.policy.quorum ?? Math.floor(N / 2) + 1));
-      return `every server it could go on is in a pool that already holds ${cap} of its copies (at most replicas - quorum per pool, so losing a pool can't lose its quorum), or runs a copy already`;
+      return `every server it could go on already runs a copy, or belongs to a group of servers that already holds ${cap} of its copies (at most replicas - quorum per group, so losing one group can't lose its quorum)`;
     }
     const empty = [...up.keys()].filter((m) => !this.copiesOn(name, m).length);
     if (empty.length) {
@@ -2366,7 +2365,7 @@ export class Control {
       if (this.neverAuto(name, x, now)) continue;
       const dest = this.bestMachine(name, ctx.dests(x.machine), ctx.counts, now);
       if (!dest) continue;
-      const res = ctx.start(name, x, dest, "spread", `pool ${over[0]} held ${over[1].length} of its copies, more than its share of ${cap}`);
+      const res = ctx.start(name, x, dest, "spread", `one group of servers held ${over[1].length} of its copies, more than its share of ${cap}`);
       if (res === "paused") return res;
     }
     return null;
@@ -2456,7 +2455,7 @@ export class Control {
       this.webhookLog.push(now);
       const message = `Runners: ${text}`;
       fetch(url, { method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(10_000),
-        body: JSON.stringify({ text: message, content: message, cause, app: f.app ?? null, machine: f.machine ?? null, pool: f.pool ?? null, t: now }) })
+        body: JSON.stringify({ text: message, content: message, cause, app: f.app ?? null, machine: f.machine ?? null, t: now }) })
         .catch((e) => console.log(`alert webhook: ${e.message}`));
     }
   }
@@ -2539,7 +2538,7 @@ export class Control {
     if (!((r.quarantine ?? 0) > now) || !this.sickWhy.has(r.id) || r.drain || r.handover || r.evict || r.retire) return;
     const why = this.sickWhy.get(r.id);
     if (!r.pool) {
-      this.alert("sick-server", { machine: r.machine }, `server ${r.machine} looks sick (${why}); it isn't in a pool, so it needs a look`, now);
+      this.alert("sick-server", { machine: r.machine }, `server ${r.machine} looks sick (${why}); nothing replaces it automatically, so it needs a look`, now);
       return;
     }
     if (now - (this.sickDrains[r.pool] ?? 0) < SICK_DRAIN_GAP_MS || this.poolShort(r.pool, now) || this.capped(r.pool, now)) return;
@@ -2657,42 +2656,36 @@ export class Control {
     return v;
   }
 
-  // Departures: under way, coming up (when each run is due, and why a due one waits), and over the last day per pool:
-  // planned (ours) and stopped (by the platform), each cold when a replica went dark with it; lost (gone silent); the
-  // median handover times (start: grant to successor start; build: to successor ready; overlap: to the old run's exit).
+  // Departures: under way, coming up (when each run is due, and why a due one waits), and over the last day: planned
+  // (ours) and stopped (the server was stopped on its own), each cold when a replica went dark with it; lost (gone
+  // silent); median handover times (start: grant to successor start; build: to successor ready; overlap: to the old
+  // run's exit). `capped`: whether new servers aren't arriving for some departures right now.
   departures(now) {
     const list = this.liveRuns(now).filter((r) => !r.retire && !this.predecessorOf(r, now) && (this.dueAt(r) || r.drain || r.handover || r.evict || this.rolled(r)))
       .map((r) => {
         const g = this.departureGate(r, now);
         const due = this.due(r, now);
-        return { machine: r.machine, pool: r.pool ?? null, run: r.id, dueAt: this.dueAt(r), deadline: r.deadline ?? null, due, why: due ? this.dueWhy(r, now) : null,
+        return { machine: r.machine, run: r.id, dueAt: this.dueAt(r), deadline: r.deadline ?? null, due, why: due ? this.dueWhy(r, now) : null,
           leaving: r.handover ? "handover" : r.evict ? "evict" : null, since: r.handover || r.evict || null,
           how: g?.how ?? null, wait: g?.wait ?? null, waitingSince: g?.wait ? this.dueWait.get(r.id)?.since ?? null : null };
       })
       .sort((a, b) => Boolean(b.leaving) - Boolean(a.leaving) || b.due - a.due || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
-    const ev = this.all("SELECT kind, run, pool FROM events WHERE t > ? AND kind IN ('depart', 'server-lost', 'left', 'dark')", now - 24 * 3600_000);
+    const ev = this.all("SELECT kind, run FROM events WHERE t > ? AND kind IN ('depart', 'server-lost', 'left', 'dark')", now - 24 * 3600_000);
     const darkRuns = new Set(ev.filter((e) => e.kind === "dark").map((e) => e.run));
-    const pools = new Map();
-    const pool = (name) => pools.get(name ?? null) ?? pools.set(name ?? null, { pool: name ?? null, planned: 0, plannedCold: 0, stopped: 0, stoppedCold: 0, lost: 0, handover: null }).get(name ?? null);
+    const day = { planned: 0, plannedCold: 0, stopped: 0, stoppedCold: 0, lost: 0, handover: null };
     for (const e of ev) {
       if (e.kind === "depart") {
-        pool(e.pool).planned++;
-        if (darkRuns.has(e.run)) pool(e.pool).plannedCold++;
+        day.planned++;
+        if (darkRuns.has(e.run)) day.plannedCold++;
       } else if (e.kind === "left") {
-        pool(e.pool).stopped++;
-        if (darkRuns.has(e.run)) pool(e.pool).stoppedCold++;
-      } else if (e.kind === "server-lost") pool(e.pool).lost++;
+        day.stopped++;
+        if (darkRuns.has(e.run)) day.stoppedCold++;
+      } else if (e.kind === "server-lost") day.lost++;
     }
+    const hs = this.handoverTimes;
     const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
-    for (const x of pools.values()) {
-      const hs = this.handoverTimes.filter((h) => (h.pool ?? null) === x.pool);
-      if (hs.length) x.handover = { n: hs.length, queue: median(hs.map((h) => h.queue)), build: median(hs.map((h) => h.build)), overlap: median(hs.map((h) => h.overlap)) };
-    }
-    return {
-      list,
-      pools: [...pools.values()].sort((a, b) => String(a.pool).localeCompare(String(b.pool))),
-      capped: [...this.cappedUntil].filter(([, t]) => t > now).map(([p, until]) => ({ pool: p, until })),
-    };
+    if (hs.length) day.handover = { n: hs.length, queue: median(hs.map((h) => h.queue)), build: median(hs.map((h) => h.build)), overlap: median(hs.map((h) => h.overlap)) };
+    return { list, day, capped: [...this.cappedUntil.values()].some((t) => t > now) };
   }
 
   // ---- machines ----
@@ -2776,7 +2769,7 @@ export class Control {
         const succ = this.successorOf(r, now);
         let timing = "";
         if (r.handover && succ) { // queue: grant to successor start; build: to successor ready; overlap: until now
-          const x = { t: now, pool: r.pool ?? null, machine: r.machine, queue: Math.max(0, succ.started - r.handover),
+          const x = { t: now, machine: r.machine, queue: Math.max(0, succ.started - r.handover),
             build: Math.max(0, (succ.readyAt ?? now) - succ.started), overlap: Math.max(0, now - (succ.readyAt ?? now)) };
           this.handoverTimes.push(x);
           const fmt = (ms) => (ms < 90_000 ? `${Math.round(ms / 1000)} s` : `${Math.round(ms / MIN)} min`);
@@ -2825,7 +2818,7 @@ export class Control {
       this.lossNoted.add(r.id);
       this.lossLog = this.lossLog.filter((t) => now - t < 10 * MIN);
       this.lossLog.push(now);
-      this.logEvent("server-lost", { machine: r.machine, run: r.id, cause: r.pool ?? "standalone", detail: `server ${r.machine} stopped checking in without saying it was leaving`, t: now });
+      this.logEvent("server-lost", { machine: r.machine, run: r.id, cause: "silent", detail: `server ${r.machine} stopped checking in without saying it was leaving`, t: now });
     }
     if (lost.size < Math.max(MASS_LOSS_MIN, Math.ceil(0.1 * this.expectedMachines()))) return;
     this.massArms = this.massArms.filter((t) => now - t < 3600_000);
@@ -2873,8 +2866,9 @@ export class Control {
   // The control plane decides when a run leaves: when something asked (drain, roll), at its dueAt (it knows its
   // deadline), early to spread a crowded pool (flatten), or urgently (its deadline is near). Leaving is a same-slot
   // handover by default: the run starts its successor, which inherits its copies (no moves, no DNS changes), and exits
-  // once the successor serves everything it did. In a pool that can't start a successor (capped: every job it may run is
-  // taken), when the deadline is near, or to shrink a pool, it leaves by moving its copies out first (evict), then exits.
+  // once the successor serves everything it did. In a pool that can't start a successor right now (capped: a server it
+  // started didn't show up), when the deadline is near, or to shrink a pool, it leaves by moving its copies out first
+  // (evict), then exits.
   // Gates: one departure in flight per pool (standalone hosts share one), 3 fleet-wide, at most 4 started in 10
   // minutes (2 of them evictions), earliest deadline first, none while settling, within 10 minutes of a (re)start, or
   // after 3 unannounced losses in 10 minutes; a run carrying a copy of an app already changing as much as it may waits.
@@ -2918,8 +2912,8 @@ export class Control {
   markCapped(pool, now, why) {
     if (!pool) return;
     if (!this.capped(pool, now)) {
-      this.logEvent("capped", { cause: pool, pool, detail: `pool ${pool} can't start servers now (${why}): its departures move copies out first for ${CAPPED_MS / MIN} min` });
-      this.alert("capped", { pool }, `pool ${pool} can't start servers now (${why}): its account may be at its job limit`, now);
+      this.logEvent("capped", { cause: "capped", detail: `new servers aren't arriving (${why}): departures that would wait for one move their copies out first for ${CAPPED_MS / MIN} min` });
+      this.alert("capped", {}, `new servers aren't arriving (${why}): whatever starts them may be at its limit`, now);
     }
     this.cappedUntil.set(pool, now + CAPPED_MS);
   }
@@ -2966,11 +2960,11 @@ export class Control {
     // Earliest deadline first: only the first due run that its gates let through may go.
     const queue = this.liveRuns(now).filter((x) => !x.retire && !x.evict && !x.handover && !this.successorOf(x, now) && this.due(x, now))
       .sort((a, b) => (this.sickWhy.has(a.id) ? 0 : 1) - (this.sickWhy.has(b.id) ? 0 : 1) ||
-        (a.deadline ?? a.started + 6 * 3600_000) - (b.deadline ?? b.started + 6 * 3600_000));
+        ((a.deadline ?? Infinity) - (b.deadline ?? Infinity) || a.started - b.started));
     const first = queue.find((x) => !poolBusy(x) && !carriesBusyApp(x) && !rollWaits(x));
     if (first?.id === r.id) return out(null);
     if (rollWaits(r)) return out("a roll replaces one server at a time");
-    if (poolBusy(r)) return out(`another server of ${r.pool ? `pool ${r.pool}` : "its own"} is leaving`);
+    if (poolBusy(r)) return out("a server of the same group is leaving");
     if (carriesBusyApp(r)) return out(`${busyApp(r)} is already changing as much as it may`);
     return out(first ? `server ${first.machine} goes first` : "waiting its turn");
   }
@@ -3144,8 +3138,8 @@ export class Control {
     if (!pool || !(pool in this.pools())) return [];
     const live = this.liveRuns(now);
     if (this.settling(now)) return []; // claiming now would start a whole pool's worth of extras
-    // A start of this pool that never showed up: its jobs are all taken. Claim nothing new until that passes (the
-    // queued start still arrives when a job frees up).
+    // A start of this pool that never showed up: whatever starts its servers can't start more right now. Claim nothing
+    // new until that passes (a start that's only late still arrives).
     for (const [n, at] of [...this.starts]) {
       if (this.startPools.get(n) !== pool || now - at < START_WAIT_MS) continue;
       if (!live.some((x) => x.machine === n && x.started >= at - MIN)) this.markCapped(pool, now, `a machine started for slot ${n} didn't show up within ${START_WAIT_MS / MIN} minutes`);
@@ -3166,7 +3160,7 @@ export class Control {
       this.markStart(n, now, by, pool);
       out.push(n);
     }
-    if (out.length) this.logEvent("start", { cause: pool, detail: `starting ${out.length === 1 ? "a machine" : `${out.length} machines`} for pool ${pool}: slot${out.length === 1 ? "" : "s"} ${out.join(", ")}`, t: now });
+    if (out.length) this.logEvent("start", { cause: "start", detail: `starting ${out.length === 1 ? "a server" : `${out.length} servers`}: slot${out.length === 1 ? "" : "s"} ${out.join(", ")}`, t: now });
     return out;
   }
 

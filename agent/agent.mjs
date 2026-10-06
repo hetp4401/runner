@@ -14,8 +14,8 @@
 //   START_CMD     a shell command that starts a new machine for slot $SLOT. With it, the agent starts the pool members
 //                 the control plane says are missing, and its own replacement when it's handed over; without it, a
 //                 handover restarts the agent (where it runs under a supervisor, it comes back with the latest code)
-//   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then (a CI job's time limit,
-//                 say): the control plane plans its departure before that. Without it, the machine has no deadline.
+//   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then: the control plane plans
+//                 its departure before that. Without it, the machine has no deadline.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
