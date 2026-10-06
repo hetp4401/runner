@@ -1291,6 +1291,12 @@ async function restartAll() {
     if (await withPassword({ admin: true }, (secret) => api("POST", "/roll", null, { secret }))) { fast(); toast("Restarting servers one at a time"); loadStatus(); }
   } catch (e) { fail(e); }
 }
+async function stopRoll() {
+  if (!(await confirmSheet("Stop restarting?", "Servers the restart hasn't reached yet stay until they're due on their own. A server already handing over finishes.", "Stop"))) return;
+  try {
+    if (await withPassword({ admin: true }, (secret) => api("DELETE", "/roll", null, { secret }))) { toast("Restart stopped"); loadStatus(); }
+  } catch (e) { fail(e); }
+}
 async function setRebalance(on) {
   try {
     const r = await withPassword({ admin: true }, (secret) => api("PUT", "/settings", { rebalance: on }, { secret }));
@@ -1367,7 +1373,7 @@ function departureStrip(limit) {
 const FEED = {
   all: null,
   moves: ["place", "move-start", "move-done", "move-cancel", "drop", "rebalance", "pause"],
-  departures: ["depart", "drain", "retire", "left", "server-lost", "start", "capped", "mass-loss", "gap"],
+  departures: ["depart", "drain", "retire", "left", "server-lost", "start", "capped", "mass-loss", "gap", "roll"],
   servers: ["strike", "quarantine", "drain", "server-lost", "mass-loss", "left"],
   dark: ["dark", "lit"],
   alerts: ["alert"],
@@ -2068,13 +2074,17 @@ function vFleet() {
     title: "Fleet",
     html: `<h1>Fleet</h1><div class="sub">Everyone can see this page; changing anything here needs the admin password.</div>
       <h2>Rebalancing</h2><div id="fl-rebalance"></div>
-      <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta">Restart every server, one at a time (for example after changing the agent). A server that can start its own replacement hands over to it first; a contributed server restarts its agent in place.</span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
+      <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta" id="fl-roll-text"></span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
       <h2>Add a server</h2><div id="fl-join"></div>`,
     status() {
       const st = S.status;
       setHtml($("#fl-rebalance"), `<div class="card"><div class="row"><span class="grow"><b>Automatic rebalancing</b></span>
         <button type="button" class="switch" role="switch" data-act="rebalance" aria-checked="${st.rebalance.on}" aria-pressed="${st.rebalance.on}" aria-label="Automatic rebalancing">${st.rebalance.on ? "✓ On" : "○ Off"}</button></div>${rebalanceLog(10)}</div>`);
-      setHtml($("#fl-roll"), `Restart all`);
+      const roll = st.roll;
+      setHtml($("#fl-roll-text"), roll ? `Restarting: ${plural(roll.left, "server")} still to go, one at a time${roll.since ? ` (since ${clock(roll.since)})` : ""}. Servers due on their own go first.`
+        : "Restart every server, one at a time (for example after changing the agent). A server that can start its own replacement hands over to it first; a contributed server restarts its agent in place.");
+      $("#fl-roll").dataset.act = roll ? "rollstop" : "rollall";
+      setHtml($("#fl-roll"), roll ? "Stop" : "Restart all");
       setHtml($("#fl-join"), `<div class="card"><p class="meta" style="margin:0">Any Linux server with Docker can join the fleet with one command.</p><div class="actions"><a class="btn" href="#/contribute">How to contribute a server</a></div></div>`);
     },
     click(e) {
@@ -2083,6 +2093,7 @@ function vFleet() {
       const act = b.dataset.act;
       if (act === "rebalance") setRebalance(b.getAttribute("aria-pressed") !== "true");
       if (act === "rollall") restartAll();
+      if (act === "rollstop") stopRoll();
     },
   };
 }

@@ -146,4 +146,22 @@ function watcher(c, f, apps) {
   ok("the drained server didn't wait for the roll", drainedLeft >= 3, `${drainedLeft} rolled servers still waiting when it left`);
   ok("all warm: no hard stops, nothing dark", f.log.every((l) => !l.includes("hard stop")) && !c.all("SELECT 1 FROM events WHERE kind = 'dark'").length);
 }
+
+{ // 7. a roll can be called off: the servers it hadn't reached stay, and nothing is due any more
+  const c = makeControl();
+  const f = new Fleet(c, { a: { size: 4, cap: 20 } }, { drainAt: () => null, reportDeadline: true });
+  await f.startPool("a");
+  await f.run(5 * MIN);
+  deploy(c, "web", app("web", 4));
+  await f.run(10 * MIN);
+  const before = new Set(f.alive().map((s) => s.run));
+  c.roll();
+  await f.run(2 * MIN);
+  ok("the roll is under way", c.status().roll?.left >= 2, JSON.stringify(c.status().roll));
+  ok("calling it off says so", c.cancelRoll().cancelled === true);
+  const handing = c.liveRuns(T).filter((r) => r.handover).map((r) => r.id);
+  await f.run(10 * MIN);
+  const kept = f.alive().filter((s) => before.has(s.run) && !handing.includes(s.run));
+  ok("the servers it hadn't reached stay", kept.length >= 2 && !c.status().roll && c.status().departures.list.every((d) => !d.due), `${kept.length} kept`);
+}
 summary();

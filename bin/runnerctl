@@ -14,7 +14,7 @@
 #                                    on) with FLEET_APP, FLEET_REPLICA, FLEET_MACHINE, FLEET_HOST... Values are never
 #                                    shown again, so secrets go here, not in the compose file. A change is a new version.
 #   runnerctl status                 projects and machines
-#   runnerctl roll [machine]         replace machines one at a time (e.g. after an agent change)
+#   runnerctl roll [machine|stop]    replace machines one at a time (e.g. after an agent change); stop calls it off
 #   runnerctl pool <name> <n>        how many machines to keep in a pool (e.g. pool main 10)
 #   runnerctl join-token             the token another host joins with (see /install.sh)
 #   runnerctl move <name> <from> [to] [replica]  move one copy of a project off a machine (new copy first, old one removed once
@@ -130,7 +130,7 @@ PY
         + (if .retiring then "leaving" elif .handover then "starting its replacement"
            elif .ready then "online" else "starting" end)
         + "  " + ([.projects | to_entries[] | "\(.key) v\(.value.v) \(.value.s)"] | join(", ")))' ;;
-  roll) api "/roll${1:+?machine=$1}" -X POST | jq . ;;
+  roll) if [ "${1:-}" = stop ]; then api /roll -X DELETE | jq .; else api "/roll${1:+?machine=$1}" -X POST | jq .; fi ;;
   pool) [ $# -eq 2 ] || usage; api /settings -X PUT -d "{\"pools\": {\"$1\": $2}}" | jq . ;;
   join-token) api /join-token | jq -r .token ;;
   move) [ $# -ge 2 ] || usage; api "/projects/$1/move?from=$2${3:+&to=$3}${4:+&replica=$4}" -X POST | jq -c '.placed' ;;

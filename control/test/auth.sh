@@ -95,6 +95,7 @@ want 200 -X POST $U/projects/api/unlock -H 'x-app-password: new-owner'
 echo "== fleet changes without the password: refused"
 want 401 -X PUT $U/settings "${J[@]}" -d '{"rebalance":false}'
 want 401 -X POST $U/roll
+want 401 -X DELETE $U/roll
 want 401 -X POST $U/machines/1/evict
 want 401 -X DELETE $U/slots/9
 want 401 $U/join-token
@@ -104,6 +105,7 @@ want 200 -X POST $U/unlock -H 'x-admin-password: hunter2'
 echo "== fleet changes with the password"
 want 200 -X PUT $U/settings -H 'x-admin-password: hunter2' "${J[@]}" -d '{"rebalance":false}'
 want 200 -X POST $U/roll -H 'x-admin-password: hunter2'
+want 200 -X DELETE $U/roll -H 'x-admin-password: hunter2'
 want 200 $U/join-token -H 'x-admin-password: hunter2'
 echo "== fleet changes from a script: the admin password on /api"
 want 200 -X PUT $A/settings -H 'x-admin-password: hunter2' "${J[@]}" -d '{"rebalance":true}'

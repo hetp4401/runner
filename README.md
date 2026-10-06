@@ -75,6 +75,7 @@ GET    /api/projects/<name>[?version=N]         a version's compose file, files 
 POST   /api/projects/<name>/disable | /enable   stop / start it on every machine
 DELETE /api/projects/<name>                     delete it and its versions
 POST   /api/roll[?machine=N]                    replace machines one at a time
+DELETE /api/roll                                call a roll off: servers go back to their own schedules
 PUT    /api/settings                            {"pools": {"<pool>": 10}, "rebalance": true}  (machines to keep per pool; automatic rebalancing)
 POST   /api/projects/<name>/move?from=N[&to=M][&replica=K]  move one copy off machine N (to M, or the machine with the most room)
 POST   /api/machines/<n>/evict[?force=1]        move every placed project off machine n (apps changing as much as they may wait, unless forced)

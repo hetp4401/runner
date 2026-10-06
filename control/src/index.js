@@ -1003,6 +1003,7 @@ export class Control {
     }
     if (method === "POST" && route === "/drain") return need(node, "the join token"), json(this.drain(await body()));
     if (method === "POST" && route === "/roll") return need(admin || node, "the admin password or the join token"), json(this.roll(url.searchParams.get("machine")));
+    if (method === "DELETE" && route === "/roll") return need(admin, "the admin password"), json(this.cancelRoll());
     if (method === "GET" && route === "/join-token") return need(admin), json({ token: this.env.JOIN_TOKEN });
     if (method === "GET" && route === "/export") { // everything stored, a table at a time, for moving the control plane
       need(admin);
@@ -1311,7 +1312,19 @@ export class Control {
   roll(machine) {
     const now = Date.now();
     this.setSetting(machine ? `roll_${Number(machine)}` : "roll", now);
+    this.logEvent("roll", { machine: machine ? Number(machine) : null, cause: "start", detail: machine ? `server ${Number(machine)} is to be replaced` : "every server is to be replaced, one at a time", t: now });
     return { rolling: machine ? [Number(machine)] : "all", since: now };
+  }
+
+  // Call a roll off: the servers it made due go back to their own schedules (one already handing over finishes).
+  cancelRoll() {
+    const keys = [...this.settings.keys()].filter((k) => k === "roll" || /^roll_\d+$/.test(k));
+    for (const k of keys) {
+      this.settings.delete(k);
+      this.sql.exec("DELETE FROM settings WHERE key = ?", k);
+    }
+    if (keys.length) this.logEvent("roll", { cause: "cancelled", detail: "the roll was called off: servers leave on their own schedules again" });
+    return { cancelled: keys.length > 0 };
   }
 
   // What machine n should run: every copy placed on it, at its project's latest version (or the last good one if the
@@ -3513,6 +3526,11 @@ export class Control {
         inFlight: [...this.copies.values()].reduce((n, list) => n + list.filter((x) => x.leaving).length, 0),
         cap: Math.max(1, Math.min(8, Math.ceil(0.1 * [...this.liveMachines(now).values()].filter((r) => r.ready && now - r.started > SETTLED_MS).length))),
       },
+      // A roll under way: since when, and how many servers it still has to replace.
+      roll: (() => {
+        const left = this.liveRuns(now).filter((r) => !r.retire && !this.predecessorOf(r, now) && this.rolled(r)).length;
+        return left ? { since: Number(this.settings.get("roll") ?? 0) || null, left } : null;
+      })(),
       churn: this.churn(now),
       departures: this.departures(now),
       dark: [...this.dark].map(([key, d]) => ({ app: key.slice(0, key.lastIndexOf("|")), replica: Number(key.slice(key.lastIndexOf("|") + 1)), since: d.since, machine: d.machine, why: d.why })),
