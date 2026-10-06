@@ -25,8 +25,8 @@
 //                                                          machines send the join token (Bearer): join/sync/claim/drain/roll
 //   PUT /api/projects/<name>/env  the app's env: {KEY: "value"} sets, {KEY: null} removes. Every copy gets it as its
 //                                 .env (compose reads ${VAR} from it; env_file: .env passes it into containers), along
-//                                 with FLEET_APP, FLEET_REPLICA, FLEET_REPLICAS, FLEET_MACHINE, FLEET_HOST, FLEET_DOMAIN
-//                                 and FLEET_VERSION. Values are never sent out again (GET gives the keys), so secrets go
+//                                 with FLEET_APP, FLEET_REPLICA, FLEET_MACHINE, FLEET_HOST and FLEET_DOMAIN (nothing that
+//                                 changes with the replica count). Values are never sent out again (GET gives the keys), so secrets go
 //                                 here rather than in the compose file, which everyone can read. A change is a new version.
 //                                            /admin/api/*  the same, for the UI (changes from other sites are refused)
 //   /admin, /metrics  redirect to the app      /api/metrics  machine and app metrics (no token needed)
@@ -47,6 +47,10 @@ const PBKDF2_ITERATIONS = 10_000; // app passwords are stored as salted PBKDF2-S
 // A run counts as up if it checked in within liveMs: two and a half check-ins, so one late check-in doesn't count as down.
 const START_WAIT_MS = 8 * 60_000; // after starting a machine, give it this long to show up before trying again
 const HANDOVER_STUCK_MS = 15 * 60_000; // a handover slower than this stops holding up the other machines
+const SUCCESSOR_WAIT_MS = 12 * 60_000; // a successor that hasn't joined by then isn't coming (its pool's jobs are all taken)
+const CAPPED_MS = 30 * 60_000; // a pool that couldn't start a machine is treated as full for this long
+const URGENT_MS = 25 * 60_000; // a run this close to its deadline leaves now, whatever the gates say
+const STATEFUL_GONE_MS = 10 * 60_000; // a stateful copy's machine counts as gone after this long silent
 const NAME = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const FILE_PATH = /^[A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)*$/;
 const MAX_FILES = 30;
@@ -66,18 +70,30 @@ const SETTLE_MS = 5 * 60_000; // after a (re)start, machines that haven't checke
 // control plane was unreachable (its tunnel dropped, say), not that the fleet died. Without it, the first machine back
 // would be the only live one and get every copy of everything (which happened on 2026-10-04: two tunnel drops, 40-odd
 // copies each time onto one machine, and a stateful app's data gone with its copies recreated at once).
-const MOVE_TIMEOUT_MS = 15 * 60_000; // a move's old copy is dropped once the new one is healthy, or after this long
-// Automatic rebalancing: a machine that's hot (over these for HOT_MS straight) or that carries SPREAD_GAP more placed
-// projects than the emptiest machine has one project moved off it, to a machine with room, at most one move per
-// COOLDOWN_MS fleet-wide, and no project more than once per PROJECT_COOLDOWN_MS.
+const MOVE_TIMEOUT_MS = 15 * 60_000; // a move whose new copy isn't healthy by then is cancelled (if another copy of the app is ready)
+const MOVE_TIMEOUT_EXT_MS = 25 * 60_000; // ...or by then, once, while the new copy is still building
+const FAILED_ON_MS = 6 * 3600_000; // a server a move of an app failed on isn't chosen for that app again for this long
+const DNS_WAIT_MAX_MS = 5 * 60_000; // a finished move keeps its old copy until DNS points at the new one, at most this long
+const EVENTS_KEEP_MS = 30 * 86400_000;
+const MASS_LOSS_MIN = 3; // this many servers (or 10% of the fleet) going silent together is an outage, not deaths
+const QUIET_AFTER_SETTLE_MS = 10 * 60_000; // nothing is moved, evicted or handed over this soon after a (re)start or gap
+// Automatic rebalancing: a server that's hot (4 of its last 5 minutes over these) has the app making it hot moved
+// off, to a server with room, at most one hot move per COOLDOWN_MS fleet-wide, and no app more than once per
+// PROJECT_COOLDOWN_MS (see rebalanceHot).
 const HOT_CPU = 85;
 const HOT_MEM = 90;
 const ROOM_CPU = 70; // a destination must be under these
 const ROOM_MEM = 80;
-const SPREAD_GAP = 2;
 const COOLDOWN_MS = 10 * 60_000;
 const PROJECT_COOLDOWN_MS = 30 * 60_000;
 const SETTLED_MS = 5 * 60_000; // a machine takes part once it's been up this long
+const FAIL_MS = 10 * 60_000; // a copy failing (or not ready) this long on one server, while its app is healthy elsewhere, moves once
+const STRIKE_WINDOW_MS = 30 * 60_000; // two strikes against a server within this make it sick
+const QUARANTINE_MS = 60 * 60_000; // a sick or stubbornly hot server isn't a destination for this long
+const SICK_DRAIN_GAP_MS = 30 * 60_000; // at most one sick server per pool is asked to leave per this long
+const HOT_DEST_MS = 30 * 60_000; // a server that took a hot move isn't a hot move's destination again for this long
+const PAUSE_MS = 60 * 60_000; // the thrash breaker pauses automatic moves this long
+const DEFAULT_CPUS = 4; // cores assumed for a server whose agent doesn't say (GitHub's hosted runners have 4)
 // Metrics: agents send one summary per machine per minute; the fleet's minute is stored as one row (few writes),
 // and rolled up into 10-minute rows for the day view
 const MIN = 60_000;
@@ -277,6 +293,28 @@ function keysOn(replicas, name) {
   return new Map(sorted.map((k, i) => [k, i === 0 ? name : `${name}-r${k}`]));
 }
 
+// What an app says about itself in its compose file's x-runner block, beyond port and replicas:
+//   stateful: true   its copies hold data that only the running copies have (a quorum store, say): the control plane
+//                    changes at most `parallel` of them at a time (default 1), waits `resync` seconds (default 600)
+//                    after one is rebuilt before the next, never runs two on one server, and spreads them so no pool
+//                    holds more than replicas - quorum (quorum: default a majority)
+//   ready: /path     a path that answers 2xx once a copy is ready to serve (synced, say): "healthy" waits for it, but a
+//                    copy that isn't ready is never restarted for it (only a copy that stops answering at all is)
+function policyOf(compose) {
+  let xr = {};
+  try {
+    xr = YAML.parse(compose)?.["x-runner"] ?? {};
+  } catch {}
+  if (!isMap(xr)) xr = {};
+  return {
+    stateful: xr.stateful === true,
+    quorum: Number.isInteger(xr.quorum) ? xr.quorum : null,
+    resyncMs: (Number.isInteger(xr.resync) ? xr.resync : 600) * 1000,
+    parallel: Number.isInteger(xr.parallel) ? xr.parallel : null,
+    ready: typeof xr.ready === "string" ? xr.ready : null,
+  };
+}
+
 // Why this compose file's published ports can't be moved to other host ports (null: they can). The machine's network
 // itself can't be shared, and a port written with a variable can't be rewritten.
 function fixedPorts(compose) {
@@ -427,6 +465,13 @@ function buildSpec(body, { trusted = false } = {}) {
   }
   port ??= declared;
   replicas ??= parseReplicas(doc["x-runner"]?.replicas, "x-runner.replicas") ?? 1;
+  const xr = isMap(doc["x-runner"]) ? doc["x-runner"] : {};
+  if (xr.stateful != null && typeof xr.stateful !== "boolean") throw new HttpError(400, "x-runner.stateful is true or false");
+  for (const k of ["quorum", "parallel"]) {
+    if (xr[k] != null && !(Number.isInteger(xr[k]) && xr[k] >= 1 && xr[k] <= MAX_REPLICAS)) throw new HttpError(400, `x-runner.${k} must be a whole number from 1 to ${MAX_REPLICAS}`);
+  }
+  if (xr.resync != null && !(Number.isInteger(xr.resync) && xr.resync >= 0 && xr.resync <= 3600)) throw new HttpError(400, "x-runner.resync is seconds, from 0 to 3600");
+  if (xr.ready != null && !(typeof xr.ready === "string" && /^\/[\x21-\x7e]{0,199}$/.test(xr.ready))) throw new HttpError(400, "x-runner.ready is a path, like /healthz");
   if (!trusted) {
     // Checked as compose reads it: with YAML merge keys (<<) applied.
     const merged = YAML.parse(compose, { merge: true });
@@ -482,7 +527,34 @@ echo "Joined. Follow it with: docker logs -f runner-agent"
 `;
 }
 
-const EXPORT_TABLES = ["projects", "versions", "copies", "runs", "starts", "settings", "slots", "agents", "app_passwords", "app_env", "metrics_1m", "metrics_10m", "metrics_1h"];
+const EXPORT_TABLES = ["projects", "versions", "copies", "runs", "starts", "settings", "slots", "agents", "app_passwords", "app_env", "events", "metrics_1m", "metrics_10m", "metrics_1h"];
+
+// One line for an event, for the pages and logs.
+const fmtDur = (ms) => (ms < 90_000 ? `${Math.round(ms / 1000)} s` : ms < 90 * MIN ? `${Math.round(ms / MIN)} min` : `${(ms / 3600_000).toFixed(1)} h`);
+
+// A copy's report says it isn't serving: it failed, or it answers but isn't ready.
+function failing(st) {
+  return isMap(st) && (st.s === "failed" || (st.s === "healthy" && st.r === false));
+}
+
+function eventText(e) {
+  const copy = e.app ? `${e.app}${e.replica != null ? ` replica ${e.replica}` : ""}` : "";
+  switch (e.kind) {
+    case "move-start": return `moving ${copy} from server ${e.machine} to server ${e.other}${e.detail ? `: ${e.detail}` : ""}`;
+    case "move-done": return `moved ${copy} from server ${e.machine} to server ${e.other}`;
+    case "move-cancel": return `kept ${copy} on server ${e.machine}: ${e.detail}`;
+    case "place": return `placed ${copy} on server ${e.machine}`;
+    case "drop": return `removed ${copy} from server ${e.machine} (${e.cause})`;
+    case "strike": return `strike against server ${e.machine}: ${e.detail}`;
+    case "copy-start": return `${e.cause === "successor" ? "the successor on" : "a new version on"} server ${e.machine} started ${copy}`;
+    case "dns": return `${e.app}-${e.replica} now points at server ${e.machine}`;
+    case "dark": return `${copy} went dark: ${e.detail}`;
+    case "lit": return `${copy} is back: ${e.detail}`;
+    case "quarantine": return `server ${e.machine} quarantined: ${e.detail}`;
+    case "alert": return `alert: ${e.detail}`;
+    default: return e.detail ?? `${e.kind}${copy ? ` ${copy}` : ""}`;
+  }
+}
 
 export class Control {
   // sql: { exec(query, ...args) -> { toArray() } } over SQLite; env: settings and secrets; alarm(at): call this.alarm()
@@ -513,6 +585,9 @@ export class Control {
       `CREATE TABLE IF NOT EXISTS app_passwords (name TEXT PRIMARY KEY, salt TEXT NOT NULL, hash TEXT NOT NULL, updated INTEGER NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS app_env (name TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, updated INTEGER NOT NULL, PRIMARY KEY (name, key))`,
       `CREATE TABLE IF NOT EXISTS geo (ip TEXT PRIMARY KEY, text TEXT, at INTEGER NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, kind TEXT NOT NULL,
+         app TEXT, replica INTEGER, machine INTEGER, other INTEGER, run TEXT, cause TEXT, detail TEXT)`,
+      `CREATE INDEX IF NOT EXISTS events_t ON events (t)`,
     ]) {
       this.sql.exec(query);
     }
@@ -525,8 +600,13 @@ export class Control {
     if (!runColumns.has("agent")) this.sql.exec("ALTER TABLE runs ADD COLUMN agent TEXT");
     if (!runColumns.has("kind")) this.sql.exec("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT ''"); // no longer used
     if (!runColumns.has("label")) this.sql.exec("ALTER TABLE runs ADD COLUMN label TEXT");
-    for (const col of ["pool TEXT", "drain INTEGER"]) if (!runColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE runs ADD COLUMN ${col}`);
+    for (const col of ["pool TEXT", "drain INTEGER", "deadline INTEGER", "evict INTEGER", "quarantine INTEGER", "heir INTEGER"]) {
+      if (!runColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE runs ADD COLUMN ${col}`);
+    }
     if (!columns("agents").has("pool")) this.sql.exec("ALTER TABLE agents ADD COLUMN pool TEXT");
+    if (!columns("events").has("pool")) this.sql.exec("ALTER TABLE events ADD COLUMN pool TEXT");
+    const copyColumns = columns("copies");
+    for (const col of ["key TEXT", "cause TEXT"]) if (!copyColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE copies ADD COLUMN ${col}`);
     // Working state lives in memory (the object is single-threaded); SQLite keeps it across restarts,
     // which happen when the process is restarted.
     this.projects = new Map(this.all("SELECT * FROM projects").map((p) => [p.name, p]));
@@ -551,15 +631,46 @@ export class Control {
       }
     }
     for (const x of this.all("SELECT * FROM copies ORDER BY since")) {
-      (this.copies.get(x.name) ?? this.copies.set(x.name, []).get(x.name))
-        .push({ machine: x.machine, replica: x.replica, since: x.since, reason: x.reason, leaving: x.leaving ? JSON.parse(x.leaving) : null, ports: x.ports ? JSON.parse(x.ports) : null });
+      (this.copies.get(x.name) ?? this.copies.set(x.name, []).get(x.name)).push({
+        machine: x.machine, replica: x.replica, since: x.since, reason: x.reason, leaving: x.leaving ? JSON.parse(x.leaving) : null,
+        ports: x.ports ? JSON.parse(x.ports) : null, key: x.key ?? null, cause: x.cause ?? null,
+      });
+    }
+    // Copies from before keys were stored get the key their machine knows them by now, so nothing is renamed.
+    for (const [name, list] of this.copies) {
+      for (const m of new Set(list.filter((x) => !x.key).map((x) => x.machine))) {
+        const keys = keysOn(list.filter((x) => x.machine === m).map((x) => x.replica), name);
+        for (const x of list.filter((y) => y.machine === m && !y.key)) {
+          x.key = keys.get(x.replica);
+          this.sql.exec("UPDATE copies SET key = ? WHERE name = ? AND machine = ? AND replica = ?", x.key, name, m, x.replica);
+        }
+      }
     }
     this.remapped = new Map(); // "name@v|ports" -> compose text with moved ports
+    this.plainDrops = new Map(); // "name|machine" -> when the copy known by the plain name there was dropped (see freeKey)
+    this.failedOn = new Map(); // "name|machine" -> until when a move of the app to that server isn't tried again
+    this.healthyAt = new Map(); // "run|key" -> when the copy first reported healthy on that run
+    this.unhealthySince = new Map(); // "name|replica" -> since when its copy hasn't been healthy (see transitions)
+    this.missingAt = new Map(); // "name|replica" -> when it lost its last copy (see transitions)
+    this.belowSince = new Map(); // stateful app -> since when it's had fewer healthy copies than its quorum
+    this.hadQuorum = new Set(JSON.parse(this.settings.get("had_quorum") ?? "[]")); // stateful apps that have reached their quorum
+    this.lastCut = new Map(); // stateful app -> when its last extra replica was removed (cuts are paced)
+    this.deferSince = new Map(); // app -> since when doubling it up has been put off for a starting server
+    this.cappedUntil = new Map(); // pool -> until when it's treated as unable to start machines
+    this.departLog = []; // [{ t, kind: handover | evict, run }]: departures started by the control plane, last 10 min
+    this.lossLog = []; // times of unannounced machine losses, last 10 min
+    this.lossNoted = new Set(); // runs whose loss has been noted
+    this.pulled = new Set(); // runs made due early to spread a pool's departures (see flatten)
     this.bootAt = Date.now();
     this.settleAt = this.bootAt; // the (re)start, or the end of the last gap in check-ins: SETTLE_MS and ARRIVAL_MS count from here
+    // The last check-in before the (re)start or gap: the runs live then are the ones settling() waits for.
+    this.quietSince = Math.max(0, ...[...this.runs.values()].map((r) => r.seen));
     this.lastCheckin = this.bootAt;
+    this.lastLossCheck = 0;
+    this.massArms = JSON.parse(this.settings.get("mass_arms") ?? "[]"); // when the mass-loss breaker last fired
+    this.dnsSyncedAt = 0; // the last DNS sync that succeeded (a finished move waits for one, see moveOutcome)
     this.setPace(this.bootAt);
-    this.samples = new Map(); // machine -> [{ t, cpu, mem }] from the last few minutes, for spotting hot machines
+    this.samples = new Map(); // machine -> [{ t, cpu, mem }] from the last few minutes, for the room a server has
     this.lastRebalance = 0;
     this.failures = new Map(); // "address|fleet" or "address|app:<name>" -> { n, at }: wrong passwords
     this.appPasswords = new Map(this.all("SELECT name, salt, hash FROM app_passwords").map((x) => [x.name, x])); // never sent out
@@ -569,8 +680,31 @@ export class Control {
     for (const x of this.all("SELECT name, key, value FROM app_env ORDER BY key")) {
       (this.appEnv.get(x.name) ?? this.appEnv.set(x.name, new Map()).get(x.name)).set(x.key, x.value);
     }
-    this.autoMoved = new Map(); // project -> when it was last moved automatically
-    this.rebalanceLog = JSON.parse(this.settings.get("rebalance_log") ?? "[]");
+    this.autoMoved = new Map(Object.entries(JSON.parse(this.settings.get("auto_moved") ?? "{}"))); // project -> when it was last moved automatically
+    this.minutes = new Map(); // run -> its last 10 minute summaries [{ t, cpu, steal, mem, memTotal, a }] (the hot rule)
+    this.lastHealthy = new Map(); // "run|key" -> when that copy last reported healthy and ready there (failure clocks)
+    this.firstSeen = new Map(); // "run|key" -> when that run first reported the copy (failure clocks)
+    this.readySince = new Map(); // app -> since when some copy of it has been healthy (outage-aware failure clocks)
+    this.restarts = new Map(); // run -> { last: { key: n }, log: [{ t, key, k }] }: restarts seen in the last hour
+    this.lowDiskSince = new Map(); // run -> since when it's had under 10% of its disk free
+    this.strikes = new Map(); // run -> [{ t, kind, why }] in the last 30 minutes
+    this.sickWhy = new Map(); // run -> why it was quarantined as sick (a pool member then asks to leave)
+    this.sickDrains = JSON.parse(this.settings.get("sick_drains") ?? "{}"); // pool -> when its last sick server was asked to leave
+    // "app@version" -> servers it failed on: after 2, it's the app, and its copies aren't moved for failing any more.
+    this.versionFails = new Map(Object.entries(JSON.parse(this.settings.get("version_fails") ?? "{}")).map(([k, v]) => [k, new Set(v)]));
+    this.aloneSince = new Map(); // "app@version" -> since when it has failed somewhere and been healthy nowhere (settle)
+    this.noted = new Map(); // what the rebalancer last noted, by subject: once per 30 minutes each
+    this.alertedAt = new Map(); // "cause|target" -> when that alert was last raised
+    this.lastSickCheck = 0;
+    this.lastReadyCheck = 0;
+    this.lastV = new Map(); // "run|key" -> the version that run last reported for the copy (version churn)
+    this.litAt = new Map(); // "app|k" -> { t, run, machine }: when replica k last had a copy serving, and where
+    this.dark = new Map(); // "app|k" -> { since, run, machine, why, alerted }: replicas with no copy serving now
+    this.lastDarkCheck = 0;
+    this.dueWait = new Map(); // run -> { since, why }: a due departure waiting at its gate
+    this.handoverTimes = []; // [{ t, pool, machine, queue, build, overlap }] (ms), the last 24 hours
+    this.webhookLog = []; // when alerts were last posted to ALERT_WEBHOOK (at most 30 an hour)
+    this.recentEvents = this.all("SELECT * FROM events ORDER BY id DESC LIMIT 200").reverse(); // the newest, for the pages
     this.slots = new Map(this.all("SELECT n, tunnel, token FROM slots").map((x) => [x.n, x])); // slot -> its tunnel
     this.agents = new Map(this.all("SELECT * FROM agents").map((a) => [a.id, a])); // agent -> the slot it last had
     this.holds = new Map(); // slot -> { agent, at }: just given out at /join, not checked in yet
@@ -627,11 +761,48 @@ export class Control {
     this.setSetting("pool_asks", JSON.stringify(Object.fromEntries(this.poolAsks)));
   }
 
-  // Just after a (re)start, runs loaded from storage haven't checked in yet to say which pool they're in (and they may
-  // be on a slower cadence than this now asks for). Until every one of them has (or SETTLE_MS have passed), a pool
-  // looks smaller than it is, so nothing is started or retired on that account.
+  // Just after a (re)start, or a gap in check-ins (the control plane was unreachable), the runs that were live when it
+  // went quiet haven't checked in yet to say they're still there. Until every one of them has (or SETTLE_MS have
+  // passed), a pool looks smaller than it is and copies look lost, so nothing is started, retired, moved or re-placed.
+  // However long the gap was: a run counts if it was live at quietSince.
   settling(now) {
-    return now - this.settleAt < SETTLE_MS && [...this.runs.values()].some((x) => !x.retire && now - x.seen < SETTLE_MS && x.seen < this.settleAt);
+    return now - this.settleAt < SETTLE_MS &&
+      [...this.runs.values()].some((x) => !x.retire && x.seen >= this.quietSince - this.liveMs && x.seen < this.settleAt);
+  }
+
+  // Quiet: nothing voluntary (moves, evictions, handovers) for a while after a (re)start or gap, or before the fleet
+  // has shown up.
+  quiet(now) {
+    return this.settling(now) || now - this.settleAt < Number(this.env.QUIET_MS ?? QUIET_AFTER_SETTLE_MS);
+  }
+
+  // ---- events ----
+  // One row per change the control plane makes or sees, with its cause: what the pages show as activity and churn.
+  logEvent(kind, f = {}) {
+    const e = { t: f.t ?? Date.now(), kind, app: f.app ?? null, replica: f.replica ?? null, machine: f.machine ?? null,
+      other: f.other ?? null, run: f.run ?? null, cause: f.cause ?? null, detail: f.detail != null ? String(f.detail).slice(0, 500) : null,
+      pool: f.pool ?? (f.run ? this.runs.get(f.run)?.pool : null) ?? null };
+    const row = this.all(`INSERT INTO events (t, kind, app, replica, machine, other, run, cause, detail, pool) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING id`, e.t, e.kind, e.app, e.replica, e.machine, e.other, e.run, e.cause, e.detail, e.pool)[0];
+    this.recentEvents.push({ id: row?.id, ...e });
+    if (this.recentEvents.length > 200) this.recentEvents.splice(0, this.recentEvents.length - 200);
+  }
+
+  events(q) {
+    const where = [];
+    const args = [];
+    const since = Number(q.get("since") ?? 0);
+    where.push("t >= ?");
+    args.push(Number.isFinite(since) ? since : 0);
+    for (const f of ["app", "kind", "cause", "pool"]) if (q.get(f)) { where.push(`${f} = ?`); args.push(q.get(f)); }
+    const kinds = String(q.get("kinds") ?? "").split(",").filter((k) => /^[a-z-]{1,20}$/.test(k)).slice(0, 20);
+    if (kinds.length) {
+      where.push(`kind IN (${kinds.map(() => "?").join(", ")})`);
+      args.push(...kinds);
+    }
+    if (q.get("machine")) { where.push("(machine = ? OR other = ?)"); args.push(Number(q.get("machine")), Number(q.get("machine"))); }
+    const limit = Math.min(1000, Math.max(1, Number(q.get("limit") ?? 200) || 200));
+    return { events: this.all(`SELECT * FROM events WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...args, limit).map((e) => ({ ...e, text: eventText(e) })) };
   }
 
   poolSize(pool) {
@@ -664,7 +835,9 @@ export class Control {
       if (!row) return undefined; // not cached: a version asked for before it's deployed mustn't stay missing once it is
       const claims = new Set(claimsOf(row.compose));
       if (row.port) claims.add(`port ${row.port}`);
-      this.versions.set(key, { compose: row.compose, port: row.port, replicas: row.replicas ?? 1, files: JSON.parse(row.files ?? "{}"), claims: [...claims], nodup: dupProblem(row.compose), fixed: fixedPorts(row.compose) });
+      const policy = policyOf(row.compose);
+      this.versions.set(key, { compose: row.compose, port: row.port, replicas: row.replicas ?? 1, files: JSON.parse(row.files ?? "{}"), claims: [...claims],
+        nodup: dupProblem(row.compose) ?? (policy.stateful ? "x-runner.stateful: one copy per server" : null), fixed: fixedPorts(row.compose), policy });
     }
     return this.versions.get(key);
   }
@@ -683,11 +856,13 @@ export class Control {
     this.runs.set(r.id, r);
     r.savedSeen = r.seen;
     this.sql.exec(
-      `INSERT INTO runs (id, machine, started, status, ready, handover, retire, seen, agent, kind, label, pool, drain)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO runs (id, machine, started, status, ready, handover, retire, seen, agent, kind, label, pool, drain, deadline, evict, quarantine, heir)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET status = excluded.status, ready = excluded.ready, handover = excluded.handover,
-         retire = excluded.retire, seen = excluded.seen, label = excluded.label, pool = excluded.pool, drain = excluded.drain`,
+         retire = excluded.retire, seen = excluded.seen, label = excluded.label, pool = excluded.pool, drain = excluded.drain,
+         deadline = excluded.deadline, evict = excluded.evict, quarantine = excluded.quarantine`,
       r.id, r.machine, r.started, JSON.stringify(r.status), r.ready, r.handover, r.retire, r.seen, r.agent, "", r.label, r.pool ?? null, r.drain ?? 0,
+      r.deadline ?? null, r.evict ?? null, r.quarantine ?? null, r.heir ?? 0,
     );
   }
 
@@ -816,6 +991,7 @@ export class Control {
       if (!ok) throw new HttpError(401, `this needs ${what}`);
     };
     if (method === "GET" && route === "/status") return json(this.status());
+    if (method === "GET" && route === "/events") return json(this.events(url.searchParams));
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
     if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip));
@@ -854,7 +1030,7 @@ export class Control {
     }
     if (method === "PUT" && route === "/settings") return need(admin), json(this.putSettings(await body()));
     const ev = route.match(/^\/machines\/(\d+)\/evict$/);
-    if (ev && method === "POST") return need(admin), json(this.evict(Number(ev[1])));
+    if (ev && method === "POST") return need(admin), json(this.evict(Number(ev[1]), { force: url.searchParams.get("force") === "1" }));
     const sl = route.match(/^\/slots\/(\d+)$/);
     if (sl && method === "DELETE") return need(admin), json(await this.retireSlot(Number(sl[1])));
     // Apps are open: anyone can look, deploy a new one, change or remove one. Unless it's locked: a "password" sent
@@ -918,7 +1094,7 @@ export class Control {
 
   describe(p) {
     const latest = this.version(p.name, p.version);
-    const placed = this.copiesOf(p.name).map((x) => ({ machine: x.machine, replica: x.replica, since: x.since, reason: x.reason, leaving: x.leaving, moved: Boolean(x.ports) }))
+    const placed = this.copiesOf(p.name).map((x) => ({ machine: x.machine, replica: x.replica, key: x.key, since: x.since, reason: x.reason, cause: x.cause, leaving: x.leaving, moved: Boolean(x.ports) }))
       .sort((a, b) => a.replica - b.replica || Boolean(a.leaving) - Boolean(b.leaving));
     const staying = placed.filter((x) => !x.leaving).length;
     return {
@@ -1071,14 +1247,14 @@ export class Control {
   // reads the file: single quotes keep a value as it is; a value with a quote or a line break is double-quoted and escaped.
   envFile(name, spec, x, v) {
     const quote = (s) => (!/['\n\r]/.test(s) ? `'${s}'` : `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\$/g, "$$$$").replace(/\r?\n/g, "\\n")}"`);
+    // Nothing here changes with the app's replica count or version: a copy whose files and .env are the same isn't
+    // recreated, so changing the count leaves the copies that stay alone.
     const lines = [
       `FLEET_APP=${name}`,
       `FLEET_REPLICA=${x.replica}`,
-      `FLEET_REPLICAS=${spec.replicas}`,
       `FLEET_MACHINE=${x.machine}`,
       `FLEET_HOST=${name}-${x.replica}.${this.env.DOMAIN}`,
       `FLEET_DOMAIN=${this.env.DOMAIN}`,
-      `FLEET_VERSION=${v}`,
     ];
     for (const [k, val] of this.appEnv.get(name) ?? []) lines.push(`${k}=${quote(val)}`);
     return `${lines.join("\n")}\n`;
@@ -1096,6 +1272,7 @@ export class Control {
     this.blocked.delete(name);
     this.appPasswords.delete(name);
     this.appEnv.delete(name);
+    if (this.hadQuorum.delete(name)) this.setSetting("had_quorum", JSON.stringify([...this.hadQuorum]));
     for (const key of this.versions.keys()) if (key.startsWith(`${name}@`)) this.versions.delete(key);
     this.scheduleDns();
     return { deleted: name };
@@ -1125,8 +1302,9 @@ export class Control {
     return this.settings.get("rebalance") !== "off";
   }
 
-  hotMs() {
-    return Number(this.env.HOT_MS ?? 5 * 60_000);
+  // Copies younger than this (built on their server) aren't moved automatically: a start-up spike isn't heat (YOUNG_MS).
+  youngMs() {
+    return Number(this.env.YOUNG_MS ?? 10 * MIN);
   }
 
   // Replace machines one at a time (all of them, or just one), e.g. after the agent code changes.
@@ -1137,26 +1315,41 @@ export class Control {
   }
 
   // What machine n should run: every copy placed on it, at its project's latest version (or the last good one if the
-  // latest is halted), keyed by copy: <name> for replica 1, <name>-r<k> for the others. Disabled projects run nowhere.
-  desiredFor(machine) {
+  // latest is halted), keyed by the copy's key (see freeKey). Disabled projects run nowhere.
+  desiredFor(machine, successor = null) {
     const out = {};
     for (const p of this.projects.values()) {
       if (!p.enabled) continue;
       const v = p.halted ? p.stable : p.version;
       if (v == null) continue;
       const spec = this.version(p.name, v);
-      const here = this.copiesOn(p.name, machine);
-      const keys = keysOn(here.map((x) => x.replica), p.name);
-      for (const x of here) {
-        out[keys.get(x.replica)] = { v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica };
+      const newest = this.liveMachines(Date.now()).get(machine);
+      for (const x of this.copiesOn(p.name, machine)) {
+        // A copy lost with its machine is being rebuilt elsewhere: a new run of the machine doesn't build it too, and a
+        // successor doesn't build copies that are moving off the machine. A stateful copy left by a run that died isn't
+        // built by the fresh run that took its slot either (it would start empty, outside the app's pacing).
+        if (x.leaving?.lost || (successor && x.leaving) || this.orphaned(spec, x, newest)) continue;
+        out[x.key] = { v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica,
+          ...(spec.policy.ready ? { ready: spec.policy.ready } : {}) };
       }
     }
     return out;
   }
 
-  // The key machine n knows copy k of a project by (see keysOn).
+  // The key machine n knows copy k of a project by: stored with the copy when it was placed, never recomputed.
   keyOn(name, machine, k) {
-    return keysOn(this.copiesOn(name, machine).map((x) => x.replica), name).get(k) ?? name;
+    return this.copiesOn(name, machine).find((x) => x.replica === k)?.key ?? name;
+  }
+
+  // The key for a new copy of a project on a machine: the plain name when no copy there has it (the usual, only copy,
+  // so the key agents always used), else <name>-r<k>. Once given, a copy keeps its key while it stays on the machine,
+  // so other copies arriving or leaving never rename it. The plain name isn't reused for a different replica within
+  // 10 minutes of being freed there: an agent from before keys were stable could mistake the new copy for the old one.
+  freeKey(name, machine, k, now) {
+    const used = new Set(this.copiesOn(name, machine).map((x) => x.key));
+    const freedAt = this.plainDrops.get(`${name}|${machine}`);
+    if (!used.has(name) && !(freedAt && now - freedAt.at < 10 * 60_000 && freedAt.replica !== k)) return name;
+    return `${name}-r${k}`;
   }
 
   // What a copy runs: its spec as it is, or, for a copy whose published ports were moved (it shares its machine with
@@ -1172,20 +1365,32 @@ export class Control {
     return this.copiesOn(name, machine).length > 0;
   }
 
-  // A version is good once every machine that should run it (and is up) reports it healthy, and halted as soon
-  // as one reports it failed; then every machine goes back to the last good version.
+  // A new version becomes stable once every copy of it is healthy. It's halted (its copies go back to the stable
+  // version) only when it failed on 2 or more servers, on its only server, or on one while healthy nowhere for
+  // FAIL_MS: one sick server doesn't stop a rollout.
   settle(now) {
-    const newest = new Map(); // machine -> its newest run that's up; that's the one that speaks for the machine
-    for (const r of this.liveRuns(now)) {
-      if ((newest.get(r.machine)?.started ?? -1) < r.started) newest.set(r.machine, r);
-    }
+    const up = this.liveMachines(now);
     for (const p of this.projects.values()) {
       if (!p.enabled || p.halted || p.stable === p.version) continue;
-      const group = [...newest.values()].filter((r) => this.runsOn(p.name, r.machine));
-      if (!group.length) continue;
-      const failed = group.find((r) => r.status[p.name]?.v === p.version && r.status[p.name]?.s === "failed");
-      if (failed) p.halted = `server ${failed.machine}: ${failed.status[p.name].e || "failed"}`.slice(0, 600);
-      else if (group.every((r) => r.status[p.name]?.v === p.version && r.status[p.name]?.s === "healthy")) p.stable = p.version;
+      const seen = this.copiesOf(p.name).filter((x) => !x.leaving && up.has(x.machine)).map((x) => ({ x, st: up.get(x.machine).status?.[x.key] }));
+      if (!seen.length) continue;
+      const mine = seen.filter((o) => o.st?.v === p.version);
+      const failedOn = [...new Set(mine.filter((o) => o.st.s === "failed").map((o) => o.x.machine))];
+      const healthy = mine.some((o) => o.st.s === "healthy" && o.st.r !== false);
+      const key = `${p.name}@${p.version}`;
+      if (failedOn.length && !healthy) {
+        if (!this.aloneSince.has(key)) this.aloneSince.set(key, now);
+      } else this.aloneSince.delete(key);
+      let halt = null;
+      if (failedOn.length >= 2) halt = `it failed on servers ${failedOn.join(" and ")}`;
+      else if (failedOn.length && seen.length === 1) halt = `it failed on server ${failedOn[0]}, its only server`;
+      else if (failedOn.length && now - this.aloneSince.get(key) >= FAIL_MS) halt = `it failed on server ${failedOn[0]} and has been healthy nowhere for 10 minutes`;
+      if (halt) {
+        const e = mine.find((o) => o.st.s === "failed")?.st.e;
+        p.halted = `${halt}: ${String(e || "failed").split("\n").pop()}`.slice(0, 600);
+        this.aloneSince.delete(key);
+        this.alert("halted", { app: p.name }, `${p.name} version ${p.version} was halted (its copies go back to version ${p.stable ?? "none"}): ${halt}`, now);
+      } else if (seen.every((o) => o.st?.v === p.version && o.st.s === "healthy" && o.st.r !== false)) p.stable = p.version;
       else continue;
       p.updated = now;
       this.saveProject(p);
@@ -1213,18 +1418,28 @@ export class Control {
     const i = list.findIndex((y) => y.machine === x.machine && y.replica === x.replica);
     if (i >= 0) list[i] = x;
     else list.push(x);
-    this.sql.exec("INSERT OR REPLACE INTO copies (name, machine, replica, since, reason, leaving, ports) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      name, x.machine, x.replica, x.since, x.reason, x.leaving ? JSON.stringify(x.leaving) : null, x.ports ? JSON.stringify(x.ports) : null);
+    this.sql.exec("INSERT OR REPLACE INTO copies (name, machine, replica, since, reason, leaving, ports, key, cause) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      name, x.machine, x.replica, x.since, x.reason, x.leaving ? JSON.stringify(x.leaving) : null, x.ports ? JSON.stringify(x.ports) : null,
+      x.key ?? name, x.cause ?? null);
   }
 
-  dropCopy(name, machine, replica) {
+  // `cause` says why, for the events (removed, replicas, gone, moved, cancelled, disabled, retired).
+  dropCopy(name, machine, replica, cause = null, now = Date.now()) {
     const list = this.copies.get(name);
     if (list) {
       const i = list.findIndex((y) => y.machine === machine && y.replica === replica);
-      if (i >= 0) list.splice(i, 1);
+      if (i >= 0) {
+        if (list[i].key === name) this.plainDrops.set(`${name}|${machine}`, { at: now, replica });
+        list.splice(i, 1);
+      }
       if (!list.length) this.copies.delete(name);
     }
+    // A replica left with no copy, other than by its app shrinking or going away, is missing from now on (transitions).
+    if (!["replicas", "removed", "disabled"].includes(cause) && !(this.copies.get(name) ?? []).some((y) => y.replica === replica)) {
+      this.missingAt.set(`${name}|${replica}`, now);
+    }
     this.sql.exec("DELETE FROM copies WHERE name = ? AND machine = ? AND replica = ?", name, machine, replica);
+    if (cause) this.logEvent("drop", { app: name, replica, machine, cause, t: now });
   }
 
   // What a copy takes on its machine: its project's claims, with the ports that were moved for it.
@@ -1257,36 +1472,114 @@ export class Control {
     const counts = new Map(); // machine -> copies placed on it
     for (const [name, list] of this.copies) {
       // Projects that are gone or disabled need no copies; neither do machines that have gone, nor replicas
-      // numbered above the count (it was lowered), along with any copy of theirs being moved.
+      // numbered above the count (it was lowered), along with any copy of theirs being moved. A stateful app loses its
+      // extra replicas one per resync window, highest first, and only while every other copy of it is healthy.
       const p = this.projects.get(name);
-      const replicas = p ? this.version(name, p.version)?.replicas ?? 1 : null;
-      // Just after a (re)start, or a gap in check-ins, every machine looks down until it has checked in again: a copy's
-      // machine counts as gone only once the control plane has been reachable long enough for that.
-      const gone = (machine) => !up.has(machine) && now - this.settleAt > Math.max(this.liveMs, SETTLE_MS);
+      const spec = p ? this.version(name, p.version) : null;
+      const replicas = spec?.replicas ?? 1;
+      let cut = Infinity;
+      if (p?.enabled && spec?.policy.stateful) {
+        const extras = list.filter((x) => x.replica > replicas).map((x) => x.replica);
+        const rest = list.filter((x) => x.replica <= replicas && !x.leaving);
+        cut = extras.length && now - (this.lastCut.get(name) ?? 0) >= spec.policy.resyncMs &&
+          rest.every((x) => this.copyHealthy(name, x, up.get(x.machine))) ? Math.max(...extras) : null;
+      }
+      let lostBudget = null; // how many lost stateful copies of this app may start being rebuilt now
       for (const x of [...list]) {
-        // A copy being moved away goes once its replacement is healthy, or after a while regardless.
-        const moved = x.leaving && (up.get(x.leaving.to)?.status[this.keyOn(name, x.leaving.to, x.replica)]?.s === "healthy" || now - x.leaving.at > MOVE_TIMEOUT_MS);
-        if (!p || !p.enabled || x.replica > replicas || gone(x.machine) || moved) {
-          this.dropCopy(name, x.machine, x.replica);
+        if (!list.includes(x)) continue; // dropped meanwhile (a cancelled move's new copy)
+        const extra = x.replica > replicas && (cut === Infinity || x.replica === cut);
+        const lost = Boolean(p?.enabled) && !extra && x.replica <= replicas && (this.goneCopy(spec, x, up, now) || this.orphaned(spec, x, up.get(x.machine)));
+        if (lost && spec.policy.stateful && !x.leaving) {
+          if (lostBudget == null) {
+            const below = this.belowQuorum(name, spec, up, now);
+            const moving = list.filter((y) => y.leaving?.lost).length;
+            lostBudget = below ? Math.max(1, below.quorum - below.a) - moving
+              : this.budget(name) - this.transitions(name, now, { countMissing: false, countLost: false });
+          }
+          if (lostBudget > 0 && this.lostMove(name, spec, x, up, counts, now)) {
+            lostBudget--;
+            changed = true;
+          }
+          continue;
+        }
+        // (A lost stateful copy is never just dropped: it's rebuilt elsewhere first, see lostMove.)
+        const why = !p ? "removed" : !p.enabled ? "disabled" : extra ? "replicas" : lost && !spec.policy.stateful ? "gone" : null;
+        if (why === "gone") this.alert("grace", { machine: x.machine }, `server ${x.machine} is gone and no replacement took its slot in time: its copies are placed elsewhere`, now);
+        if (why) {
+          this.dropCopy(name, x.machine, x.replica, why, now);
+          if (why === "replicas" && cut !== Infinity) this.lastCut.set(name, now);
           changed = true;
-        } else if (!x.leaving) counts.set(x.machine, (counts.get(x.machine) ?? 0) + 1);
+          continue;
+        }
+        if (x.leaving) {
+          const outcome = this.moveOutcome(name, x, up, now);
+          if (outcome === "done") {
+            this.dropCopy(name, x.machine, x.replica, null, now);
+            this.logEvent("move-done", { app: name, replica: x.replica, machine: x.machine, other: x.leaving.to, cause: x.leaving.cause ?? "hand", t: now });
+            changed = true;
+          } else if (outcome?.cancel) {
+            const to = x.leaving.to;
+            if (!outcome.noNew) this.dropCopy(name, to, x.replica, null, now);
+            if (outcome.failed) {
+              this.failedOn.set(`${name}|${to}`, now + FAILED_ON_MS);
+              if (p) this.noteVersionFail(name, p.halted ? p.stable : p.version, to, now);
+            }
+            this.logEvent("move-cancel", { app: name, replica: x.replica, machine: x.machine, other: to, cause: x.leaving.cause ?? "hand", detail: outcome.cancel, t: now });
+            x.leaving = null;
+            this.saveCopy(name, x);
+            counts.set(x.machine, (counts.get(x.machine) ?? 0) + 1);
+            changed = true;
+          }
+          continue;
+        }
+        counts.set(x.machine, (counts.get(x.machine) ?? 0) + 1);
       }
     }
-    for (const p of [...this.projects.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+    // Stateful apps first (they're the hard ones to fit), then by name.
+    const stateful = (p) => (this.version(p.name, p.version)?.policy.stateful ? 1 : 0);
+    for (const p of [...this.projects.values()].sort((a, b) => stateful(b) - stateful(a) || a.name.localeCompare(b.name))) {
       if (!p.enabled) continue;
       const spec = this.version(p.name, p.version);
+      if (spec?.policy.stateful) this.belowQuorum(p.name, spec, up, now); // notes when it reaches its quorum
       const want = spec?.replicas ?? 1;
       // Each number from 1 to the count needs a copy that's staying: a move's new copy counts, its old one doesn't.
       const have = new Set(this.copiesOf(p.name).filter((x) => !x.leaving).map((x) => x.replica));
       this.blocked.delete(p.name);
-      for (let k = 1; k <= want && arrived; k++) {
-        if (have.has(k)) continue;
+      if (!arrived) continue;
+      const missing = [];
+      for (let k = 1; k <= want; k++) if (!have.has(k)) missing.push(k);
+      if (!missing.length) {
+        this.deferSince.delete(p.name);
+        continue;
+      }
+      // A stateful app gets its missing copies one at a time (each must be healthy for its resync window before the
+      // next): several empty copies arriving together could outvote the ones with data. Below quorum, it gets just
+      // enough at once to reach it.
+      let allowed = missing.length;
+      if (spec?.policy.stateful) {
+        const below = this.belowQuorum(p.name, spec, up, now);
+        // An app that has never had its quorum is being deployed: its copies hold nothing yet, so they all go at once.
+        if (this.hadQuorum.has(p.name)) {
+          allowed = below ? Math.max(1, below.quorum - below.a) : Math.max(0, this.budget(p.name) - this.transitions(p.name, now, { countMissing: false }));
+        }
+        if (!allowed) {
+          this.blocked.set(p.name, `${missing.length === 1 ? "a replica waits" : `${missing.length} replicas wait`} for the copies already changing to settle (one at a time)`);
+          continue;
+        }
+      }
+      for (const k of missing.slice(0, allowed)) {
         const best = this.bestMachine(p.name, up, counts, now);
         if (!best) {
           if (up.size) this.blocked.set(p.name, this.whyBlocked(p.name, spec, up));
           break;
         }
-        this.saveCopy(p.name, this.newCopy(p.name, spec, k, best, now));
+        if (best.doubling && want > 1 && this.deferDoubling(p.name, up, now)) {
+          this.blocked.set(p.name, "waiting for a server that's starting, rather than running two copies on one");
+          break;
+        }
+        const copy = this.newCopy(p.name, spec, k, best, now, best.reason, this.everPlaced(p.name, k) ? "replace" : "new");
+        this.saveCopy(p.name, copy);
+        this.logEvent("place", { app: p.name, replica: k, machine: best.machine, cause: copy.cause, detail: copy.reason, t: now });
         counts.set(best.machine, (counts.get(best.machine) ?? 0) + 1);
         changed = true;
       }
@@ -1294,10 +1587,245 @@ export class Control {
     return changed;
   }
 
+  // A machine counts as gone once it's been silent past the liveness window, but never just after a (re)start or a gap
+  // in check-ins: then every machine looks down until it has checked in again. (For a move's destination.)
+  gone(machine, up, now) {
+    return !up.has(machine) && now - this.settleAt > Math.max(this.liveMs, SETTLE_MS) && !this.settling(now);
+  }
+
+  // A copy's machine counts as gone once it's been silent past its fuse (stateful apps: 10 minutes; others: three
+  // check-in intervals, at least 5 minutes) and its slot isn't held for its pool's next machine (which inherits the
+  // copy). A machine whose run said it's leaving is gone at once. Never while settling.
+  goneCopy(spec, x, up, now) {
+    if (up.has(x.machine)) return false;
+    const last = [...this.runs.values()].filter((r) => r.machine === x.machine).sort((a, b) => b.seen - a.seen)[0];
+    if (last?.left) return true; // it said so itself: no need to wait out a gap
+    if (this.settling(now) || now - this.settleAt <= Math.max(this.liveMs, SETTLE_MS)) return false;
+    const fuse = spec?.policy.stateful ? STATEFUL_GONE_MS : Math.max(3 * this.liveMs, 5 * MIN);
+    if (now - this.lastSeenOf(x.machine) < fuse) return false;
+    return !this.heldBy(x.machine, now);
+  }
+
+  // A stateful copy whose run died and whose slot was taken by a fresh run (not its heir): lost with that run.
+  orphaned(spec, x, run) {
+    return Boolean(spec?.policy.stateful && run?.pool && !run.heir && run.started > x.since);
+  }
+
+  // A lost stateful copy is rebuilt elsewhere as a move (its old copy stays, marked lost): if its machine comes back
+  // before the new copy is healthy, the move is cancelled and the old copy, with its data, keeps its place.
+  lostMove(name, spec, x, up, counts, now) {
+    const dest = this.bestMachine(name, new Map([...up].filter(([m]) => m !== x.machine)), counts, now);
+    if (!dest) {
+      if (up.size) this.blocked.set(name, this.whyBlocked(name, spec, up));
+      return false;
+    }
+    // The run that held it, if its machine is silent (it may come back); none if a fresh run took the slot already.
+    const last = up.has(x.machine) ? null : [...this.runs.values()].filter((r) => r.machine === x.machine).sort((a, b) => b.seen - a.seen)[0];
+    const copy = this.newCopy(name, spec, x.replica, dest, now, `rebuilt here: server ${x.machine} ${last ? "went silent" : "was replaced by a fresh one"}; ${dest.reason}`, "lost");
+    this.saveCopy(name, copy);
+    x.leaving = { to: dest.machine, at: now, lost: true, cause: "lost", fromRun: last?.id ?? null };
+    this.saveCopy(name, x);
+    counts.set(dest.machine, (counts.get(dest.machine) ?? 0) + 1);
+    this.logEvent("move-start", { app: name, replica: x.replica, machine: x.machine, other: dest.machine, cause: "lost", detail: `server ${x.machine} went silent`, t: now });
+    this.alert("grace", { machine: x.machine }, `server ${x.machine} is gone and no replacement took its slot in time: its stateful copies are rebuilt elsewhere`, now);
+    return true;
+  }
+
+  // Whether replica k of an app has had a copy before (a copy placed for it now replaces one, rather than adding one).
+  everPlaced(name, k) {
+    return this.all("SELECT 1 FROM events WHERE app = ? AND replica = ? AND kind = 'place' LIMIT 1", name, k).length > 0;
+  }
+
+  // ---- the transition budget ----
+  // A replica is in transition while it's being moved (two copies), lost its last copy less than 30 minutes ago and has
+  // none yet (countMissing: one that never had a copy is waiting for room, not changing), sits on a machine that
+  // isn't live, isn't healthy on its machine's newest run (for up to 30 minutes: longer is a broken copy, not a change,
+  // and mustn't freeze its app), hasn't yet been healthy there for its app's resync window (stateful apps), or sits on
+  // a run that's leaving (handing over, or moving its copies out). Every voluntary change of an app
+  // (a move, an eviction, a handover, a replica cut) waits while its app has `budget` replicas in transition.
+  transitions(name, now, { countMissing = true, countLost = true, exclude = null, excludeReplica = null } = {}) {
+    const p = this.projects.get(name);
+    const spec = p && this.version(name, p.version);
+    if (!spec) return 0;
+    const up = this.liveMachines(now);
+    let n = 0;
+    for (let k = 1; k <= spec.replicas; k++) {
+      if (k === excludeReplica) continue;
+      const copies = this.copiesOf(name).filter((x) => x.replica === k);
+      const key = `${name}|${k}`;
+      if (!copies.length) {
+        if (countMissing && now - (this.missingAt.get(key) ?? -Infinity) < 30 * MIN) n++;
+        continue;
+      }
+      this.missingAt.delete(key);
+      if (copies.some((x) => x.leaving)) {
+        n++;
+        continue;
+      }
+      const x = copies[0];
+      const run = up.get(x.machine);
+      if (!run || this.orphaned(spec, x, run)) { // lost with its machine (being handled by lostMove)
+        if (countLost) n++;
+        continue;
+      }
+      if (!this.copyHealthy(name, x, run)) {
+        const since = this.unhealthySince.get(key) ?? this.unhealthySince.set(key, now).get(key);
+        if (now - since < 30 * MIN) n++;
+        continue;
+      }
+      this.unhealthySince.delete(key);
+      if (spec.policy.stateful && now - (this.healthyAt.get(`${run.id}|${x.key}`) ?? now) < spec.policy.resyncMs) n++;
+      else if ((run.handover || run.evict) && run.id !== exclude) n++; // leaving now (a drain is only a request: it waits its turn)
+    }
+    return n;
+  }
+
+  // How many replicas of an app may be in transition at once.
+  budget(name) {
+    const p = this.projects.get(name);
+    const spec = p && this.version(name, p.version);
+    if (!spec) return 1;
+    return spec.policy.stateful ? spec.policy.parallel ?? 1 : Math.max(1, Math.ceil(0.2 * spec.replicas));
+  }
+
+  // `exclude`: a run whose own departure doesn't count (moving its copies out is that departure, not another change);
+  // `excludeReplica`: a replica whose own change is the one asked about (a failing copy isn't serving anyway).
+  mayTransition(name, now, exclude = null, excludeReplica = null) {
+    return this.transitions(name, now, { exclude, excludeReplica }) < this.budget(name);
+  }
+
+  // When a copy was last (re)started where it runs: the run's own report of it, else the copy's placement, else the run's start.
+  builtAt(x, run) {
+    const t0 = Number(run?.status?.[x.key]?.t0);
+    return Math.max(x.since, Number.isFinite(t0) && t0 > 0 ? t0 : run?.started ?? 0);
+  }
+
+  // A stateful app with fewer healthy copies than its quorum for 2 minutes: { quorum, a }, where a counts its copies on
+  // live machines that were healthy at least once on their current run (the ones that hold data). Null otherwise.
+  belowQuorum(name, spec, up, now) {
+    const quorum = spec.policy.quorum ?? Math.floor(spec.replicas / 2) + 1;
+    const staying = this.copiesOf(name).filter((x) => !x.leaving);
+    const healthy = staying.filter((x) => this.copyHealthy(name, x, up.get(x.machine))).length;
+    if (healthy >= quorum && !this.hadQuorum.has(name)) {
+      this.hadQuorum.add(name);
+      this.setSetting("had_quorum", JSON.stringify([...this.hadQuorum]));
+    }
+    if (healthy >= quorum || !staying.length) {
+      this.belowSince.delete(name);
+      return null;
+    }
+    const since = this.belowSince.get(name) ?? this.belowSince.set(name, now).get(name);
+    if (now - since < 2 * MIN) return null;
+    if (!this.settling(now)) this.alert("below-quorum", { app: name }, `${name} has ${healthy} healthy copies, below its quorum of ${quorum}, for ${Math.round((now - since) / MIN)} minutes`, now);
+    const a = staying.filter((x) => {
+      const run = up.get(x.machine);
+      return run && this.healthyAt.has(`${run.id}|${x.key}`);
+    }).length;
+    return { quorum, a };
+  }
+
+  // The pool a machine counts in for spreading: its pool, or itself for a standalone host.
+  poolOf(machine, up) {
+    return up.get(machine)?.pool ?? `#${machine}`;
+  }
+
+  // Room left on a machine before it's too busy to take more, from its last 3 minutes (half busy without figures).
+  headroom(machine, now) {
+    const list = (this.samples.get(machine) ?? []).filter((x) => now - x.t <= 3 * MIN);
+    const m = this.liveMetrics.get(machine);
+    let cpu = 50;
+    let mem = 50;
+    if (list.length) {
+      cpu = list.reduce((a, x) => a + x.cpu, 0) / list.length;
+      mem = list.reduce((a, x) => a + x.mem, 0) / list.length;
+    } else if (m && now - m.t < 3 * this.liveMs && m.h.memTotal) {
+      cpu = Number(m.h.cpu) || 0;
+      mem = (100 * (m.h.memUsed || 0)) / m.h.memTotal;
+    }
+    return { cpu, mem, h: Math.min(ROOM_CPU - cpu, ROOM_MEM - mem), measured: list.length > 0 || Boolean(m) };
+  }
+
+  // When the control plane wants a run to leave: some time between 4 h and 5 h 10 min after its start (a fixed spread per
+  // run), always at least 45 minutes before its deadline. Only runs that know their deadline (LIFETIME_MIN) and belong to
+  // a pool (so a replacement can be started) get one.
+  dueAt(r) {
+    if (!r.deadline || !r.pool) return null;
+    let h = 2166136261;
+    for (const ch of r.id) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
+    return Math.min(r.started + (240 + (h % 70)) * MIN, r.deadline - 45 * MIN);
+  }
+
+  // Put off doubling an app up for up to 8 minutes while a server that doesn't run it is starting (or one is being
+  // started): it'll have room in a moment.
+  deferDoubling(name, up, now) {
+    const starting = [...this.starts].some(([n, at]) => now - at < START_WAIT_MS && !up.has(n));
+    const notReady = [...up.values()].some((r) => !r.ready && !this.copiesOn(name, r.machine).length);
+    if (!starting && !notReady) {
+      this.deferSince.delete(name);
+      return false;
+    }
+    const since = this.deferSince.get(name) ?? this.deferSince.set(name, now).get(name);
+    return now - since < 8 * MIN;
+  }
+
+  // A copy is healthy on a run when the run reports it running the wanted version, answering, and (for an app that
+  // declares a readiness path) ready.
+  copyHealthy(name, x, run, v = null) {
+    const st = run?.status?.[x.key];
+    if (!st || st.s !== "healthy" || st.r === false) return false;
+    if (v == null) {
+      const p = this.projects.get(name);
+      v = p?.halted ? p.stable : p?.version;
+    }
+    return st.v === v;
+  }
+
+  // Whether some other replica of the app has a healthy copy right now: a slow new copy is only given up on then (in an
+  // outage, nothing is ready, and waiting is all there is to do).
+  anyReady(name, up, exceptReplica = null) {
+    return this.copiesOf(name).some((y) => !y.leaving && y.replica !== exceptReplica && this.copyHealthy(name, y, up.get(y.machine)));
+  }
+
+  // How a move stands (x is its old copy): "done" once the new copy is healthy and DNS points at it; { cancel } when the
+  // new copy failed, its machine is gone, or it took too long while another copy of the app is ready; null meanwhile.
+  // A cancelled move keeps the old copy: a working copy is never dropped for one that doesn't work.
+  moveOutcome(name, x, up, now) {
+    const lv = x.leaving;
+    const nx = this.copiesOf(name).find((y) => y.machine === lv.to && y.replica === x.replica && !y.leaving);
+    if (!nx) return { cancel: "its new copy is gone", noNew: true };
+    if (lv.lost && lv.fromRun && up.get(x.machine)?.id === lv.fromRun && !this.copyHealthy(name, nx, up.get(lv.to))) {
+      return { cancel: `server ${x.machine} came back before the new copy was ready`, failed: false };
+    }
+    const run = up.get(lv.to);
+    if (this.copyHealthy(name, nx, run)) {
+      if (!lv.okAt) {
+        lv.okAt = now;
+        this.saveCopy(name, x);
+      }
+      const p = this.projects.get(name);
+      const spec = this.version(name, p.halted ? p.stable : p.version);
+      if (!spec?.port || this.env.DNS === "off" || this.dnsSyncedAt >= lv.okAt || now - lv.okAt > DNS_WAIT_MAX_MS) return "done";
+      return null;
+    }
+    if (this.gone(lv.to, up, now)) return { cancel: `server ${lv.to} went away`, failed: false };
+    const st = run?.status?.[nx.key];
+    if (st?.s === "failed") return { cancel: `it failed on server ${lv.to}: ${String(st.e ?? "").split("\n").pop()}`.slice(0, 300), failed: true };
+    const limit = lv.ext ? MOVE_TIMEOUT_EXT_MS : MOVE_TIMEOUT_MS;
+    if (now - lv.at > limit) {
+      if (!lv.ext && st?.s === "applying") {
+        lv.ext = true;
+        this.saveCopy(name, x);
+        return null;
+      }
+      if (this.anyReady(name, up, x.replica)) return { cancel: `its new copy on server ${lv.to} wasn't healthy after ${Math.round(limit / 60_000)} min`, failed: true };
+    }
+    return null;
+  }
+
   // A copy for machine `best` (from bestMachine). Published host ports that something on the machine already uses (a
   // copy of the same project, or another project) are moved aside; the reason says so.
-  newCopy(name, spec, k, best, now, reason = best.reason) {
-    const x = { machine: best.machine, replica: k, since: now, reason, leaving: null, ports: null };
+  newCopy(name, spec, k, best, now, reason = best.reason, cause = "new") {
+    const x = { machine: best.machine, replica: k, since: now, reason, leaving: null, ports: null, key: this.freeKey(name, best.machine, k, now), cause };
     const ports = this.movedPorts(name, spec, best.machine, k);
     const moved = Object.entries(ports).filter(([a, b]) => Number(a) !== b);
     if (moved.length) {
@@ -1309,6 +1837,11 @@ export class Control {
 
   // Why no machine could take a copy, for the project's page.
   whyBlocked(name, spec, up) {
+    if (spec?.policy.stateful) {
+      const N = spec.replicas;
+      const cap = Math.max(1, N - (spec.policy.quorum ?? Math.floor(N / 2) + 1));
+      return `every server it could go on is in a pool that already holds ${cap} of its copies (at most replicas - quorum per pool, so losing a pool can't lose its quorum), or runs a copy already`;
+    }
     const empty = [...up.keys()].filter((m) => !this.copiesOn(name, m).length);
     if (empty.length) {
       const clash = empty.map((m) => this.clash(name, m)).find(Boolean);
@@ -1365,19 +1898,47 @@ export class Control {
     return null;
   }
 
-  // The machine with the most room for a copy of the project: ready machines first, then machines without a copy of
-  // it (a second copy there only when every machine has one, and the project can run twice on a machine), then by
-  // load. A machine where its ports are taken is fine (they're moved aside); one where they can't be, or where a
-  // container name of its is in use, is out.
+  // The machine for a copy of an app. Out: machines where it would clash, where a second copy can't run (or the app is
+  // stateful), that are leaving (drain, handover, evict, due), mid-handover, quarantined, where a move of the app just
+  // failed, or (stateful apps) whose pool already holds its share (replicas - quorum, at least 1). Machines that will be
+  // stopped soon (under 60 minutes left for stateful apps, 30 for others) or are hot (over HOT_CPU / HOT_MEM on their
+  // last 3 minutes) are passed over unless nothing else is left. Then: ready first, fewest copies of the app on the
+  // machine (a second copy only where every machine has one), then in its pool, then machines with room (under
+  // ROOM_CPU / ROOM_MEM) before busy ones, fewest copies placed, most room.
   bestMachine(name, up, counts, now) {
     const p = this.projects.get(name);
     const spec = p && this.version(name, p.version);
-    const mine = new Map(); // machine -> copies of this project there (ones moving away included: their ports are still in use)
+    const pol = spec?.policy ?? {};
+    const mine = new Map(); // machine -> copies of this app there (ones moving away included: their ports are still in use)
     for (const x of this.copiesOf(name)) mine.set(x.machine, (mine.get(x.machine) ?? 0) + 1);
-    return [...up.values()]
-      .filter((r) => !this.clash(name, r.machine) && !(mine.get(r.machine) && spec?.nodup))
-      .map((r) => ({ machine: r.machine, ready: r.ready, doubling: mine.get(r.machine) ?? 0, ...this.load(r.machine, counts.get(r.machine) ?? 0, now) }))
-      .sort((a, b) => b.ready - a.ready || a.doubling - b.doubling || a.score - b.score)[0] ?? null;
+    const inPool = new Map(); // pool -> staying copies of this app there
+    for (const x of this.copiesOf(name)) if (!x.leaving) inPool.set(this.poolOf(x.machine, up), (inPool.get(this.poolOf(x.machine, up)) ?? 0) + 1);
+    const N = spec?.replicas ?? 1;
+    const poolCap = pol.stateful ? Math.max(1, N - (pol.quorum ?? Math.floor(N / 2) + 1)) : Infinity;
+    const runsOnSlot = new Map();
+    for (const r of this.liveRuns(now)) runsOnSlot.set(r.machine, (runsOnSlot.get(r.machine) ?? 0) + 1);
+    const cands = [];
+    for (const r of up.values()) {
+      const doubling = mine.get(r.machine) ?? 0;
+      if (this.clash(name, r.machine) || (doubling && spec?.nodup)) continue;
+      if (r.drain || r.handover || r.retire || r.evict || (runsOnSlot.get(r.machine) ?? 0) > 1) continue;
+      if ((r.quarantine ?? 0) > now || this.failedHere(name, r.machine, now)) continue;
+      const due = this.dueAt(r);
+      if (due && now >= due) continue;
+      const pool = this.poolOf(r.machine, up);
+      if ((inPool.get(pool) ?? 0) >= poolCap) continue;
+      const room = this.headroom(r.machine, now);
+      const placed = counts.get(r.machine) ?? 0;
+      cands.push({
+        machine: r.machine, ready: r.ready, doubling, pool: inPool.get(pool) ?? 0, placed, h: room.h, roomy: room.h > 0,
+        lifeOk: !r.deadline || r.deadline - now >= (pol.stateful ? 60 : 30) * MIN, hot: room.cpu > HOT_CPU || room.mem > HOT_MEM,
+        reason: `${room.measured ? `cpu ${Math.round(room.cpu)}%, memory ${Math.round(room.mem)}%` : "no metrics yet"}, ${placed} other ${placed === 1 ? "copy" : "copies"} placed`,
+      });
+    }
+    let list = cands.filter((c) => c.lifeOk && !c.hot);
+    if (!list.length) list = cands.filter((c) => c.lifeOk);
+    if (!list.length) list = cands;
+    return list.sort((a, b) => b.ready - a.ready || a.doubling - b.doubling || a.pool - b.pool || b.roomy - a.roomy || a.placed - b.placed || b.h - a.h)[0] ?? null;
   }
 
   liveMachines(now) {
@@ -1395,16 +1956,25 @@ export class Control {
   // Move one copy of a project off a machine (replica k, or the first copy there): the new copy is placed first, and
   // the old one is dropped once the new one is healthy (see place()). `to` picks the destination; otherwise it's the
   // machine with the most room.
-  move(name, from, to, replica = null) {
+  move(name, from, to, replica = null, { cause = "hand", why = null } = {}) {
     const p = this.project(name);
     const now = Date.now();
     const onFrom = this.copiesOn(name, from);
     const x = replica != null ? onFrom.find((y) => y.replica === Number(replica)) : onFrom.find((y) => !y.leaving) ?? onFrom[0];
     if (!x) throw new HttpError(400, replica != null ? `replica ${replica} of ${name} isn't on server ${from}` : `${name} isn't placed on server ${from}`);
     if (x.leaving) throw new HttpError(409, `replica ${x.replica} of ${name} is already moving from server ${from} to ${x.leaving.to}`);
+    // A copy that's the new end of a move still under way (its old copy is still serving): that move is redirected
+    // instead of chained, so the replica never ends up with two copies.
+    const origin = this.copiesOf(name).find((y) => y.replica === x.replica && y.leaving?.to === from);
     const spec = this.version(name, p.version);
     const up = this.liveMachines(now);
     let dest;
+    if (origin && to && Number(to) === origin.machine) { // back where it came from: the move is called off
+      this.dropCopy(name, from, x.replica, null, now);
+      this.logEvent("move-cancel", { app: name, replica: x.replica, machine: origin.machine, other: from, cause: origin.leaving.cause ?? "hand", detail: `sent back to server ${origin.machine}${why ? `: ${why}` : " by hand"}`, t: now });
+      this.saveCopy(name, { ...origin, leaving: null });
+      return this.describe(p);
+    }
     if (to) {
       const m = Number(to);
       if (!up.has(m)) throw new HttpError(400, `server ${to} isn't up`);
@@ -1413,26 +1983,45 @@ export class Control {
       if (doubling && spec?.nodup) throw new HttpError(409, `server ${to} already runs ${name}, which can't run twice on one server (${spec.nodup})`);
       const clash = this.clash(name, m);
       if (clash) throw new HttpError(409, `server ${to} already has ${clash.other}, which uses ${clash.what} too`);
-      dest = { machine: m, doubling, reason: `moved here from server ${from} by hand` };
+      dest = { machine: m, doubling, reason: `moved here from server ${from} ${why ? `automatically: ${why}` : "by hand"}` };
     } else {
-      const best = this.bestMachine(name, new Map([...up].filter(([m]) => m !== from)), this.placementCounts(), now);
+      const best = this.bestMachine(name, new Map([...up].filter(([m]) => m !== from && m !== origin?.machine && !this.failedHere(name, m, now))), this.placementCounts(), now);
       if (!best) throw new HttpError(409, `no other server is up for ${name}`);
-      dest = { ...best, reason: `moved here from server ${from}: ${best.reason}` };
+      dest = { ...best, reason: `moved here from server ${from}${why ? ` automatically: ${why}` : ""}: ${best.reason}` };
     }
-    this.saveCopy(name, this.newCopy(name, spec, x.replica, dest, now, dest.reason));
-    this.saveCopy(name, { ...x, leaving: { to: dest.machine, at: now } });
+    if (origin) {
+      this.dropCopy(name, from, x.replica, null, now);
+      this.saveCopy(name, this.newCopy(name, spec, x.replica, dest, now, dest.reason.replace(`from server ${from}`, `from server ${origin.machine} (instead of ${from})`), `move:${cause}`));
+      const { lost, fromRun } = origin.leaving;
+      this.saveCopy(name, { ...origin, leaving: { to: dest.machine, at: now, cause, ...(lost ? { lost, fromRun } : {}) } });
+      this.logEvent("move-start", { app: name, replica: x.replica, machine: origin.machine, other: dest.machine, cause, detail: `redirected from server ${from}: ${why ?? dest.reason}`, t: now });
+      return this.describe(p);
+    }
+    this.saveCopy(name, this.newCopy(name, spec, x.replica, dest, now, dest.reason, `move:${cause}`));
+    this.saveCopy(name, { ...x, leaving: { to: dest.machine, at: now, cause } });
+    this.logEvent("move-start", { app: name, replica: x.replica, machine: from, other: dest.machine, cause, detail: why ?? dest.reason, t: now });
     return this.describe(p);
   }
 
-  // Move every copy off a machine (it's hot, or about to be removed).
-  evict(machine) {
+  failedHere(name, machine, now) {
+    return (this.failedOn.get(`${name}|${machine}`) ?? 0) > now;
+  }
+
+  // Move every copy off a machine (it's hot, or about to be removed). Apps already changing as much as they may (see
+  // transitions) are left for later unless forced.
+  evict(machine, { force = false } = {}) {
+    const now = Date.now();
     const moved = [];
     const failed = [];
     for (const [name, list] of this.copies) {
       for (const x of [...list]) {
         if (x.machine !== machine || x.leaving) continue;
+        if (!force && !this.mayTransition(name, now)) {
+          failed.push(`${name} (replica ${x.replica}): it's already changing as much as it may; try again in a few minutes, or force it`);
+          continue;
+        }
         try {
-          this.move(name, machine, null, x.replica);
+          this.move(name, machine, null, x.replica, { cause: "evict" });
           moved.push(`${name} (replica ${x.replica})`);
         } catch (e) {
           failed.push(`${name} (replica ${x.replica}): ${e.message}`);
@@ -1443,12 +2032,44 @@ export class Control {
   }
 
   // ---- automatic rebalancing ----
+  // Every automatic move has a cause: a hot server (the app making it hot moves), a copy failing on one server while
+  // its app is healthy elsewhere, a server running two copies of an app while another runs none (un-stack), or a
+  // stateful app over its share in one pool (spread). Moves in flight fleet-wide (any cause, by hand included) stay
+  // under min(8, 10% of the settled servers), the last slot kept for a hot server; a server takes one arrival at a
+  // time. Hot and failed-copy moves feed a breaker that pauses all of this for an hour when they look like thrashing.
 
-  // Over the limits on every sample going back at least HOT_MS, with enough samples to mean it.
-  isHot(machine, now) {
-    const list = (this.samples.get(machine) ?? []).filter((x) => now - x.t <= this.hotMs() * 1.5);
-    if (list.length < 3 || now - list[0].t < this.hotMs()) return false;
-    return list.every((x) => x.cpu > HOT_CPU || x.mem > HOT_MEM);
+  // A run's last 5 minute summaries, if it sent at least 4: hot when 4 are over HOT_CPU (CPU minus steal: time the
+  // host took away isn't the apps') or HOT_MEM. { cpu, mem, kind: "cpu" | "mem", score, list }, or null.
+  hotness(r, now) {
+    const list = (this.minutes.get(r.id) ?? []).filter((m) => now - m.t <= 7 * MIN).slice(-5);
+    if (list.length < 4) return null;
+    const over = list.filter((m) => m.cpu - m.steal > HOT_CPU || m.mem > HOT_MEM).length;
+    if (over < 4) return null;
+    const avg = (f) => list.reduce((a, m) => a + f(m), 0) / list.length;
+    const cpu = avg((m) => m.cpu - m.steal);
+    const mem = avg((m) => m.mem);
+    const cpuOver = list.filter((m) => m.cpu - m.steal > HOT_CPU).length;
+    const memOver = list.filter((m) => m.mem > HOT_MEM).length;
+    const kind = cpuOver !== memOver ? (memOver > cpuOver ? "mem" : "cpu") : mem - HOT_MEM > cpu - HOT_CPU ? "mem" : "cpu";
+    return { cpu, mem, kind, score: Math.max(cpu - HOT_CPU, mem - HOT_MEM), list };
+  }
+
+  // What one copy of each app on a run takes of it over those minutes: cpu and mem as % of the host, and mem in bytes.
+  // Copies of one app on a server share its figures (a copy moving away included: it still runs).
+  appShares(r, list) {
+    const cores = r.cpus || DEFAULT_CPUS;
+    const memTotal = list.at(-1)?.memTotal || 1;
+    const out = new Map();
+    for (const [name, copies] of this.copies) {
+      const all = copies.filter((x) => x.machine === r.machine);
+      const staying = all.filter((x) => !x.leaving);
+      const rows = list.map((m) => m.a?.[name]).filter(isMap);
+      if (!staying.length || !rows.length) continue;
+      const cpu = rows.reduce((a, x) => a + (Number(x.cpu) || 0), 0) / rows.length / cores / all.length;
+      const memBytes = rows.reduce((a, x) => a + (Number(x.mem) || 0), 0) / rows.length / all.length;
+      out.set(name, { cpu, mem: (100 * memBytes) / memTotal, memBytes, copies: staying });
+    }
+    return out;
   }
 
   hasRoom(machine, now) {
@@ -1457,89 +2078,604 @@ export class Control {
     return m.h.cpu < ROOM_CPU && (100 * m.h.memUsed) / m.h.memTotal < ROOM_MEM;
   }
 
-  // The placed copy using the most of a machine, by its project's CPU and memory there (two copies of one project
-  // share its figures; the highest replica number is the one to move).
-  heaviestOn(machine, now) {
-    const m = this.liveMetrics.get(machine);
-    const memTotal = m?.h.memTotal || 1;
-    let best = null;
-    for (const [name, list] of this.copies) {
-      const here = list.filter((x) => x.machine === machine && !x.leaving);
-      if (!here.length) continue;
-      if (now - (this.autoMoved.get(name) ?? 0) < PROJECT_COOLDOWN_MS) continue;
-      const a = m?.a[name];
-      const weight = a ? (a.cpu || 0) + (100 * (a.mem || 0)) / memTotal : 0;
-      if (!best || weight > best.weight) best = { name, weight, replica: Math.max(...here.map((x) => x.replica)) };
-    }
-    return best;
+  // Why a copy mustn't be moved automatically now, or null: a stateful app with one copy, an app whose latest version
+  // isn't settled, or a stateful app with another copy changing.
+  neverAuto(name, x, now) {
+    const p = this.projects.get(name);
+    const spec = p && this.version(name, p.version);
+    if (!p?.enabled || !spec) return "it isn't running";
+    if (spec.policy.stateful && spec.replicas === 1) return "it's a stateful app with a single copy";
+    if (p.stable !== p.version) return "its latest version hasn't settled yet";
+    if (spec.policy.stateful && this.transitions(name, now, { excludeReplica: x.replica }) > 0) return "another of its copies is changing";
+    return null;
   }
 
-  logRebalance(now, text) {
-    this.rebalanceLog.unshift({ t: now, text });
-    this.rebalanceLog.length = Math.min(this.rebalanceLog.length, 30);
-    this.setSetting("rebalance_log", JSON.stringify(this.rebalanceLog));
+  lastAutoMove(name) {
+    return Number(this.autoMoved.get(name) ?? 0);
+  }
+
+  autoMovedAt(name, now) {
+    this.autoMoved.set(name, now);
+    this.setSetting("auto_moved", JSON.stringify(Object.fromEntries([...this.autoMoved].filter(([, t]) => now - t < PROJECT_COOLDOWN_MS))));
+  }
+
+  // Hot and failed-copy moves started in the last `span` (from the events).
+  autoMoves(now, span) {
+    return this.all("SELECT app, replica, machine, other, t, cause FROM events WHERE kind = 'move-start' AND cause IN ('hot', 'failed') AND t > ?", now - span);
+  }
+
+  // When a hot move of replica k may come again: 30 minutes after its first hot move in 24 hours, an hour after its
+  // second; never after a third (pinned: null).
+  hotBackoff(name, k, moves24) {
+    const mine = moves24.filter((e) => e.cause === "hot" && e.app === name && e.replica === k).map((e) => e.t);
+    if (mine.length >= 3) return null;
+    return mine.length ? Math.max(...mine) + Math.min(240, 30 * 2 ** (mine.length - 1)) * MIN : 0;
+  }
+
+  // The thrash breaker, over hot and failed-copy moves only: why this move would trip it (more than 3 between one pair
+  // of servers in 2 hours, more than 6 in an hour, or a replica's second in 2 hours), or null.
+  thrash(name, k, from, to, moves2h, now) {
+    if (moves2h.filter((e) => (e.machine === from && e.other === to) || (e.machine === to && e.other === from)).length >= 3) {
+      return `it would be the 4th automatic move between servers ${from} and ${to} in 2 hours`;
+    }
+    if (moves2h.filter((e) => now - e.t < 3600_000).length >= 6) return "it would be the 7th automatic move in an hour";
+    if (moves2h.some((e) => e.app === name && e.replica === k)) return `${name} replica ${k} would move automatically a second time in 2 hours`;
+    return null;
+  }
+
+  paused(now) {
+    return Number(this.settings.get("rebalance_paused_until") ?? 0) > now;
+  }
+
+  pause(why, now) {
+    this.setSetting("rebalance_paused_until", now + PAUSE_MS);
+    this.logEvent("pause", { cause: "thrash", detail: `automatic moves paused for an hour: ${why}`, t: now });
+    this.alert("paused", {}, `automatic moves are paused for an hour: ${why}`, now);
+  }
+
+  // A note in the events about something the rebalancer saw but didn't act on, once per 30 minutes per subject.
+  noteRebalance(subject, text, now, f = {}) {
+    if (now - (this.noted.get(subject) ?? 0) < 30 * MIN) return;
+    this.noted.set(subject, now);
+    this.logEvent("rebalance", { ...f, detail: text, t: now });
   }
 
   rebalance(now) {
-    if (!this.rebalanceOn() || now - this.lastRebalance < 30_000) return;
+    if (!this.rebalanceOn() || now - this.lastRebalance < 30_000 || this.quiet(now) || this.paused(now)) return;
     this.lastRebalance = now;
-    // One move at a time: wait for any move (by hand or automatic) to finish.
-    for (const list of this.copies.values()) for (const x of list) if (x.leaving) return;
     const up = this.liveMachines(now);
     const settled = [...up.values()].filter((r) => r.ready && now - r.started > SETTLED_MS && this.liveMetrics.has(r.machine));
     if (settled.length < 2) return;
-    const counts = this.placementCounts();
-    const tryMove = (name, from, dest, replica, why, reasonOnDest, { cooldown = true } = {}) => {
-      try {
-        this.move(name, from, String(dest.machine), replica);
-        const x = this.copiesOn(name, dest.machine).find((y) => y.replica === replica);
-        x.reason = `moved here from server ${from} automatically: ${why}; ${reasonOnDest}`;
-        this.saveCopy(name, x);
-        if (cooldown) this.autoMoved.set(name, now);
-        this.logRebalance(now, `moved replica ${replica} of ${name} from server ${from} to server ${dest.machine}: ${why}`);
-      } catch (e) {
-        this.logRebalance(now, `couldn't move replica ${replica} of ${name} off server ${from}: ${e.message}`);
+    const isSettled = new Set(settled.map((r) => r.machine));
+    let inFlight = 0;
+    const arriving = new Set();
+    for (const list of this.copies.values()) {
+      for (const x of list) {
+        if (!x.leaving) continue;
+        inFlight++;
+        arriving.add(x.leaving.to);
       }
+    }
+    const moves24 = this.autoMoves(now, 24 * 3600_000);
+    const ctx = {
+      now, up, isSettled, moves24, counts: this.placementCounts(),
+      moves2h: moves24.filter((e) => now - e.t < 2 * 3600_000),
+      hotRuns: settled.map((r) => ({ r, hot: this.hotness(r, now) })).filter((x) => x.hot).sort((a, b) => b.hot.score - a.hot.score),
+      cap: Math.max(1, Math.min(8, Math.ceil(0.1 * settled.length))),
+      // Room for one more move of this kind: the last slot is a hot server's while one is hot.
+      free: (kind) => inFlight < (kind === "hot" || !ctx.hotRuns.length ? ctx.cap : ctx.cap - 1),
+      // Destinations: settled servers other than `from`, with nothing arriving, that pass `ok`.
+      dests: (from, ok = () => true) => new Map([...up].filter(([m]) => m !== from && isSettled.has(m) && !arriving.has(m) && ok(m))),
+      // Starts a move (the breaker may pause everything instead): true, false, or "paused".
+      start: (name, x, dest, cause, why) => {
+        if (cause === "hot" || cause === "failed") {
+          const t = this.thrash(name, x.replica, x.machine, dest.machine, ctx.moves2h, now);
+          if (t) {
+            this.pause(t, now);
+            return "paused";
+          }
+        }
+        try {
+          this.move(name, x.machine, String(dest.machine), x.replica, { cause, why });
+        } catch (e) {
+          this.noteRebalance(`fail|${name}|${x.replica}`, `couldn't move ${name} replica ${x.replica} off server ${x.machine}: ${e.message}`, now, { app: name, replica: x.replica, machine: x.machine });
+          return false;
+        }
+        const nx = this.copiesOn(name, dest.machine).find((y) => y.replica === x.replica && !y.leaving);
+        if (nx) {
+          nx.reason = `moved here from server ${x.machine} automatically: ${why}; ${dest.reason}`;
+          this.saveCopy(name, nx);
+        }
+        inFlight++;
+        arriving.add(dest.machine);
+        ctx.counts.set(dest.machine, (ctx.counts.get(dest.machine) ?? 0) + 1);
+        if (cause !== "unstack") this.autoMovedAt(name, now);
+        if (cause === "hot" || cause === "failed") ctx.moves2h.push({ app: name, replica: x.replica, machine: x.machine, other: dest.machine, t: now, cause });
+        return true;
+      },
     };
-    // First: a machine running two or more copies of a project while a settled machine with room runs none of it.
-    // These moves only undo a shortage of machines at placement time, so they go as fast as they complete (one at a
-    // time), with none of the thrash protection the moves below have.
-    for (const [name, list] of this.copies) {
+    // Priority: hot, then failed copies, then un-stacking, then stateful spread.
+    for (const step of [this.rebalanceHot, this.rebalanceFailed, this.rebalanceUnstack, this.rebalanceSpread]) {
+      if (step.call(this, ctx) === "paused") return;
+    }
+  }
+
+  // A hot server has the copy taking the most of it moved off (at least 15% of it, else the heat isn't the apps'),
+  // once no copy on it is new or unhealthy; to a server that would still have room with it there and took no hot move
+  // in 30 minutes. At most 2 moves off a server an hour; still hot 10 minutes after one, it's suspect (not a
+  // destination for an hour). A replica moved for heat waits 30 minutes, then an hour, and stays put after 3 in a day.
+  // One hot move per COOLDOWN_MS fleet-wide, one per app per PROJECT_COOLDOWN_MS.
+  rebalanceHot(ctx) {
+    const { now, up } = ctx;
+    const cooling = now - Number(this.settings.get("last_hot_move") ?? 0) < COOLDOWN_MS;
+    for (const { r, hot } of ctx.hotRuns) {
+      const what = `server ${r.machine} is hot (${hot.kind === "cpu" ? `cpu ${Math.round(hot.cpu)}%` : `memory ${Math.round(hot.mem)}%`} over 5 minutes)`;
+      const off = ctx.moves24.filter((e) => e.cause === "hot" && e.machine === r.machine && now - e.t < 3600_000);
+      if (off.length && now - Math.max(...off.map((e) => e.t)) >= 10 * MIN && !((r.quarantine ?? 0) > now)) {
+        this.quarantine(r, "still hot 10 minutes after an app was moved off it", now, { sick: false });
+      }
+      if (off.length >= 2) {
+        this.noteRebalance(`hot2|${r.id}`, `${what}, but 2 apps were moved off it this hour already`, now, { machine: r.machine });
+        continue;
+      }
+      const here = [];
+      for (const [name, list] of this.copies) for (const x of list) if (x.machine === r.machine && !x.leaving) here.push({ name, x });
+      if (here.some(({ name, x }) => now - this.builtAt(x, r) < this.youngMs() || !this.copyHealthy(name, x, r))) {
+        this.noteRebalance(`hotwait|${r.id}`, `${what}, but a copy on it is new or not healthy: waiting`, now, { machine: r.machine });
+        continue;
+      }
+      const shares = this.appShares(r, hot.list);
+      const share = (s) => (hot.kind === "cpu" ? s.cpu : s.mem);
+      if (Math.max(0, ...[...shares.values()].map(share)) < 15) {
+        this.noteRebalance(`hotapps|${r.id}`, `${what}, but no app on it uses 15% of it: nothing to move`, now, { machine: r.machine });
+        continue;
+      }
+      if (cooling || !ctx.free("hot")) { // (notes and suspicion above go on meanwhile)
+        this.noteRebalance(`hotcool|${r.id}`, `${what}: waiting, ${cooling ? "a hot move was made less than 10 minutes ago" : "enough moves are under way"}`, now, { machine: r.machine });
+        continue;
+      }
+      const cands = [];
+      for (const [name, s] of shares) {
+        if (share(s) < 15 || now - this.lastAutoMove(name) < PROJECT_COOLDOWN_MS || !this.mayTransition(name, now)) continue;
+        for (const x of s.copies) {
+          const at = this.hotBackoff(name, x.replica, ctx.moves24);
+          if (at != null && at <= now && !this.neverAuto(name, x, now)) cands.push({ name, x, s });
+        }
+      }
+      const pick = cands.sort((a, b) => share(b.s) - share(a.s) || b.x.replica - a.x.replica)[0];
+      if (!pick) {
+        this.noteRebalance(`hotnone|${r.id}`, `${what}, but the apps using it can't move now (cooldown, budget, backoff or policy)`, now, { machine: r.machine });
+        continue;
+      }
+      const tookHot = new Set(ctx.moves24.filter((e) => e.cause === "hot" && now - e.t < HOT_DEST_MS).map((e) => e.other));
+      const fits = (m) => {
+        const d = up.get(m);
+        const room = this.headroom(m, now);
+        const memTotal = this.liveMetrics.get(m)?.h.memTotal || 0;
+        const cpu = room.cpu + pick.s.cpu * ((r.cpus || DEFAULT_CPUS) / (d.cpus || DEFAULT_CPUS));
+        const mem = room.mem + (memTotal ? (100 * pick.s.memBytes) / memTotal : pick.s.mem);
+        return cpu < ROOM_CPU && mem < ROOM_MEM && !this.hotness(d, now);
+      };
+      const dest = this.bestMachine(pick.name, ctx.dests(r.machine, (m) => !tookHot.has(m) && fits(m)), ctx.counts, now);
+      if (!dest) {
+        this.noteRebalance(`hotroom|${r.id}`, `${what}, but no server has room for ${pick.name} (${Math.round(share(pick.s))}% of it)`, now, { machine: r.machine, app: pick.name });
+        continue;
+      }
+      const res = ctx.start(pick.name, pick.x, dest, "hot", `${what}; ${pick.name} used ${Math.round(share(pick.s))}% of it`);
+      if (res === true) this.setSetting("last_hot_move", now);
+      if (res) return res;
+    }
+    return null;
+  }
+
+  // A copy failing (or not ready) for FAIL_MS on a settled server while its app is healthy elsewhere moves once, and
+  // its app isn't placed there again for FAILED_ON_MS. A version that failed on 2 servers is the app's fault: its
+  // copies stay where they are, and an alert says so.
+  rebalanceFailed(ctx) {
+    const { now, up } = ctx;
+    for (const [name, list] of [...this.copies]) {
+      const p = this.projects.get(name);
+      if (!p?.enabled) continue;
+      const v = p.halted ? p.stable : p.version;
+      for (const x of [...list]) {
+        if (x.leaving || !ctx.isSettled.has(x.machine)) continue;
+        const run = up.get(x.machine);
+        const st = run?.status?.[x.key];
+        if (!failing(st) || st.v !== v || !this.anyReady(name, up, x.replica)) continue;
+        const since = this.failClock(name, x, run, now);
+        if (now - since < FAIL_MS) continue;
+        this.noteVersionFail(name, v, x.machine, now);
+        if ((this.versionFails.get(`${name}@${v}`)?.size ?? 0) >= 2) continue;
+        if (!ctx.free("failed")) return null;
+        const no = this.neverAuto(name, x, now);
+        if (no || now - this.lastAutoMove(name) < PROJECT_COOLDOWN_MS || !this.mayTransition(name, now, null, x.replica)) {
+          if (no) this.noteRebalance(`failno|${name}|${x.replica}`, `${name} replica ${x.replica} is failing on server ${x.machine}, but it's left there: ${no}`, now, { app: name, replica: x.replica, machine: x.machine });
+          continue;
+        }
+        const dest = this.bestMachine(name, ctx.dests(x.machine), ctx.counts, now);
+        if (!dest) {
+          this.noteRebalance(`failroom|${name}|${x.replica}`, `${name} replica ${x.replica} is failing on server ${x.machine}, and no other server can take it`, now, { app: name, replica: x.replica, machine: x.machine });
+          continue;
+        }
+        const err = String(st.e ?? "").split("\n").pop().slice(0, 160);
+        const res = ctx.start(name, x, dest, "failed", `it ${st.s === "failed" ? "failed" : "wasn't ready"} on server ${x.machine} for ${Math.round((now - since) / MIN)} minutes while healthy elsewhere${err ? ` (${err})` : ""}`);
+        if (res === "paused") return res;
+        if (res) this.failedOn.set(`${name}|${x.machine}`, now + FAILED_ON_MS);
+      }
+    }
+    return null;
+  }
+
+  // A server running two or more copies of an app while a settled server with room runs none: the highest replica
+  // there moves, one per app per pass (a stateful app's through its budget, one at a time). Copies younger than 10
+  // minutes are left alone.
+  rebalanceUnstack(ctx) {
+    const { now, up } = ctx;
+    const young = (x) => now - this.builtAt(x, up.get(x.machine)) < this.youngMs();
+    for (const [name, list] of [...this.copies]) {
+      if (!ctx.free("unstack")) return null;
+      if (!this.mayTransition(name, now)) continue;
       const by = new Map();
-      for (const x of list) if (!x.leaving) by.set(x.machine, (by.get(x.machine) ?? 0) + 1);
-      const from = [...by].filter(([m, n]) => n > 1 && settled.some((r) => r.machine === m)).sort((a, b) => b[1] - a[1])[0];
+      for (const x of list) if (!x.leaving && !young(x)) by.set(x.machine, (by.get(x.machine) ?? 0) + 1);
+      const from = [...by].filter(([m, n]) => n > 1 && ctx.isSettled.has(m)).sort((a, b) => b[1] - a[1])[0];
       if (!from) continue;
-      const dest = this.bestMachine(name, new Map([...up].filter(([m]) => !by.has(m) && settled.some((r) => r.machine === m) && this.hasRoom(m, now))), counts, now);
+      const x = list.filter((y) => y.machine === from[0] && !y.leaving).sort((a, b) => b.replica - a.replica)[0];
+      if (this.neverAuto(name, x, now)) continue;
+      const dest = this.bestMachine(name, ctx.dests(from[0], (m) => !list.some((y) => y.machine === m) && this.hasRoom(m, now)), ctx.counts, now);
+      if (dest) ctx.start(name, x, dest, "unstack", `server ${from[0]} ran ${from[1]} copies of ${name} and server ${dest.machine} none`);
+    }
+    return null;
+  }
+
+  // A stateful app with more copies in one pool than its share (from before it said it's stateful, or a pool that
+  // shrank): one move at a time, with every copy of it healthy.
+  rebalanceSpread(ctx) {
+    const { now, up } = ctx;
+    for (const [name, list] of [...this.copies]) {
+      if (!ctx.free("spread")) return null;
+      const p = this.projects.get(name);
+      const spec = p && this.version(name, p.version);
+      if (!spec?.policy.stateful || this.transitions(name, now) > 0 || now - this.lastAutoMove(name) < PROJECT_COOLDOWN_MS) continue;
+      const cap = Math.max(1, spec.replicas - (spec.policy.quorum ?? Math.floor(spec.replicas / 2) + 1));
+      const byPool = new Map();
+      for (const x of list) {
+        if (x.leaving) continue;
+        const pool = this.poolOf(x.machine, up);
+        (byPool.get(pool) ?? byPool.set(pool, []).get(pool)).push(x);
+      }
+      const over = [...byPool].find(([, xs]) => xs.length > cap);
+      if (!over) continue;
+      const x = over[1].sort((a, b) => b.replica - a.replica)[0];
+      if (this.neverAuto(name, x, now)) continue;
+      const dest = this.bestMachine(name, ctx.dests(x.machine), ctx.counts, now);
       if (!dest) continue;
-      const replica = Math.max(...list.filter((x) => x.machine === from[0] && !x.leaving).map((x) => x.replica));
-      return tryMove(name, from[0], dest, replica, `server ${from[0]} ran ${from[1]} copies of ${name} and server ${dest.machine} none`, dest.reason, { cooldown: false });
+      const res = ctx.start(name, x, dest, "spread", `pool ${over[0]} held ${over[1].length} of its copies, more than its share of ${cap}`);
+      if (res === "paused") return res;
     }
-    if (now - (this.rebalanceLog[0]?.t ?? 0) < COOLDOWN_MS) return;
-    // Hot machines first, busiest first; then the most loaded machine if the spread is uneven.
-    let from = null;
-    let why = "";
-    const hot = settled.filter((r) => this.isHot(r.machine, now) && (counts.get(r.machine) ?? 0) > 0)
-      .sort((a, b) => this.liveMetrics.get(b.machine).h.cpu - this.liveMetrics.get(a.machine).h.cpu);
-    if (hot.length) {
-      from = hot[0].machine;
-      const h = this.liveMetrics.get(from).h;
-      why = `server ${from} is hot (cpu ${Math.round(h.cpu)}%, memory ${Math.round((100 * h.memUsed) / h.memTotal)}%)`;
-    } else {
-      const byCount = settled.map((r) => ({ machine: r.machine, n: counts.get(r.machine) ?? 0 })).sort((a, b) => b.n - a.n);
-      const most = byCount[0];
-      const least = byCount[byCount.length - 1];
-      if (most.n - least.n < SPREAD_GAP) return;
-      from = most.machine;
-      why = `server ${from} has ${most.n} ${most.n === 1 ? "copy" : "copies"} placed and the emptiest server has ${least.n}`;
+    return null;
+  }
+
+  // ---- copy clocks, sick servers, alerts ----
+
+  // What a run's check-in says about its copies: when each was first reported there, last healthy there (and first
+  // healthy, for the resync window), and how often each restarted (strikes).
+  noteCopies(r, status, now) {
+    const rs = this.restarts.get(r.id) ?? this.restarts.set(r.id, { last: {}, log: [] }).get(r.id);
+    for (const [key, st] of Object.entries(status)) {
+      if (!isMap(st)) continue;
+      const k = `${r.id}|${key}`;
+      const copy = () => {
+        for (const [name, list] of this.copies) for (const x of list) if (x.machine === r.machine && x.key === key) return { app: name, replica: x.replica };
+        return { app: null, replica: null };
+      };
+      if (!this.firstSeen.has(k)) {
+        this.firstSeen.set(k, now);
+        // A successor building a copy its predecessor serves (after a restart, only builds still under way count).
+        const older = this.predecessorOf(r, now);
+        if (older && st.s !== "healthy" && older.status?.[key]?.s === "healthy") this.logEvent("copy-start", { ...copy(), machine: r.machine, run: r.id, cause: "successor", t: now });
+      }
+      const pv = this.lastV.get(k);
+      if (st.v != null && pv != null && st.v !== pv) this.logEvent("copy-start", { ...copy(), machine: r.machine, run: r.id, cause: "version", detail: `v${pv} -> v${st.v}`, t: now });
+      if (st.v != null) this.lastV.set(k, st.v);
+      if (st.s === "healthy" && st.r !== false) {
+        this.lastHealthy.set(k, now);
+        if (!this.healthyAt.has(k)) this.healthyAt.set(k, now);
+      }
+      const n = Number(st.n);
+      if (!Number.isFinite(n)) continue;
+      if (rs.last[key] != null && n > rs.last[key]) rs.log.push({ t: now, key, k: n - rs.last[key] });
+      rs.last[key] = n;
     }
-    const pick = this.heaviestOn(from, now);
-    if (!pick) return;
-    const dest = this.bestMachine(pick.name, new Map([...up].filter(([m]) => m !== from && this.hasRoom(m, now) && settled.some((r) => r.machine === m))), counts, now);
-    if (!dest) {
-      if (now - (this.rebalanceLog[0]?.t ?? 0) > COOLDOWN_MS * 3) this.logRebalance(now, `${why}, but no server has room for ${pick.name}`);
+    while (rs.log.length && now - rs.log[0].t > 3600_000) rs.log.shift();
+  }
+
+  // Since when each app has had a healthy copy somewhere (checked every 10 s).
+  noteReady(now) {
+    if (now - this.lastReadyCheck < 10_000) return;
+    this.lastReadyCheck = now;
+    const up = this.liveMachines(now);
+    for (const name of this.projects.keys()) {
+      if (this.copiesOf(name).some((x) => !x.leaving && this.copyHealthy(name, x, up.get(x.machine)))) {
+        if (!this.readySince.has(name)) this.readySince.set(name, now);
+      } else this.readySince.delete(name);
+    }
+  }
+
+  // When a copy's current failure started, on the control plane's clock: the latest of its last healthy report on its
+  // server's run, its placement and its first report there; outage-aware, no earlier than when some copy of its app
+  // was last healthy again (in an outage, nothing is ready, and nothing is any one server's fault).
+  failClock(name, x, run, now, { outageAware = true } = {}) {
+    const k = `${run.id}|${x.key}`;
+    const t = Math.max(this.lastHealthy.get(k) ?? 0, x.since, this.firstSeen.get(k) ?? now);
+    return outageAware ? Math.max(t, this.readySince.get(name) ?? now) : t;
+  }
+
+  noteVersionFail(name, v, machine, now) {
+    const key = `${name}@${v}`;
+    const set = this.versionFails.get(key) ?? this.versionFails.set(key, new Set()).get(key);
+    if (set.has(machine)) return;
+    set.add(machine);
+    this.saveVersionFails();
+    if (set.size >= 2) {
+      this.alert("fails-everywhere", { app: name }, `${name} version ${v} failed on servers ${[...set].join(" and ")}: that's the app, not the servers, so its copies aren't moved for failing any more`, now);
+    }
+  }
+
+  saveVersionFails() {
+    this.setSetting("version_fails", JSON.stringify(Object.fromEntries([...this.versionFails].map(([k, set]) => [k, [...set]]))));
+  }
+
+  // Something automation gave up on, or a human should see: an event of kind "alert", once per cause and target per
+  // 10 minutes.
+  alert(cause, f, text, now) {
+    const key = `${cause}|${f.app ?? ""}|${f.machine ?? ""}`;
+    if (now - (this.alertedAt.get(key) ?? 0) < 10 * MIN) return;
+    this.alertedAt.set(key, now);
+    this.logEvent("alert", { ...f, cause, detail: text, t: now });
+    // ALERT_WEBHOOK: a JSON POST per alert (text and content, for Slack- and Discord-style hooks), at most 30 an hour.
+    const url = this.env.ALERT_WEBHOOK;
+    this.webhookLog = this.webhookLog.filter((t) => now - t < 3600_000);
+    if (url && this.webhookLog.length < 30) {
+      this.webhookLog.push(now);
+      const message = `Runners: ${text}`;
+      fetch(url, { method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify({ text: message, content: message, cause, app: f.app ?? null, machine: f.machine ?? null, pool: f.pool ?? null, t: now }) })
+        .catch((e) => console.log(`alert webhook: ${e.message}`));
+    }
+  }
+
+  // Strikes against a server, at most one of each kind per 10 minutes: copies of 2 or more apps failing there for 5
+  // minutes while healthy elsewhere; half or more of its copies failing for 10 minutes (counting apps healthy
+  // elsewhere, or every failing app when 2 or more fail); under 10% of its disk free for 5 minutes; 5 or more restarts
+  // in an hour of apps healthy elsewhere. Two strikes within 30 minutes: quarantined for an hour (not a destination),
+  // and a pool member asks to leave through the departure gate (one per pool per 30 minutes, none while its pool is
+  // short or can't start servers); a server outside a pool raises an alert. 3 or more sick servers at once is likely
+  // an app: nothing is done automatically, and an alert says so.
+  checkSick(now) {
+    if (now - this.lastSickCheck < 30_000 || this.quiet(now)) return;
+    this.lastSickCheck = now;
+    const up = this.liveMachines(now);
+    const candidates = [];
+    for (const r of up.values()) {
+      if (!r.ready || now - r.started < SETTLED_MS) continue;
+      for (const [kind, why] of this.sickSigns(r, up, now)) this.strike(r, kind, why, now);
+      const recent = (this.strikes.get(r.id) ?? []).filter((x) => now - x.t < STRIKE_WINDOW_MS);
+      if (recent.length) this.strikes.set(r.id, recent);
+      else this.strikes.delete(r.id);
+      if (recent.length >= 2 && !((r.quarantine ?? 0) > now)) candidates.push({ r, why: [...new Set(recent.map((x) => x.why))].join("; ") });
+    }
+    const sick = [...up.values()].filter((r) => (r.quarantine ?? 0) > now && this.sickWhy.has(r.id));
+    if (sick.length + candidates.length >= 3) {
+      if (candidates.length) {
+        const list = [...sick, ...candidates.map((c) => c.r)].map((r) => r.machine).sort((a, b) => a - b);
+        this.alert("many-sick", {}, `servers ${list.join(", ")} look sick at once: probably an app, not the servers, so nothing is done automatically`, now);
+      }
       return;
     }
-    tryMove(pick.name, from, dest, pick.replica, why, dest.reason);
+    for (const { r, why } of candidates) this.quarantine(r, why, now, { sick: true });
+    for (const r of [...sick, ...candidates.map((c) => c.r)]) this.sickDrain(r, now);
+  }
+
+  sickSigns(r, up, now) {
+    const out = [];
+    const here = [];
+    for (const [name, list] of this.copies) for (const x of list) if (x.machine === r.machine && !x.leaving) here.push({ name, x });
+    const bad = here.filter(({ x }) => failing(r.status?.[x.key])).map((o) => {
+      const elsewhere = this.anyReady(o.name, up, o.x.replica);
+      return { ...o, elsewhere, plain: now - this.failClock(o.name, o.x, r, now, { outageAware: false }), aware: elsewhere ? now - this.failClock(o.name, o.x, r, now) : 0 };
+    });
+    const apps = new Set(bad.filter((o) => o.aware >= 5 * MIN).map((o) => o.name));
+    if (apps.size >= 2) out.push(["apps", `${[...apps].join(" and ")} failing on it while healthy elsewhere`]);
+    const long = bad.filter((o) => o.plain >= FAIL_MS);
+    const counted = new Set(long.map((o) => o.name)).size >= 2 ? long : long.filter((o) => o.aware >= FAIL_MS);
+    if (counted.length && 2 * counted.length >= here.length) out.push(["half", `${counted.length} of its ${here.length} copies failing for 10 minutes`]);
+    const d = r.disk;
+    if (d?.total && d.free / d.total < 0.1) {
+      const since = this.lowDiskSince.get(r.id) ?? this.lowDiskSince.set(r.id, now).get(r.id);
+      if (now - since >= 5 * MIN) out.push(["disk", `${Math.round((100 * d.free) / d.total)}% of its disk free`]);
+    } else this.lowDiskSince.delete(r.id);
+    const okElsewhere = (key) => {
+      const o = here.find((y) => y.x.key === key);
+      return o && this.anyReady(o.name, up, o.x.replica);
+    };
+    const n = (this.restarts.get(r.id)?.log ?? []).filter((e) => now - e.t < 3600_000 && okElsewhere(e.key)).reduce((a, e) => a + e.k, 0);
+    if (n >= 5) out.push(["restarts", `${n} restarts in the last hour of apps healthy elsewhere`]);
+    return out;
+  }
+
+  strike(r, kind, why, now) {
+    const list = this.strikes.get(r.id) ?? this.strikes.set(r.id, []).get(r.id);
+    if (list.some((x) => x.kind === kind && now - x.t < 10 * MIN)) return;
+    list.push({ t: now, kind, why });
+    this.logEvent("strike", { machine: r.machine, run: r.id, cause: kind, detail: why, t: now });
+  }
+
+  // Not a destination for QUARANTINE_MS. `sick`: it also asks to leave (see sickDrain).
+  quarantine(r, why, now, { sick }) {
+    r.quarantine = now + QUARANTINE_MS;
+    this.saveRun(r);
+    if (sick) this.sickWhy.set(r.id, why);
+    this.logEvent("quarantine", { machine: r.machine, run: r.id, cause: sick ? "sick" : "hot", detail: `not a destination for an hour: ${why}`, t: now });
+  }
+
+  sickDrain(r, now) {
+    if (!((r.quarantine ?? 0) > now) || !this.sickWhy.has(r.id) || r.drain || r.handover || r.evict || r.retire) return;
+    const why = this.sickWhy.get(r.id);
+    if (!r.pool) {
+      this.alert("sick-server", { machine: r.machine }, `server ${r.machine} looks sick (${why}); it isn't in a pool, so it needs a look`, now);
+      return;
+    }
+    if (now - (this.sickDrains[r.pool] ?? 0) < SICK_DRAIN_GAP_MS || this.poolShort(r.pool, now) || this.capped(r.pool, now)) return;
+    r.drain = now;
+    this.saveRun(r);
+    this.sickDrains[r.pool] = now;
+    this.setSetting("sick_drains", JSON.stringify(this.sickDrains));
+    this.logEvent("drain", { machine: r.machine, run: r.id, cause: "sick", detail: `server ${r.machine} looks sick (${why}): it asks to leave, for a fresh one`, t: now });
+  }
+
+  // A pool with fewer live servers than its size.
+  poolShort(pool, now) {
+    const size = this.pools()[pool];
+    return Boolean(size) && new Set(this.liveRuns(now).filter((r) => r.pool === pool).map((r) => r.machine)).size < size;
+  }
+
+  // ---- cold replicas, churn, departures (for the pages) ----
+
+  // Replica k is lit while a live run of its server reports its copy healthy and ready, with the run's tunnel connected
+  // (edges, when the agent reports them); dark otherwise, from the last moment it was lit. A dark spell is noted when
+  // it's seen (never while settling) and closed by "lit" (other: its length in seconds); both name the run that last
+  // served it, whose departure or loss is the cause, so a departure that left a replica dark counts as cold. Dark for
+  // 5 minutes: an alert.
+  checkDark(now) {
+    if (now - this.lastDarkCheck < 10_000) return;
+    this.lastDarkCheck = now;
+    const byMachine = new Map();
+    for (const r of this.liveRuns(now)) (byMachine.get(r.machine) ?? byMachine.set(r.machine, []).get(r.machine)).push(r);
+    const settling = this.settling(now);
+    const wanted = new Set();
+    for (const p of this.projects.values()) {
+      const spec = p.enabled ? this.version(p.name, p.version) : null;
+      if (!spec) continue;
+      for (let k = 1; k <= spec.replicas; k++) {
+        const key = `${p.name}|${k}`;
+        wanted.add(key);
+        let serving = null;
+        for (const x of this.copiesOf(p.name)) {
+          if (x.replica !== k) continue;
+          const r = (byMachine.get(x.machine) ?? []).find((y) => {
+            const st = y.status?.[x.key];
+            return isMap(st) && st.s === "healthy" && st.r !== false && y.edges !== 0;
+          });
+          if (r) {
+            serving = { run: r.id, machine: x.machine };
+            break;
+          }
+        }
+        const d = this.dark.get(key);
+        if (serving) {
+          if (d) {
+            this.dark.delete(key);
+            this.logEvent("lit", { app: p.name, replica: k, machine: serving.machine, run: d.run, cause: d.cause, other: Math.round((now - d.since) / 1000),
+              detail: `dark for ${fmtDur(now - d.since)}, after ${d.why}`, t: now });
+          }
+          this.litAt.set(key, { t: now, ...serving });
+        } else if (!d) {
+          const last = this.litAt.get(key);
+          if (!last || settling) continue; // never served yet (a new replica), or not known yet
+          const r = this.runs.get(last.run);
+          const s = `server ${last.machine}`;
+          const [cause, why] = !r ? ["gone", `${s} went away`] : r.left ? ["stopped", `${s} was stopped`]
+            : r.evict ? ["evict", `${s} moved its copies out`] : r.handover ? ["handover", `${s} handed over`]
+            : r.retire ? ["retired", `${s} retired`] : !this.live(r, now) ? ["silent", `${s} went silent`]
+            : ["copy", `its copy on ${s} stopped serving`];
+          this.dark.set(key, { since: last.t, run: last.run, machine: last.machine, cause, why });
+          this.logEvent("dark", { app: p.name, replica: k, machine: last.machine, run: last.run, cause, detail: why, t: now });
+        } else if (!d.alerted && !settling && now - d.since >= 5 * MIN) {
+          d.alerted = true;
+          this.alert("dark", { app: p.name }, `${p.name} replica ${k} has had no healthy copy for ${fmtDur(now - d.since)} (${d.why})`, now);
+        }
+      }
+    }
+    for (const key of [...this.dark.keys()]) if (!wanted.has(key)) this.dark.delete(key); // removed or disabled: not dark
+    for (const key of [...this.litAt.keys()]) if (!wanted.has(key)) this.litAt.delete(key);
+  }
+
+  // Copy starts by cause over the last hour and day (placements, moves by cause, successors' rebuilds, new versions),
+  // DNS re-points apart; starts per app; each stateful app's starts in the last 2, 10 and 60 minutes against its budget.
+  churn(now) {
+    if (this.churnCache && now - this.churnCache.at < 30_000) return this.churnCache.v;
+    const rows = this.all("SELECT t, kind, cause, app FROM events WHERE t > ? AND kind IN ('place', 'move-start', 'copy-start', 'dns')", now - 24 * 3600_000);
+    const blank = () => ({ starts: 0, placed: 0, moved: 0, successor: 0, version: 0, dns: 0, moves: {} });
+    const h1 = blank();
+    const h24 = blank();
+    const apps = new Map();
+    for (const e of rows) {
+      for (const b of now - e.t < 3600_000 ? [h1, h24] : [h24]) {
+        if (e.kind === "dns") {
+          b.dns++;
+          continue;
+        }
+        b.starts++;
+        if (e.kind === "place") b.placed++;
+        else if (e.kind === "move-start") {
+          b.moved++;
+          b.moves[e.cause ?? "hand"] = (b.moves[e.cause ?? "hand"] ?? 0) + 1;
+        } else b[e.cause === "successor" ? "successor" : "version"]++;
+      }
+      if (e.kind !== "dns" && e.app) {
+        const a = apps.get(e.app) ?? apps.set(e.app, { app: e.app, h1: 0, h24: 0 }).get(e.app);
+        a.h24++;
+        if (now - e.t < 3600_000) a.h1++;
+      }
+    }
+    const stateful = [];
+    for (const p of this.projects.values()) {
+      if (!this.version(p.name, p.version)?.policy.stateful) continue;
+      const mine = rows.filter((e) => e.app === p.name && e.kind !== "dns");
+      const n = (m) => mine.filter((e) => now - e.t < m * MIN).length;
+      stateful.push({ app: p.name, budget: this.budget(p.name), m2: n(2), m10: n(10), m60: n(60) });
+    }
+    const v = { h1, h24, apps: [...apps.values()].sort((a, b) => b.h24 - a.h24), stateful };
+    this.churnCache = { at: now, v };
+    return v;
+  }
+
+  // Departures: under way, coming up (when each run is due, and why a due one waits), and over the last day per pool:
+  // planned (ours) and stopped (by the platform), each cold when a replica went dark with it; lost (gone silent); the
+  // median handover times (start: grant to successor start; build: to successor ready; overlap: to the old run's exit).
+  departures(now) {
+    const list = this.liveRuns(now).filter((r) => !r.retire && !this.predecessorOf(r, now) && (this.dueAt(r) || r.drain || r.handover || r.evict || this.rolled(r)))
+      .map((r) => {
+        const g = this.departureGate(r, now);
+        const due = this.due(r, now);
+        return { machine: r.machine, pool: r.pool ?? null, run: r.id, dueAt: this.dueAt(r), deadline: r.deadline ?? null, due, why: due ? this.dueWhy(r, now) : null,
+          leaving: r.handover ? "handover" : r.evict ? "evict" : null, since: r.handover || r.evict || null,
+          how: g?.how ?? null, wait: g?.wait ?? null, waitingSince: g?.wait ? this.dueWait.get(r.id)?.since ?? null : null };
+      })
+      .sort((a, b) => Boolean(b.leaving) - Boolean(a.leaving) || b.due - a.due || (a.dueAt ?? Infinity) - (b.dueAt ?? Infinity));
+    const ev = this.all("SELECT kind, run, pool FROM events WHERE t > ? AND kind IN ('depart', 'server-lost', 'left', 'dark')", now - 24 * 3600_000);
+    const darkRuns = new Set(ev.filter((e) => e.kind === "dark").map((e) => e.run));
+    const pools = new Map();
+    const pool = (name) => pools.get(name ?? null) ?? pools.set(name ?? null, { pool: name ?? null, planned: 0, plannedCold: 0, stopped: 0, stoppedCold: 0, lost: 0, handover: null }).get(name ?? null);
+    for (const e of ev) {
+      if (e.kind === "depart") {
+        pool(e.pool).planned++;
+        if (darkRuns.has(e.run)) pool(e.pool).plannedCold++;
+      } else if (e.kind === "left") {
+        pool(e.pool).stopped++;
+        if (darkRuns.has(e.run)) pool(e.pool).stoppedCold++;
+      } else if (e.kind === "server-lost") pool(e.pool).lost++;
+    }
+    const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+    for (const x of pools.values()) {
+      const hs = this.handoverTimes.filter((h) => (h.pool ?? null) === x.pool);
+      if (hs.length) x.handover = { n: hs.length, queue: median(hs.map((h) => h.queue)), build: median(hs.map((h) => h.build)), overlap: median(hs.map((h) => h.overlap)) };
+    }
+    return {
+      list,
+      pools: [...pools.values()].sort((a, b) => String(a.pool).localeCompare(String(b.pool))),
+      capped: [...this.cappedUntil].filter(([, t]) => t > now).map(([p, until]) => ({ pool: p, until })),
+    };
   }
 
   // ---- machines ----
@@ -1549,8 +2685,11 @@ export class Control {
     // Every machine silent for longer than the liveness window: this was unreachable, so give the fleet time to show
     // up again before anything counts as gone or gets placed (see SETTLE_MS).
     if (now - this.lastCheckin > this.liveMs) {
+      this.quietSince = this.lastCheckin;
       this.settleAt = now;
-      console.log(`no check-in for ${Math.round((now - this.lastCheckin) / 1000)}s: the control plane was unreachable; nothing counts as gone for ${SETTLE_MS / 60_000} min`);
+      const text = `no check-in for ${Math.round((now - this.lastCheckin) / 1000)}s: the control plane was unreachable; nothing counts as gone until the fleet is back`;
+      console.log(text);
+      this.logEvent("gap", { cause: "unreachable", detail: text });
     }
     this.lastCheckin = now;
     const machine = Number(body?.machine);
@@ -1565,22 +2704,34 @@ export class Control {
     const pool = typeof body.pool === "string" && /^[a-z0-9-]{1,30}$/.test(body.pool) ? body.pool : null;
     const label = String(body.label ?? "").slice(0, 80) || null;
     const starts = body.starts !== false; // agents from before this field could all start machines
+    // When whatever runs the machine will stop it (LIFETIME_MIN), if it knows: between 1 minute and a day after its start.
+    const deadline = Number(body.deadline) > started + MIN && Number(body.deadline) < started + 86400_000 ? Number(body.deadline) : null;
     this.askPoolSize(pool, body.poolSize);
     let r = this.runs.get(run);
     if (!r) {
       const agent = String(body.agent ?? run).slice(0, 100);
-      r = { id: run, machine, started, status, ready, handover: 0, retire: 0, seen: now, agent, label, pool, drain: 0, starts };
+      // An heir took over its slot from a run still serving it (a handover), or is the same agent back (a standalone host
+      // restarting its agent): it keeps the slot's stateful copies. Any other new run of a pool slot starts empty.
+      const prev = [...this.runs.values()].filter((x) => x.machine === machine && x.id !== run).sort((a, b) => b.seen - a.seen)[0];
+      const heir = this.liveRuns(now).some((x) => x.machine === machine && x.started < started && !x.retire) || (prev && prev.agent === agent) || !pool ? 1 : 0;
+      r = { id: run, machine, started, status, ready, handover: 0, retire: 0, seen: now, agent, label, pool, drain: 0, starts, deadline, heir };
       this.saveRun(r);
     } else {
       const changed = ready !== r.ready || JSON.stringify(status) !== JSON.stringify(r.status) ||
-        pool !== (r.pool ?? null) || label !== (r.label ?? null);
-      Object.assign(r, { status, ready, seen: now, pool, label });
+        pool !== (r.pool ?? null) || label !== (r.label ?? null) || deadline !== (r.deadline ?? null);
+      Object.assign(r, { status, ready, seen: now, pool, label, deadline });
+      if (ready && !r.readyAt) r.readyAt = now; // (kept in memory: a handover's build time)
       r.starts = starts; // sent with every check-in, so it's kept in memory only
-      // Write when something changed, and "last seen" at most every 5 minutes (it only matters across restarts of this
-      // object, and the free plan allows 100,000 row writes a day).
-      if (changed || now - r.savedSeen > 5 * 60_000) this.saveRun(r);
+      // "Last seen" is written on every check-in: after a restart, settling() needs to know who was live.
+      if (changed) this.saveRun(r);
+      else this.sql.exec("UPDATE runs SET seen = ? WHERE id = ?", now, r.id);
     }
+    const cpus = Number(body.cpus);
+    if (Number.isInteger(cpus) && cpus > 0 && cpus <= 1024) r.cpus = cpus;
     this.takeMetrics(r, body.metrics, now);
+    this.noteCopies(r, status, now);
+    if (isMap(body.disk) && Number(body.disk.total) > 0) r.disk = { free: Number(body.disk.free) || 0, total: Number(body.disk.total) };
+    if (Number.isInteger(body.edges)) r.edges = body.edges;
     // What the pages show about the machine itself: its latency (the agent's last round trip here) and where it is.
     const rtt = Number(body.rtt);
     if (Number.isFinite(rtt) && rtt >= 0) r.rtt = Math.min(60_000, Math.round(rtt));
@@ -1590,27 +2741,89 @@ export class Control {
     }
     if (body.leaving && !r.retire) {
       r.retire = 1; // going away for good: its replicas can be placed elsewhere right now
+      r.left = now;
       this.saveRun(r);
+      this.logEvent("left", { machine: r.machine, run: r.id, cause: "leaving", detail: "the server said it's going away" });
     }
+    this.checkMassLoss(now);
     this.place(now);
     this.settle(now);
+    this.noteReady(now);
+    this.checkSick(now);
     this.rebalance(now);
-    if (!r.retire && !this.settling(now) && (this.surplusInPool(r, now) || this.superseded(r, now))) {
-      r.retire = 1;
-      this.saveRun(r);
+    this.checkDark(now);
+    if (!r.retire && !this.settling(now)) {
+      if (this.superseded(r, now)) {
+        r.retire = 1;
+        this.saveRun(r);
+        const succ = this.successorOf(r, now);
+        let timing = "";
+        if (r.handover && succ) { // queue: grant to successor start; build: to successor ready; overlap: until now
+          const x = { t: now, pool: r.pool ?? null, machine: r.machine, queue: Math.max(0, succ.started - r.handover),
+            build: Math.max(0, (succ.readyAt ?? now) - succ.started), overlap: Math.max(0, now - (succ.readyAt ?? now)) };
+          this.handoverTimes.push(x);
+          const fmt = (ms) => (ms < 90_000 ? `${Math.round(ms / 1000)} s` : `${Math.round(ms / MIN)} min`);
+          timing = ` (start ${fmt(x.queue)}, build ${fmt(x.build)}, overlap ${fmt(x.overlap)})`;
+        }
+        this.logEvent("retire", { machine: r.machine, run: r.id, cause: "superseded", detail: `its successor serves everything it did${timing}` });
+      } else if (r.evict) this.progressEvict(r, now);
+      else this.retireStuckSuccessor(r, now);
     }
+    this.trimPools(now);
     const handover = !r.retire && this.wantsHandover(r, now);
     const start = !r.retire && r.ready && r.pool && r.starts ? this.claimStarts(r.pool, run, now) : []; // pool members start their peers
     this.followCopies(now);
     this.cleanup(now);
+    const older = r.retire ? null : this.predecessorOf(r, now);
+    const desired = r.retire ? {} : this.desiredFor(r.machine, older ? r : null);
     return {
       domain: this.env.DOMAIN,
       poll: this.pollS,
-      desired: r.retire ? {} : this.desiredFor(r.machine),
+      desired,
       retire: Boolean(r.retire),
       handover,
       start,
+      // A successor (an older run of this machine still serves): it opens its tunnel once it serves what that run does.
+      ...(older ? { successor: true, serve: Object.keys(desired).filter((k) => older.status?.[k]?.s === "healthy" && older.status[k].r !== false) } : {}),
     };
+  }
+
+  // Many servers going silent together is the control plane's view of the network failing, not that many deaths: treat
+  // it like a gap (settling) so nothing is re-placed or started for them. Only unannounced silences count (a run that
+  // said it's leaving, or reached its deadline, is a departure); at most twice an hour.
+  checkMassLoss(now) {
+    if (now - this.lastLossCheck < 5_000 || this.settling(now)) return;
+    this.lastLossCheck = now;
+    const live = new Set(this.liveRuns(now).map((r) => r.machine));
+    const lost = new Set();
+    for (const r of this.runs.values()) {
+      if (r.retire || live.has(r.machine) || (r.deadline && now > r.deadline - 2 * 60_000)) continue;
+      const silent = now - r.seen;
+      if (silent >= this.liveMs && silent < 2 * this.liveMs) lost.add(r.machine);
+    }
+    // Each unannounced loss, once (voluntary departures pause after 3 in 10 minutes).
+    for (const r of this.runs.values()) {
+      if (r.retire || r.left || this.lossNoted.has(r.id) || live.has(r.machine) || now - r.seen < this.liveMs || r.seen < this.settleAt - this.liveMs) continue;
+      if (r.deadline && now > r.deadline - 2 * 60_000) continue;
+      this.lossNoted.add(r.id);
+      this.lossLog = this.lossLog.filter((t) => now - t < 10 * MIN);
+      this.lossLog.push(now);
+      this.logEvent("server-lost", { machine: r.machine, run: r.id, cause: r.pool ?? "standalone", detail: `server ${r.machine} stopped checking in without saying it was leaving`, t: now });
+    }
+    if (lost.size < Math.max(MASS_LOSS_MIN, Math.ceil(0.1 * this.expectedMachines()))) return;
+    this.massArms = this.massArms.filter((t) => now - t < 3600_000);
+    if (this.massArms.length >= 2) {
+      if (now - (this.massExhaustedAt ?? 0) > 3600_000) {
+        this.massExhaustedAt = now;
+        this.logEvent("alert", { cause: "grace-exhausted", detail: `${lost.size} servers went silent together, the third time this hour: treated as lost` });
+      }
+      return;
+    }
+    this.massArms.push(now);
+    this.setSetting("mass_arms", JSON.stringify(this.massArms));
+    this.quietSince = now - this.liveMs;
+    this.settleAt = now;
+    this.logEvent("mass-loss", { cause: "silent", detail: `${lost.size} servers went silent together (${[...lost].sort((a, b) => a - b).join(", ")}): waiting for them before re-placing anything` });
   }
 
   // Where a machine is, from the address it checks in from, as "City, Region, CC · Network" (null until a free geo-IP
@@ -1639,13 +2852,105 @@ export class Control {
     return null;
   }
 
-  // A run can go once a newer run of the same machine is online and healthy on everything it should run.
-  superseded(r, now) {
-    return this.liveRuns(now).some((x) => x.machine === r.machine && x.started > r.started && x.ready &&
-      Object.entries(this.desiredFor(x.machine)).every(([name, d]) => x.status[name]?.v === d.v && x.status[name]?.s === "healthy"));
+  // ---- departures ----
+  // The control plane decides when a run leaves: when something asked (drain, roll), at its dueAt (it knows its
+  // deadline), early to spread a crowded pool (flatten), or urgently (its deadline is near). Leaving is a same-slot
+  // handover by default: the run starts its successor, which inherits its copies (no moves, no DNS changes), and exits
+  // once the successor serves everything it did. In a pool that can't start a successor (capped: every job it may run is
+  // taken), when the deadline is near, or to shrink a pool, it leaves by moving its copies out first (evict), then exits.
+  // Gates: one departure in flight per pool (standalone hosts share one), 3 fleet-wide, at most 4 started in 10
+  // minutes (2 of them evictions), earliest deadline first, none while settling, within 10 minutes of a (re)start, or
+  // after 3 unannounced losses in 10 minutes; a run carrying a copy of an app already changing as much as it may waits.
+  // An urgent departure skips them all: the deadline takes the machine anyway.
+
+  rolled(r) {
+    return r.started < Number(this.settings.get("roll") ?? 0) || r.started < Number(this.settings.get(`roll_${r.machine}`) ?? 0);
   }
 
-  // "This server is going down soon": from whatever runs it. Its handover is scheduled like a requested roll.
+  due(r, now) {
+    const d = this.dueAt(r);
+    return Boolean(r.drain) || this.rolled(r) || Boolean(d && now >= d) || this.pulled.has(r.id);
+  }
+
+  urgent(r, now) {
+    return Boolean(r.deadline) && r.deadline - now < URGENT_MS;
+  }
+
+  // Why a run is leaving now (for the events).
+  dueWhy(r, now) {
+    return this.urgent(r, now) ? "urgent" : r.drain ? (this.sickWhy.has(r.id) ? "sick" : "drain") : this.rolled(r) ? "roll" : this.pulled.has(r.id) ? "spread" : "due";
+  }
+
+  predecessorOf(r, now) {
+    return this.liveRuns(now).filter((y) => y.machine === r.machine && y.started < r.started && !y.retire).sort((a, b) => a.started - b.started)[0] ?? null;
+  }
+
+  successorOf(r, now) {
+    return this.liveRuns(now).filter((y) => y.machine === r.machine && y.started > r.started).sort((a, b) => b.started - a.started)[0] ?? null;
+  }
+
+  capped(pool, now) {
+    return Boolean(pool) && (this.cappedUntil.get(pool) ?? 0) > now;
+  }
+
+  markCapped(pool, now, why) {
+    if (!pool) return;
+    if (!this.capped(pool, now)) {
+      this.logEvent("capped", { cause: pool, pool, detail: `pool ${pool} can't start servers now (${why}): its departures move copies out first for ${CAPPED_MS / MIN} min` });
+      this.alert("capped", { pool }, `pool ${pool} can't start servers now (${why}): its account may be at its job limit`, now);
+    }
+    this.cappedUntil.set(pool, now + CAPPED_MS);
+  }
+
+  // Runs leaving by our doing right now: handing over (until the successor takes over, or the handover is stuck) or evicting.
+  departing(now) {
+    return this.liveRuns(now).filter((r) => (r.handover && now - r.handover < HANDOVER_STUCK_MS && !r.evict) || r.evict);
+  }
+
+  noteDeparture(r, kind, why, now) {
+    this.departLog = this.departLog.filter((d) => now - d.t < 10 * MIN);
+    this.departLog.push({ t: now, kind, run: r.id });
+    this.logEvent("depart", { machine: r.machine, run: r.id, cause: `${kind}:${why}`,
+      detail: `server ${r.machine} is leaving (${why}) by ${kind === "handover" ? "handing over to a successor on its slot" : "moving its copies out first"}`, t: now });
+  }
+
+  // Whether run r may start leaving now: "handover", "evict" or null (not due, or a gate says wait).
+  departure(r, now) {
+    const g = this.departureGate(r, now);
+    return g && !g.wait ? g.how : null;
+  }
+
+  // How a due run would leave ("handover" or "evict") and, while it can't yet, why it waits: { how, wait }; null when
+  // it isn't due (or is leaving already).
+  departureGate(r, now) {
+    if (r.retire || r.evict || r.handover || this.successorOf(r, now) || !this.due(r, now)) return null;
+    const urgent = this.urgent(r, now);
+    const how = urgent || this.capped(r.pool, now) ? "evict" : "handover";
+    const out = (wait) => ({ how, wait });
+    if (urgent) return out(null);
+    if (this.quiet(now)) return out("the control plane is in its quiet period after a restart or gap");
+    if (this.lossLog.filter((t) => now - t < 10 * MIN).length >= 3) return out("3 or more servers were lost in the last 10 minutes");
+    const recent = this.departLog.filter((d) => now - d.t < 10 * MIN);
+    if (recent.length >= 4) return out("4 departures started in the last 10 minutes");
+    if (how === "evict" && recent.filter((d) => d.kind === "evict").length >= 2) return out("2 evictions started in the last 10 minutes");
+    const inFlight = this.departing(now);
+    if (inFlight.length >= 3) return out("3 servers are leaving already");
+    const poolBusy = (x) => inFlight.some((y) => (y.pool ?? null) === (x.pool ?? null));
+    const busyApp = (x) => [...this.copies].find(([name, list]) => list.some((c) => c.machine === x.machine && !c.leaving) && !this.mayTransition(name, now))?.[0];
+    const carriesBusyApp = (x) => Boolean(busyApp(x));
+    // Earliest deadline first: only the first due run that its gates let through may go.
+    const queue = this.liveRuns(now).filter((x) => !x.retire && !x.evict && !x.handover && !this.successorOf(x, now) && this.due(x, now))
+      .sort((a, b) => (this.sickWhy.has(a.id) ? 0 : 1) - (this.sickWhy.has(b.id) ? 0 : 1) ||
+        (a.deadline ?? a.started + 6 * 3600_000) - (b.deadline ?? b.started + 6 * 3600_000));
+    const first = queue.find((x) => !poolBusy(x) && !carriesBusyApp(x));
+    if (first?.id === r.id) return out(null);
+    if (poolBusy(r)) return out(`another server of ${r.pool ? `pool ${r.pool}` : "its own"} is leaving`);
+    if (carriesBusyApp(r)) return out(`${busyApp(r)} is already changing as much as it may`);
+    return out(first ? `server ${first.machine} goes first` : "waiting its turn");
+  }
+
+  // "This server is going down soon": from whatever runs it (a timer, a cron before maintenance, a cloud termination
+  // notice). Its departure is then scheduled like any due one.
   drain(body) {
     const now = Date.now();
     const runId = body?.run != null ? String(body.run) : null;
@@ -1663,22 +2968,147 @@ export class Control {
     return { draining: runs.map((x) => ({ run: x.id, machine: x.machine })) };
   }
 
-  // Ask a run to start its own replacement when it's been told it's going down (or a roll was requested). One
-  // machine at a time, oldest first, so at most one machine is ever changing over.
+  // Asked on each check-in of run r: whether it should start its successor now.
   wantsHandover(r, now) {
-    const rollAll = Number(this.settings.get("roll") ?? 0);
-    const due = (x) => Boolean(x.drain) || x.started < rollAll || x.started < Number(this.settings.get(`roll_${x.machine}`) ?? 0);
-    if (!due(r)) return false;
-    const live = this.liveRuns(now);
-    const hasSuccessor = (x) => live.some((y) => y.machine === x.machine && y.started > x.started);
-    if (hasSuccessor(r)) return false; // its replacement is already starting up
-    if (r.handover) return true; // keep asking until a replacement shows up
-    if (live.some((x) => x.handover && now - x.handover < HANDOVER_STUCK_MS)) return false;
-    const next = live.filter((x) => due(x) && !hasSuccessor(x)).sort((a, b) => a.started - b.started)[0];
-    if (next?.id !== r.id) return false;
+    if (r.retire || r.evict) return false;
+    if (r.handover) {
+      if (this.successorOf(r, now)) return false; // its successor is starting
+      if (now - r.handover > SUCCESSOR_WAIT_MS) { // none came: its pool can't start one now
+        this.markCapped(r.pool, now, `server ${r.machine}'s successor didn't start within ${SUCCESSOR_WAIT_MS / MIN} minutes`);
+        this.startEvict(r, now, "no successor came");
+        return false;
+      }
+      return true; // keep asking until a replacement shows up
+    }
+    if (this.settling(now)) return false;
+    const g = this.departureGate(r, now);
+    if (!g || g.wait) {
+      if (!g) this.dueWait.delete(r.id);
+      else {
+        const w = this.dueWait.get(r.id) ?? this.dueWait.set(r.id, { since: now }).get(r.id);
+        w.why = g.wait;
+        if (now - w.since >= 20 * MIN) this.alert("departure-waiting", { machine: r.machine }, `server ${r.machine} has been due to leave for ${Math.round((now - w.since) / MIN)} minutes: ${g.wait}`, now);
+      }
+      return false;
+    }
+    this.dueWait.delete(r.id);
+    const how = g.how;
+    const why = this.dueWhy(r, now);
+    if (how === "evict") {
+      this.startEvict(r, now, why);
+      return false;
+    }
     r.handover = now; // its replacement joins for this slot while this run is still up (join() allows that)
     this.saveRun(r);
+    this.noteDeparture(r, "handover", why, now);
     return true;
+  }
+
+  startEvict(r, now, why) {
+    r.evict = now;
+    this.saveRun(r);
+    this.noteDeparture(r, "evict", why, now);
+    this.progressEvict(r, now);
+  }
+
+  // An evicting run moves its copies out (through each app's budget, unless its deadline is near) and exits once none
+  // is left on its machine.
+  progressEvict(r, now) {
+    const urgent = this.urgent(r, now);
+    let here = 0;
+    for (const [name, list] of [...this.copies]) {
+      for (const x of list.filter((y) => y.machine === r.machine)) {
+        here++;
+        if (x.leaving || (!urgent && !this.mayTransition(name, now, r.id))) continue;
+        try {
+          this.move(name, r.machine, null, x.replica, { cause: "evict", why: `server ${r.machine} is leaving` });
+        } catch (e) {
+          if (!this.evictStuck?.has(`${r.id}|${name}|${x.replica}`)) {
+            (this.evictStuck ??= new Set()).add(`${r.id}|${name}|${x.replica}`);
+            this.logEvent("rebalance", { app: name, replica: x.replica, machine: r.machine, cause: "evict", detail: `couldn't move ${name} replica ${x.replica} off leaving server ${r.machine}: ${e.message}`, t: now });
+          }
+        }
+      }
+    }
+    if (!here) {
+      r.retire = 1;
+      this.saveRun(r);
+      this.logEvent("retire", { machine: r.machine, run: r.id, cause: "evicted", detail: "its copies moved out", t: now });
+    }
+  }
+
+  // A run can go once a newer run of the same machine is ready and serves everything it does: every copy healthy here
+  // is healthy there (a copy failing on both holds nothing up).
+  superseded(r, now) {
+    const succ = this.successorOf(r, now);
+    if (!succ?.ready) return false;
+    return Object.entries(r.status ?? {}).every(([key, st]) => !(st?.s === "healthy" && st.r !== false) ||
+      (succ.status?.[key]?.s === "healthy" && succ.status[key].r !== false));
+  }
+
+  // A successor that, 25 minutes in, still can't run a copy its predecessor runs fine (and that's healthy elsewhere) is
+  // retired, so the predecessor leaves another way (it asks again, and then moves its copies out).
+  retireStuckSuccessor(r, now) {
+    const older = this.predecessorOf(r, now);
+    if (!older || now - r.started < 25 * MIN) return;
+    const up = this.liveMachines(now);
+    const stuck = Object.entries(older.status ?? {}).find(([key, st]) => st?.s === "healthy" && st.r !== false &&
+      !(r.status?.[key]?.s === "healthy" && r.status[key].r !== false));
+    if (!stuck) return;
+    r.retire = 1;
+    this.saveRun(r);
+    this.logEvent("retire", { machine: r.machine, run: r.id, cause: "stuck-successor", detail: `after 25 minutes it still couldn't run ${stuck[0]}, which its predecessor runs`, t: now });
+    if (!older.evict) this.startEvict(older, now, "its successor couldn't take over");
+  }
+
+  // Pools over their size lose one run at a time, by moving its copies out first: the run with the fewest copies, the
+  // youngest of those. Pools also get their crowded departures spread out (flatten).
+  trimPools(now) {
+    if (now - (this.lastTrim ?? 0) < 10_000) return;
+    this.lastTrim = now;
+    if (this.quiet(now)) return;
+    const live = this.liveRuns(now);
+    for (const [pool, size] of Object.entries(this.pools())) {
+      const members = live.filter((r) => r.pool === pool && !this.successorOf(r, now));
+      if (members.length > size && !members.some((r) => r.evict) && !this.departing(now).some((r) => r.pool === pool)) {
+        const recent = this.departLog.filter((d) => now - d.t < 10 * MIN);
+        if (recent.length < 4 && recent.filter((d) => d.kind === "evict").length < 2) {
+          const count = (r) => [...this.copies.values()].reduce((n, list) => n + list.filter((x) => x.machine === r.machine).length, 0);
+          const victim = members.sort((a, b) => count(a) - count(b) || b.started - a.started)[0];
+          this.startEvict(victim, now, "surplus");
+        }
+      }
+      this.flatten(pool, members, now);
+    }
+  }
+
+  // A pool whose runs will come due in a crowd (2 or more within the next hour) while its gate is idle starts the oldest
+  // run past 3 hours now, so departures spread out instead of queueing against their deadlines.
+  flatten(pool, members, now) {
+    if (this.capped(pool, now) || this.departing(now).some((r) => r.pool === pool)) return;
+    if (members.some((r) => this.due(r, now))) return; // something is already due: the gate is about to be busy
+    const soon = members.filter((r) => { const d = this.dueAt(r); return d && d - now < 60 * MIN; });
+    if (soon.length < 2) return;
+    const oldest = members.filter((r) => this.dueAt(r) && now - r.started >= 180 * MIN && !this.pulled.has(r.id)).sort((a, b) => a.started - b.started)[0];
+    if (oldest) this.pulled.add(oldest.id);
+  }
+
+  // A pool machine that went silent keeps its copies for its slot for up to START_WAIT_MS, so the next machine its pool
+  // starts takes the slot and inherits them (no moves, no DNS changes): the pool, while that holds, else null. Not for a
+  // run that said it's leaving (it may not be replaced) or that moved its copies out.
+  heldBy(n, now) {
+    if (this.liveRuns(now).some((r) => r.machine === n)) return null;
+    const last = [...this.runs.values()].filter((r) => r.machine === n).sort((a, b) => b.seen - a.seen)[0];
+    if (!last?.pool || last.left || last.evict) return null;
+    if (![...this.copies.values()].some((list) => list.some((x) => x.machine === n && !x.leaving))) return null;
+    return now - (last.seen + this.liveMs) < START_WAIT_MS ? last.pool : null;
+  }
+
+  // When a machine last checked in (any of its runs).
+  lastSeenOf(n) {
+    let t = 0;
+    for (const r of this.runs.values()) if (r.machine === n && r.seen > t) t = r.seen;
+    return t;
   }
 
   // Machines to start so a pool has its size. Whoever asks (a member of the pool, or something watching it from
@@ -1687,17 +3117,29 @@ export class Control {
     if (!pool || !(pool in this.pools())) return [];
     const live = this.liveRuns(now);
     if (this.settling(now)) return []; // claiming now would start a whole pool's worth of extras
+    // A start of this pool that never showed up: its jobs are all taken. Claim nothing new until that passes (the
+    // queued start still arrives when a job frees up).
+    for (const [n, at] of [...this.starts]) {
+      if (this.startPools.get(n) !== pool || now - at < START_WAIT_MS) continue;
+      if (!live.some((x) => x.machine === n && x.started >= at - MIN)) this.markCapped(pool, now, `a machine started for slot ${n} didn't show up within ${START_WAIT_MS / MIN} minutes`);
+      this.startPools.delete(n);
+    }
+    if (this.capped(pool, now)) return [];
     const members = new Set(live.filter((x) => x.pool === pool).map((x) => x.machine));
     // Only this pool's starts count (a start from before a restart, pool unknown, counts for every pool).
     const starting = [...this.starts].filter(([n, at]) => now - at < START_WAIT_MS && !live.some((x) => x.machine === n) &&
       (this.startPools.get(n) ?? pool) === pool).length;
     const out = [];
+    // Its machines' held slots first: a machine started for one inherits its copies.
+    const held = [...new Set([...this.runs.values()].map((r) => r.machine))].filter((n) => this.heldBy(n, now) === pool &&
+      !(now - (this.starts.get(n) ?? 0) < START_WAIT_MS)).sort((a, b) => a - b);
     for (let missing = this.poolSize(pool) - members.size - starting; missing > 0; missing--) {
-      const n = this.freeSlot(now, null);
+      const n = held.shift() ?? this.freeSlot(now, null, pool);
       if (!n) break;
       this.markStart(n, now, by, pool);
       out.push(n);
     }
+    if (out.length) this.logEvent("start", { cause: pool, detail: `starting ${out.length === 1 ? "a machine" : `${out.length} machines`} for pool ${pool}: slot${out.length === 1 ? "" : "s"} ${out.join(", ")}`, t: now });
     return out;
   }
 
@@ -1710,16 +3152,18 @@ export class Control {
 
   // A slot is taken while another agent runs in it, while a machine is starting for it, and for a while after a
   // standalone machine drops out (so it gets the slot back when it restarts).
-  slotTaken(n, now, agent) {
+  slotTaken(n, now, agent, pool = null) {
     if (now - (this.starts.get(n) ?? 0) < START_WAIT_MS) return true;
+    const held = this.heldBy(n, now);
+    if (held && held !== pool) return true; // kept for its own pool's next machine
     const hold = this.holds.get(n);
     if (hold && hold.agent !== agent && now - hold.at < 2 * 60_000) return true;
     return [...this.runs.values()].some((x) => x.machine === n && x.agent !== agent && !x.retire &&
       (this.live(x, now) || (!x.pool && now - x.seen < STANDALONE_HOLD_MS)));
   }
 
-  freeSlot(now, agent) {
-    for (let n = 1; n <= this.maxSlots(); n++) if (!this.slotTaken(n, now, agent)) return n;
+  freeSlot(now, agent, pool = null) {
+    for (let n = 1; n <= this.maxSlots(); n++) if (!this.slotTaken(n, now, agent, pool)) return n;
     return null;
   }
 
@@ -1744,7 +3188,7 @@ export class Control {
       slot = want;
     } else {
       const before = this.agents.get(agent)?.slot;
-      slot = before && !this.slotTaken(before, now, agent) ? before : this.freeSlot(now, agent);
+      slot = before && !this.slotTaken(before, now, agent, pool) ? before : this.freeSlot(now, agent, pool);
     }
     if (!slot) throw new HttpError(503, `all ${max} slots are taken`);
     // Recorded before the tunnel lookup, so an agent joining at the same moment doesn't get the same slot.
@@ -1868,12 +3312,30 @@ export class Control {
     this.sql.exec("DELETE FROM metrics_10m WHERE t < ? AND t < ?", now - KEEP_10M_MS, Number(this.settings.get("rolled60") ?? 0)); // once rolled into hours
     this.sql.exec("DELETE FROM metrics_1h WHERE t < ?", now - KEEP_1H_MS);
     this.sql.exec("DELETE FROM geo WHERE at < ?", now - 30 * 86400_000);
+    this.sql.exec("DELETE FROM events WHERE t < ?", now - EVENTS_KEEP_MS);
     for (const r of this.runs.values()) {
       if (now - r.seen > 2 * 3600_000) {
         this.runs.delete(r.id);
         this.sql.exec("DELETE FROM runs WHERE id = ?", r.id);
       }
     }
+    for (const map of [this.healthyAt, this.lastHealthy, this.firstSeen, this.lastV]) {
+      for (const key of map.keys()) if (!this.runs.has(key.slice(0, key.lastIndexOf("|")))) map.delete(key);
+    }
+    this.handoverTimes = this.handoverTimes.filter((x) => now - x.t < 24 * 3600_000);
+    for (const map of [this.minutes, this.restarts, this.lowDiskSince, this.strikes, this.sickWhy, this.dueWait]) {
+      for (const id of map.keys()) if (!this.runs.has(id)) map.delete(id);
+    }
+    let pruned = false;
+    for (const key of this.versionFails.keys()) {
+      const [name, v] = [key.slice(0, key.lastIndexOf("@")), Number(key.slice(key.lastIndexOf("@") + 1))];
+      const p = this.projects.get(name);
+      if (!p || (p.version !== v && p.stable !== v)) {
+        this.versionFails.delete(key);
+        pruned = true;
+      }
+    }
+    if (pruned) this.saveVersionFails();
   }
 
   // ---- metrics ----
@@ -1893,15 +3355,21 @@ export class Control {
       this.liveMetrics.set(r.machine, { run: r.id, started: r.started, t: Number(metrics.live.t) || now, h, a: isMap(metrics.live.a) ? metrics.live.a : {} });
       const list = this.samples.get(r.machine) ?? this.samples.set(r.machine, []).get(r.machine);
       list.push({ t: now, cpu: Number(h.cpu) || 0, mem: h.memTotal ? (100 * (h.memUsed || 0)) / h.memTotal : 0 });
-      while (list.length && now - list[0].t > this.hotMs() * 2) list.shift();
+      while (list.length && now - list[0].t > 5 * MIN) list.shift(); // room is judged on the last 3 minutes
     }
+    const mine = this.minutes.get(r.id) ?? [];
     for (const m of Array.isArray(metrics.minutes) ? metrics.minutes.slice(-60) : []) {
       const t = Number(m?.t);
       if (!Number.isInteger(t) || t % MIN || t > now || now - t > KEEP_1M_MS || !isMap(m.h)) continue;
       const slot = this.pendingMetrics.get(t) ?? {};
       slot[r.machine] = { h: m.h, a: isMap(m.a) ? m.a : {} };
       this.pendingMetrics.set(t, slot);
+      if (now - t <= 10 * MIN && !mine.some((x) => x.t === t)) {
+        const memTotal = Number(m.h.memTotal) || 0;
+        mine.push({ t, cpu: Number(m.h.cpu) || 0, steal: Number(m.h.steal) || 0, mem: memTotal ? (100 * (Number(m.h.memUsed) || 0)) / memTotal : 0, memTotal, a: isMap(m.a) ? m.a : {} });
+      }
     }
+    if (mine.length) this.minutes.set(r.id, mine.sort((a, b) => a.t - b.t).slice(-10));
   }
 
   // Writes each finished minute as one row; a minute that already has a row (a late summary) is merged into it.
@@ -2021,7 +3489,26 @@ export class Control {
       expected: this.expectedMachines(),
       dnsError: this.dnsError,
       dnsNotes: this.dnsNotes ?? [],
-      rebalance: { on: this.rebalanceOn(), log: this.rebalanceLog.slice(0, 10), hot: [...this.liveMachines(now).keys()].filter((m) => this.isHot(m, now)) },
+      rebalance: {
+        on: this.rebalanceOn(),
+        log: this.recentEvents.filter((e) => ["move-start", "move-done", "move-cancel", "rebalance"].includes(e.kind)).slice(-10).reverse()
+          .map((e) => ({ t: e.t, text: eventText(e) })),
+        hot: [...this.liveMachines(now).values()].filter((r) => this.hotness(r, now)).map((r) => r.machine),
+        paused: this.paused(now) ? Number(this.settings.get("rebalance_paused_until")) : null,
+        state: !this.rebalanceOn() ? "off" : this.paused(now) ? "paused" : this.quiet(now) ? "quiet" : "on",
+        inFlight: [...this.copies.values()].reduce((n, list) => n + list.filter((x) => x.leaving).length, 0),
+        cap: Math.max(1, Math.min(8, Math.ceil(0.1 * [...this.liveMachines(now).values()].filter((r) => r.ready && now - r.started > SETTLED_MS).length))),
+      },
+      churn: this.churn(now),
+      departures: this.departures(now),
+      dark: [...this.dark].map(([key, d]) => ({ app: key.slice(0, key.lastIndexOf("|")), replica: Number(key.slice(key.lastIndexOf("|") + 1)), since: d.since, machine: d.machine, why: d.why })),
+      cold: (() => { // dark spells in the last day: how many, and how long in all (seconds)
+        const done = this.all("SELECT COUNT(*) AS n, COALESCE(SUM(other), 0) AS s FROM events WHERE kind = 'lit' AND t > ?", now - 86400_000)[0];
+        return { spells: done.n + this.dark.size, seconds: done.s + [...this.dark.values()].reduce((a, d) => a + Math.round((now - d.since) / 1000), 0) };
+      })(),
+      alerts: this.recentEvents.filter((e) => e.kind === "alert" && now - e.t < 24 * 3600_000).slice(-20).reverse()
+        .map((e) => ({ t: e.t, cause: e.cause, app: e.app, machine: e.machine, text: e.detail })),
+      events: this.recentEvents.slice(-50).reverse().map((e) => ({ ...e, text: eventText(e) })),
       // Slots to show: ones with a recent run, plus ones a machine is starting for.
       starting: [...this.starts].filter(([n, at]) => now - at < START_WAIT_MS && !this.liveRuns(now).some((r) => r.machine === n)).map(([n]) => n),
       settling: this.settling(now), // just (re)started, or reachable again after a gap: machines not heard from yet aren't down
@@ -2046,6 +3533,14 @@ export class Control {
           draining: Boolean(r.drain),
           label: r.label,
           rtt: r.rtt ?? null, // ms, the agent's last check-in round trip: the machine's latency to the control plane
+          quarantine: (r.quarantine ?? 0) > now ? { until: r.quarantine, why: this.sickWhy.get(r.id) ?? null, sick: this.sickWhy.has(r.id) } : null,
+          deadline: r.deadline ?? null,
+          dueAt: this.dueAt(r),
+          departing: r.handover ? "handover" : r.evict ? "evict" : null,
+          edges: r.edges ?? null, // the tunnel's live connections to Cloudflare's edge (0: nothing reaches it)
+          cpus: r.cpus ?? null,
+          disk: r.disk ?? null,
+          strikes: (this.strikes.get(r.id) ?? []).filter((x) => now - x.t < STRIKE_WINDOW_MS).map((x) => x.why),
           location: r.location ?? null,
           projects: r.status,
         })),
@@ -2072,6 +3567,7 @@ export class Control {
         if (this.env.DNS === "off") this.dnsNotes = ["DNS sync is switched off (DNS=off)"];
         else await this.syncDns();
         this.dnsError = null;
+        this.dnsSyncedAt = now;
         if (this.dnsDue === due) this.dnsDue = now + 3600_000; // re-check hourly in case something drifted
       } catch (e) {
         this.dnsError = e.message;
@@ -2107,11 +3603,15 @@ export class Control {
     const notes = [];
     const posts = [];
     const patches = [];
+    const repointed = [];
     for (const [name, content] of want) {
       const rs = byName.get(name) ?? [];
       const r = rs.find((x) => x.type === "CNAME");
       if (!rs.length) posts.push({ type: "CNAME", name, content, proxied: true, comment: DNS_COMMENT });
-      else if (r && r.content !== content && ours.has(r.content)) patches.push({ id: r.id, content });
+      else if (r && r.content !== content && ours.has(r.content)) {
+        patches.push({ id: r.id, content });
+        repointed.push([name, content]);
+      }
       else if (!r || !ours.has(r.content)) notes.push(`${name} is already used by another DNS record, so it can't point at its server`);
     }
     // At most 100 changes per batch (the free plan's limit is 200), deletes first; a batch applies its own deletes
@@ -2123,6 +3623,11 @@ export class Control {
       await this.cf(`/zones/${zone}/dns_records/batch`, { method: "POST", body: JSON.stringify(batch) });
     }
     if (ops.length) console.log(`DNS: ${deletes.length} deleted, ${patches.length} moved, ${posts.length} added`);
+    for (const [name, content] of repointed) {
+      const m = name.slice(0, -(domain.length + 1)).match(/^(.+)-(\d+)$/);
+      const slot = [...this.slots.values()].find((x) => `${x.tunnel}.cfargotunnel.com` === content);
+      if (m) this.logEvent("dns", { app: m[1], replica: Number(m[2]), machine: slot?.n ?? null, t: now });
+    }
     this.dnsNotes = notes;
   }
 }

@@ -18,10 +18,16 @@ sync 1 r1 80 80 >/dev/null; sync 2 r2 5 20 >/dev/null; sync 3 r3 30 40 >/dev/nul
 echo "== placed:"; show
 echo "== move web off machine 2 (auto destination):"; curl -s -X POST "$B/api/projects/web/move?from=2" -H "$A" | jq -c '[.placed[] | {machine, reason, leaving}]'
 echo "-- both machines should want it now:"; sync 2 r2 5 20; sync 3 r3 30 40
-echo "-- new copy (m3) reports healthy -> old copy dropped:"; sync 3 r3 30 40 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sync 2 r2 5 20; show
+echo "-- new copy (m3) reports healthy -> old copy dropped once DNS points at it (a sync 2 s later):"; sync 3 r3 30 40 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sleep 3; sync 3 r3 30 40 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sync 2 r2 5 20; show
 echo "== move again to a named machine (1):"; curl -s -X POST "$B/api/projects/web/move?from=3&to=1" -H "$A" | jq -c '[.placed[] | {machine, leaving}]'
 echo "-- move while moving is refused:"; curl -s -X POST "$B/api/projects/web/move?from=3" -H "$A" | jq -c .
-echo "== evict machine 1 (web's new copy is there, not yet healthy; still moves):"; curl -s -X POST "$B/api/machines/1/evict" -H "$A" | jq -c .
+echo "== evict machine 1 (web's new copy is there, not yet healthy): web is already changing as much as it may, so it waits:"; curl -s -X POST "$B/api/machines/1/evict" -H "$A" | jq -c .
+echo "-- forced, it moves anyway: the move from 3 is redirected (no chain of two moves, never two copies left):"; curl -s -X POST "$B/api/machines/1/evict?force=1" -H "$A" | jq -c .
 show
+D=$(curl -s $B/api/status | jq -r '.projects[] | select(.name == "web") | .placed[] | select(.leaving | not) | .machine')
+echo "-- the new copy (m$D) reports healthy: one copy is left, on $D:"; sync $D r$D 5 20 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; sleep 3; sync $D r$D 5 20 '{"web":{"v":1,"s":"healthy"}}' >/dev/null; show
+echo "== sending a move's new copy back where it came from calls the move off:"; O=$(( D == 1 ? 2 : 1 ))
+curl -s -X POST "$B/api/projects/web/move?from=$D&to=$O" -H "$A" > /dev/null; show
+curl -s -X POST "$B/api/projects/web/move?from=$O&to=$D" -H "$A" | jq -c '[.placed[] | {machine, leaving}]'
 echo "== portal can't move:"; curl -s -o /dev/null -w "%{http_code}\n" -X POST "$B/admin/api/machines/1/evict" -H 'origin: http://localhost:8911'
 . "$HERE/stop.sh"

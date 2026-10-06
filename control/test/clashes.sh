@@ -8,7 +8,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE/.."
 . "$HERE/stop.sh"
 (node "$HERE/cloudflare-mock.mjs" > /tmp/runner-test-mock.log 2>&1 &)
-. "$HERE/start.sh" ADMIN_PASSWORD=adm JOIN_TOKEN=node 'POOLS={"main":3}'
+. "$HERE/start.sh" ADMIN_PASSWORD=adm JOIN_TOKEN=node 'POOLS={"main":3}' QUIET_MS=0
 for i in $(seq 1 30); do curl -sf localhost:8911/api/status >/dev/null && break; sleep 1; done
 B=localhost:8911; START=$(date +%s%3N)
 A='x-admin-password: adm'
@@ -70,8 +70,12 @@ check "agreeing port accepted" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X 
 echo "== the join token can't take slot 1 while machine 1 is up; after a roll asks machine 1 to hand over, its replacement can"
 check "join for a live slot" 409 "$(join intruder 1)"
 check "the live run isn't disturbed" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST $B/api/sync -H 'authorization: Bearer node' "${J[@]}" -d "{\"machine\":1,\"run\":\"r1\",\"agent\":\"agent-r1\",\"pool\":\"main\",\"started\":$START,\"ready\":true,\"status\":{}}")"
+# The machines run what they're told, healthy (a roll waits while an app's copies are changing).
+declare -A HEALTHY
+for pass in 1 2; do for m in 1 2 3; do HEALTHY[$m]=$(sync $m r$m "${HEALTHY[$m]:-{\}}" | jq -c '[.desired // {} | to_entries[] | {key, value: {v: .value.v, s: "healthy"}}] | from_entries'); done; done
+sleep 3; for m in 1 2 3; do sync $m r$m "${HEALTHY[$m]}" > /dev/null; done # the api move ends once DNS follows its new copy
 curl -s -X POST "$B/api/roll?machine=1" -H "$A" > /dev/null
-check "machine 1 is told to hand over" true "$(sync 1 r1 | jq .handover)"
+check "machine 1 is told to hand over" true "$(sync 1 r1 "${HEALTHY[1]}" | jq .handover)"
 check "its replacement joins for slot 1" 200 "$(join a1b 1)"
 check "a slot nobody is in" 200 "$(join newcomer 4)"
 grep -i "error\|exception" /tmp/runner-test-dev.log | grep -v "Cloudflare API" | head -5

@@ -14,10 +14,14 @@
 //   START_CMD     a shell command that starts a new machine for slot $SLOT. With it, the agent starts the pool members
 //                 the control plane says are missing, and its own replacement when it's handed over; without it, a
 //                 handover restarts the agent (where it runs under a supervisor, it comes back with the latest code)
+//   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then (a CI job's time limit,
+//                 say): the control plane plans its departure before that. Without it, the machine has no deadline.
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import * as fsp from "node:fs/promises";
 import http from "node:http";
+import { availableParallelism } from "node:os";
 import { dirname, resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 
@@ -27,6 +31,7 @@ const base = resolve(env.RUNNER_DATA || "/var/lib/runner");
 const started = Date.now();
 const settleBy = started + 10 * 60_000; // open the tunnel by then even if a project is still struggling
 const ROUTER_PORT = Number(env.ROUTER_PORT) || 19080; // the tunnel sends everything here, and the router (Caddy) picks the project by hostname
+const METRICS_PORT = ROUTER_PORT + 1; // the tunnel's own metrics (its live edge connections)
 const dir = `${base}/projects`;
 const routerDir = `${base}/router`;
 const MANIFEST = ".runner-files"; // in each project's folder: the files the agent wrote there last time
@@ -35,11 +40,14 @@ let tunnelToken = "";
 let agent = "";
 let run = ""; // this start of the agent
 // What this agent tells the control plane about its machine.
+const deadline = Number(env.LIFETIME_MIN) > 0 ? started + Number(env.LIFETIME_MIN) * 60_000 : undefined;
 const describe = () => ({
   pool,
   poolSize: pool && env.POOL_SIZE ? Number(env.POOL_SIZE) : undefined, // how many machines the pool should have
   label: env.LABEL || null,
   starts: Boolean(env.START_CMD),
+  deadline, // when this machine will be stopped, if it knows (LIFETIME_MIN)
+  cpus: availableParallelism(), // its cores: how much of it an app's CPU use is
 });
 // Commands run without secrets (anything named like a token, key or password), so a compose file can't read them.
 const cleanEnv = Object.fromEntries(Object.entries(env).filter(([k]) => !/TOKEN|SECRET|PASSWORD|KEY/i.test(k)));
@@ -59,11 +67,11 @@ function sh(cmd, args, { timeout = 15 * 60_000, extraEnv = {} } = {}) {
 // copy runs here.
 const replicaHost = (app, replica) => `${app}-${replica}.${domain}`;
 
-// GET / for a hostname through the local router: { code, routed }, with code 0 if nothing answered.
+// GET a path (/ by default) for a hostname through the local router: { code, routed }, with code 0 if nothing answered.
 // The router's own "no such project" 404 carries X-Runner-Route: none, so it isn't mistaken for the project's.
-function probe(host) {
+function probe(host, path = "/") {
   return new Promise((resolve) => {
-    const req = http.get({ host: "127.0.0.1", port: ROUTER_PORT, path: "/", headers: { host }, timeout: 5000 }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port: ROUTER_PORT, path, headers: { host }, timeout: 5000 }, (res) => {
       res.resume();
       resolve({ code: res.statusCode, routed: res.headers["x-runner-route"] !== "none" });
     });
@@ -85,17 +93,31 @@ async function answers(name, seconds) {
   }
 }
 
+// Whether a copy is ready by its app's own readiness path (x-runner.ready): a 2xx answer. Readiness is only reported:
+// a copy that isn't ready is never restarted for it (liveness, above, decides that), so an app waiting for its peers
+// (a quorum it can't reach yet, say) isn't restarted in a loop.
+async function isReady(p) {
+  if (!p.readyPath) return undefined;
+  const { code, routed } = await probe(replicaHost(p.app, p.replica), p.readyPath);
+  return routed && code >= 200 && code < 300;
+}
+
 // ---- projects ----
 
 // Keyed by what the control plane calls each copy: a project's name for the lowest-numbered replica of it here (the
 // usual, only copy), <name>-r<k> for any further copy of it on this machine.
-const projects = new Map(); // key -> { app, replica, v, port, s: "applying" | "healthy" | "failed", e, busy, at, misses }
+const projects = new Map(); // key -> { app, replica, v, port, readyPath, s: "applying" | "healthy" | "failed", r, e, busy, at, misses, t0, n }
 let domain = "";
 
 // Writes the project's files and brings it up. `recreate` is for trying the same version again after a failure: compose
 // only recreates the containers whose config changed, so a container that's running but hung would be left as it is.
 async function apply(name, want, { recreate = false } = {}) {
-  const p = { app: want.app ?? name, replica: want.replica ?? 1, v: want.v, port: want.port, s: "applying", e: "", busy: true, at: Date.now(), misses: 0 };
+  const before = projects.get(name);
+  const same = before && before.replica === (want.replica ?? 1) && before.app === (want.app ?? name);
+  const p = { app: want.app ?? name, replica: want.replica ?? 1, v: want.v, port: want.port, readyPath: want.ready ?? null, s: "applying", e: "",
+    busy: true, at: Date.now(), misses: 0,
+    t0: same ? before.t0 : Date.now(), // when this copy was first started on this machine (for the control plane's clocks)
+    n: (same ? before.n ?? 0 : 0) + (recreate ? 1 : 0) }; // restarts of it here
   projects.set(name, p);
   updateRouter();
   log(`${name}: starting v${want.v}${recreate ? " again" : ""}`);
@@ -132,7 +154,7 @@ async function apply(name, want, { recreate = false } = {}) {
   } catch (err) {
     [s, e] = ["failed", err.message];
   }
-  Object.assign(p, { s, e, busy: false, at: Date.now() });
+  Object.assign(p, { s, e, busy: false, at: Date.now(), r: s === "healthy" ? await isReady(p) : undefined });
   log(`${name}: v${want.v} ${s}${e ? ` (${e.split("\n").pop()})` : ""}`);
 }
 
@@ -187,7 +209,10 @@ function reconcile(desired) {
     // A failed project is tried again: soon while the machine is still starting up (a hiccup mustn't hold its tunnel
     // back for long), every 3 minutes once it's online.
     const retry = p.s === "failed" && Date.now() - p.at > (ready ? 3 * 60_000 : 30_000);
-    if (p.v !== want.v || p.port !== want.port || retry) {
+    // A different replica under the same key (the control plane gave the key to another copy) is a different copy:
+    // its .env differs, so it's applied again even at the same version.
+    const other = p.replica !== (want.replica ?? 1) || p.app !== (want.app ?? name);
+    if (p.v !== want.v || p.port !== want.port || other || retry) {
       apply(name, want, { recreate: retry && p.v === want.v }).catch((e) => log(`${name}: ${e.message}`));
     }
   }
@@ -200,11 +225,13 @@ const settled = (desired) => Object.entries(desired).every(([name, want]) => {
 });
 
 // A project that stops answering three checks in a row is marked failed, which makes reconcile start it again.
+// Readiness is checked alongside, and only reported.
 async function checkHealth() {
   for (const [name, p] of projects) {
     if (p.busy || p.s !== "healthy" || !p.port) continue;
     if (await answers(name, 0)) {
       p.misses = 0;
+      if (p.readyPath) p.r = await isReady(p);
     } else if (++p.misses >= 3) {
       log(`${name}: stopped answering on port ${p.port}; restarting it`);
       Object.assign(p, { s: "failed", e: `stopped answering on port ${p.port}`, at: 0, misses: 0 });
@@ -283,7 +310,7 @@ async function startTunnel() {
   await sh("docker", ["rm", "-f", "tunnel"]); // from a start that didn't connect
   const r = await sh("docker", ["run", "-d", "--name", "tunnel", "--network", "host", "--restart", "unless-stopped",
     "-e", "TUNNEL_TOKEN", "-v", `${base}/tunnel.yml:/etc/cloudflared/config.yml:ro`,
-    "cloudflare/cloudflared:latest", "tunnel", "--no-autoupdate", "--config", "/etc/cloudflared/config.yml", "run"],
+    "cloudflare/cloudflared:latest", "tunnel", "--no-autoupdate", "--metrics", `127.0.0.1:${METRICS_PORT}`, "--config", "/etc/cloudflared/config.yml", "run"],
   { extraEnv: { TUNNEL_TOKEN: tunnelToken } });
   if (!r.ok) throw new Error(`tunnel didn't start: ${r.out}`);
   for (let i = 0; i < 45; i++) {
@@ -291,6 +318,33 @@ async function startTunnel() {
     await sleep(2000);
   }
   throw new Error(`tunnel didn't connect: ${(await sh("docker", ["logs", "--tail", "20", "tunnel"])).out}`);
+}
+
+// How many edge connections the tunnel has (0: the machine is up but unreachable from outside), or undefined.
+function tunnelEdges() {
+  return new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port: METRICS_PORT, path: "/metrics", timeout: 3000 }, (res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => {
+        const m = body.match(/^cloudflared_tunnel_ha_connections\s+(\d+)/m);
+        resolve(m ? Number(m[1]) : undefined);
+      });
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => resolve(undefined));
+  });
+}
+
+// Free and total bytes on the disk the projects live on.
+async function diskSpace() {
+  try {
+    if (!fsp.statfs) return undefined; // Node before 18.15
+    const s = await fsp.statfs(base);
+    return { free: s.bavail * s.bsize, total: s.blocks * s.bsize };
+  } catch {
+    return undefined;
+  }
 }
 
 // ---- control plane ----
@@ -363,13 +417,15 @@ async function removeLeftovers(desired) {
 
 let rtt = null; // how long the last check-in took, machine to control plane and back: sent with the next one, shown as the machine's latency
 async function sync() {
-  const status = Object.fromEntries([...projects].map(([name, p]) => [name, { v: p.v, s: p.s, e: p.e || undefined }]));
+  const status = Object.fromEntries([...projects].map(([name, p]) => [name, { v: p.v, s: p.s, e: p.e || undefined, r: p.r, t0: p.t0, n: p.n }]));
   const sent = metrics.payload();
   const t0 = Date.now();
+  const edges = ready ? await tunnelEdges() : undefined;
+  const disk = await diskSpace();
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
     method: "POST",
     headers: { authorization: `Bearer ${env.JOIN_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify({ machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt }),
+    body: JSON.stringify({ machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt, edges, disk }),
     signal: AbortSignal.timeout(15_000),
   });
   rtt = Date.now() - t0;
@@ -462,9 +518,15 @@ async function main() {
       }
     }
     // Open the tunnel only once the projects are up and answering, so a fresh run doesn't take traffic it can't serve
-    // yet (after 10 minutes, open it anyway: the control plane sees what's failing). A tunnel that won't connect is
-    // tried again in a minute; meanwhile the machine's old run, if any, keeps serving.
-    if (!ready && plan && Date.now() >= tunnelRetryAt && (settled(plan.desired) || Date.now() > settleBy)) {
+    // yet (after 10 minutes, open it anyway: the control plane sees what's failing). A successor (an older run of this
+    // machine is still serving) opens once it serves everything its predecessor did (the control plane lists those
+    // copies), with no 10-minute fallback: the predecessor keeps serving meanwhile. A tunnel that won't connect is
+    // tried again in a minute.
+    const serves = (key) => projects.get(key)?.s === "healthy" && !projects.get(key)?.busy && projects.get(key)?.r !== false;
+    const openNow = plan?.successor
+      ? Array.isArray(plan.serve) && plan.serve.every(serves) && (plan.serve.length > 0 || settled(plan.desired))
+      : plan && (settled(plan.desired) || Date.now() > settleBy);
+    if (!ready && plan && Date.now() >= tunnelRetryAt && openNow) {
       try {
         await startTunnel();
         ready = true;

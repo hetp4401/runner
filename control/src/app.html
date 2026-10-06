@@ -187,6 +187,13 @@
   details.more > summary { cursor: pointer; font-size: var(--fs-sm); font-weight: 600; color: var(--fg-2); padding: 10px 0; }
   .spark { display: inline-block; vertical-align: middle; margin-right: 6px; }
   .log { font-size: var(--fs-sm); margin-top: 8px; }
+  .log > div { padding: 3px 0; overflow-wrap: anywhere; }
+  .strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 230px), 1fr)); gap: 8px; margin-top: 12px; }
+  .dep { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-left-width: 4px; border-radius: var(--r-md); text-decoration: none; background: var(--surface); }
+  .dep .meta { overflow-wrap: anywhere; }
+  .dep.on { border-left-color: var(--leaving); }
+  .dep.due { border-left-color: var(--deploying); }
+  main h3 { font-size: var(--fs-md); margin: 18px 0 8px; }
   .mob { display: none; }
   @media (max-width: 640px) { .mob { display: inline; } }
 
@@ -255,6 +262,7 @@
       <a href="#/" data-nav=""><i aria-hidden="true">⌂</i>Overview</a>
       <a href="#/apps" data-nav="apps"><i aria-hidden="true">▦</i>Apps</a>
       <a href="#/machines" data-nav="machines"><i aria-hidden="true">▤</i>Servers</a>
+      <a href="#/activity" data-nav="activity"><i aria-hidden="true">↻</i>Activity</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
     </nav>
@@ -307,6 +315,9 @@ function ago(ms) {
   return s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : s < 172800 ? (s / 3600).toFixed(1) + "h" : Math.round(s / 86400) + "d";
 }
 const pctOf = (a, b) => (isNum(a) && b > 0 ? (100 * a) / b : null);
+const fmtDur = (ms) => (ms < 90_000 ? `${Math.max(0, Math.round(ms / 1000))} s` : ms < 90 * 60_000 ? `${Math.round(ms / 60_000)} min` : `${(ms / 3600_000).toFixed(1)} h`);
+const clock = (t) => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const inOrAgo = (t) => (t >= S.status.now ? `in ${fmtDur(t - S.status.now)}` : `${fmtDur(S.status.now - t)} ago`);
 const NAME = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 const MAX_REPLICAS = 50;
 const MIN_APP_PASSWORD = 6;
@@ -556,7 +567,9 @@ function machineState(n, r) {
   if (!r) return replacedSlot(n) ? { kind: "leaving", text: "replaced" } : { kind: "gone", text: "down" };
   if (r.handover || r.replacing) return { kind: "deploying", text: "replacing itself" };
   if (r.draining) return { kind: "leaving", text: "going down soon" };
+  if (r.departing === "evict") return { kind: "leaving", text: "moving its apps out" };
   if (!r.ready) return { kind: "deploying", text: "starting up" };
+  if (r.quarantine) return { kind: "failed", text: "quarantined" };
   if (S.status.rebalance.hot.includes(n)) return { kind: "failed", text: "hot" };
   return { kind: "healthy", text: `online · ${ago(S.status.now - r.started)}` };
 }
@@ -564,7 +577,9 @@ const APP_STATE = { live: ["healthy", "live"], deploying: ["deploying", "deployi
 // A server reports each copy it runs by key: the app's name for the lowest-numbered replica it has of the app,
 // <name>-r<k> for any other copy of it there.
 function keyOn(p, machine, k) {
-  const here = p.placed.filter((x) => x.machine === machine).map((x) => x.replica);
+  const x = p.placed.find((y) => y.machine === machine && y.replica === k);
+  if (x?.key) return x.key; // stored by the control plane when the copy was placed
+  const here = p.placed.filter((y) => y.machine === machine).map((y) => y.replica);
   return here.length && k === Math.min(...here) ? p.name : `${p.name}-r${k}`;
 }
 // What an app is doing, from its replicas: failing if any server reports a copy failed, deploying until every replica
@@ -636,7 +651,17 @@ function problems() {
   const waiting = st.settling ? st.slots.filter((n) => !runs.has(n) && !(st.starting ?? []).includes(n)).length : 0;
   if (waiting) out.push({ kind: "deploying", href: "#/machines", text: `The control plane just (re)started: ${plural(waiting, "server")} not heard from yet` });
   else for (const n of st.slots) if (!runs.has(n) && !(st.starting ?? []).includes(n) && !leavingSlot(n) && !replacedSlot(n)) out.push({ kind: "gone", href: machineHref(n), text: `Server ${n} is down` });
-  for (const n of st.rebalance.hot) out.push({ kind: "failed", href: machineHref(n), text: `Server ${n} is hot (CPU or memory high for 5 minutes)` });
+  for (const n of st.rebalance.hot) out.push({ kind: "failed", href: machineHref(n), text: `Server ${n} is hot (CPU or memory high in 4 of the last 5 minutes)` });
+  for (const d of st.dark ?? []) out.push({ kind: "failed", href: appHref(d.app), text: `${d.app} replica ${d.replica} has no healthy copy (for ${fmtDur(st.now - d.since)}): ${d.why}` });
+  for (const r of st.runs.filter((x) => x.live && !x.retiring && x.quarantine)) {
+    out.push({ kind: "failed", href: machineHref(r.machine), text: `Server ${r.machine} is quarantined for ${fmtDur(r.quarantine.until - st.now)} more: ${r.quarantine.why ?? "it stayed hot after an app was moved off it"}` });
+  }
+  if (st.rebalance.state === "paused") out.push({ kind: "failed", href: "#/activity", text: `Automatic moves are paused until ${clock(st.rebalance.paused)}: they looked like thrashing` });
+  for (const c of st.departures?.capped ?? []) out.push({ kind: "deploying", href: "#/activity", text: `Pool ${c.pool} can't start servers right now: its departures move apps out first` });
+  // What automation gave up on in the last 2 hours (dark replicas, the pause and capped pools have their own lines while they last).
+  for (const a of (st.alerts ?? []).filter((x) => st.now - x.t < 2 * 3600_000 && !["dark", "paused", "capped"].includes(x.cause))) {
+    out.push({ kind: "failed", href: a.app ? appHref(a.app) : a.machine ? machineHref(a.machine) : "#/activity", text: `${ago(st.now - a.t)} ago: ${a.text}` });
+  }
   const short = st.pools.reduce((n, x) => n + Math.max(0, x.size - x.live), 0); // the servers the fleet should have that aren't up
   const starting = (st.starting ?? []).length;
   if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "server")} missing${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
@@ -1285,7 +1310,7 @@ function vOverview() {
       <h2><span class="grow">Fleet now</span><a href="#/metrics">Metrics →</a></h2><div id="ov-tiles"><div class="meta">Loading…</div></div>
       <h2><span class="grow">Apps</span><a href="#/apps">All apps →</a></h2><div class="cards" id="ov-apps"></div>
       <h2><span class="grow">Servers</span><a href="#/machines">All servers →</a></h2><div class="cards two" id="ov-machines"></div>
-      <h2>Rebalancing</h2><div class="card" id="ov-activity"></div>`,
+      <h2><span class="grow">Activity</span><a href="#/activity">All activity →</a></h2><div class="card" id="ov-activity"></div>`,
     status() {
       const st = S.status, runs = runsBy();
       $("#ov-sub").textContent = `${plural(runs.size, "server")} up · ${plural(st.projects.length, "app")} · ${st.domain}`;
@@ -1295,16 +1320,164 @@ function vOverview() {
           <div class="meta">v${p.version} · ${placedText(p)}</div>${replicaChips(p, runs, { links: false })}</a>`).join("")
         || `<div class="card empty">No apps yet. <a href="#/apps/new">Deploy your first app</a></div>`);
       setHtml($("#ov-machines"), machineCards(true) || `<div class="card empty">No servers have checked in. <a href="#/fleet">Add a server</a></div>`);
-      setHtml($("#ov-activity"), rebalanceLog(5));
+      setHtml($("#ov-activity"), activitySummary(6));
     },
     charts() { setHtml($("#ov-tiles"), fleetTiles()); },
   };
 }
 
+function rebalanceLine(prefix = true) {
+  const r = S.status.rebalance;
+  const text = r.state === "off" ? "Off: apps stay where they're placed until their server goes away."
+    : r.state === "paused" ? `Paused until ${clock(r.paused)}: automatic moves looked like thrashing.`
+    : r.state === "quiet" ? "Waiting: the control plane just (re)started, so nothing moves for a few minutes."
+    : `On: a hot server sheds the app making it hot, a copy failing on one server moves, doubled-up copies spread out. ${plural(r.inFlight, "move")} under way, at most ${r.cap} at once.`;
+  return `<div class="meta">${prefix ? "Automatic moves: " : ""}${esc(text)}</div>`;
+}
 function rebalanceLog(limit) {
   const r = S.status.rebalance;
-  return `<div class="meta">${r.on ? "On: a server that stays hot (CPU over 85% or memory over 90% for 5 minutes) has its heaviest app moved off, and uneven spreads even out. One move every 10 minutes at most." : "Off: apps stay where they're placed until their server goes away."}</div>
+  return `${rebalanceLine()}
     ${r.log.length ? `<div class="log">${r.log.slice(0, limit).map((x) => `<div>${esc(ago(S.status.now - x.t))} ago: ${esc(x.text)}</div>`).join("")}</div>` : `<div style="margin-top:8px" class="meta">Nothing moved yet.</div>`}`;
+}
+// Copy starts by cause: "3 placed · 1 moved · 4 successor · 2 version" (the non-zero ones).
+const churnSub = (b) => [[b.placed, "placed"], [b.moved, "moved"], [b.successor, "by successors"], [b.version, "new versions"]].filter(([n]) => n).map(([n, w]) => `${n} ${w}`).join(" · ") || "none";
+const MOVE_CAUSE = { hot: "hot server", failed: "failing copy", unstack: "spread out", spread: "pool share", evict: "server leaving", hand: "by hand", lost: "server lost", lostMove: "server lost" };
+const movesSub = (m) => Object.entries(m).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${n} ${MOVE_CAUSE[c] ?? c}`).join(" · ") || "none";
+const depText = (d) => d.leaving === "handover" ? `handing over · ${fmtDur(S.status.now - d.since)}`
+  : d.leaving === "evict" ? `moving its apps out · ${fmtDur(S.status.now - d.since)}`
+  : d.due ? `due (${d.why})${d.wait ? ` · waiting: ${d.wait}` : " · leaving now"}`
+  : d.dueAt ? `due ${inOrAgo(d.dueAt)}` : "";
+// Departures under way, due, and due within the hour.
+function departureStrip(limit) {
+  const st = S.status;
+  const list = st.departures.list.filter((d) => d.leaving || d.due || (d.dueAt && d.dueAt - st.now < 3600_000)).slice(0, limit);
+  if (!list.length) return `<div class="meta" style="margin-top:10px">No server leaves in the next hour.</div>`;
+  return `<div class="strip">${list.map((d) => `<a class="dep${d.leaving ? " on" : d.due ? " due" : ""}" href="${machineHref(d.machine)}"><span><b>Server ${d.machine}</b>${d.pool ? ` <span class="meta">· pool ${esc(d.pool)}</span>` : ""}</span><span class="meta">${esc(depText(d))}</span>${d.deadline ? `<span class="meta">stops by ${esc(clock(d.deadline))}</span>` : ""}</a>`).join("")}</div>`;
+}
+// Event groups for the feed. "All" leaves out the busiest kinds (copies started by successors and new versions, DNS).
+const FEED = {
+  all: null,
+  moves: ["place", "move-start", "move-done", "move-cancel", "drop", "rebalance", "pause"],
+  departures: ["depart", "drain", "retire", "left", "server-lost", "start", "capped", "mass-loss", "gap"],
+  servers: ["strike", "quarantine", "drain", "server-lost", "mass-loss", "left"],
+  dark: ["dark", "lit"],
+  alerts: ["alert"],
+  churn: ["place", "move-start", "copy-start", "dns"],
+};
+const FEED_LABEL = { all: "All", moves: "Moves", departures: "Departures", servers: "Servers", dark: "Dark", alerts: "Alerts", churn: "Churn" };
+const QUIET_KINDS = ["copy-start", "dns"];
+const eventLines = (list) => list.length
+  ? `<div class="log">${list.map((e) => `<div><span class="meta">${esc(clock(e.t))}</span> ${esc(e.text ?? e.detail ?? e.kind)}</div>`).join("")}</div>`
+  : `<div class="meta" style="margin-top:8px">Nothing yet.</div>`;
+function activitySummary(limit) {
+  const st = S.status, ch = st.churn, pools = st.departures.pools;
+  const sum = (f) => pools.reduce((n, p) => n + f(p), 0);
+  return `${rebalanceLine()}
+    <div style="margin-top:12px">${tiles([
+      { label: "Copies started, last hour", value: String(ch.h1.starts), sub: churnSub(ch.h1) },
+      { label: "Copies started, last day", value: String(ch.h24.starts), sub: churnSub(ch.h24) },
+      { label: "Departures, last day", value: String(sum((p) => p.planned + p.stopped)), sub: `${sum((p) => p.plannedCold + p.stoppedCold)} cold · ${sum((p) => p.lost)} lost` },
+      { label: "Dark time, last day", value: st.cold.seconds ? fmtDur(st.cold.seconds * 1000) : "none", sub: plural(st.cold.spells, "dark spell") },
+    ])}</div>
+    ${departureStrip(6)}
+    ${eventLines(st.events.filter((e) => !QUIET_KINDS.includes(e.kind)).slice(0, limit))}`;
+}
+// What's on a server's own page about its life: when it's due to leave and stops, quarantine and strikes, its tunnel and disk.
+function serverFacts(r) {
+  if (!r) return "";
+  const st = S.status, out = [];
+  if (r.departing === "handover") out.push("handing over to a fresh server");
+  else if (r.departing === "evict") out.push("moving its apps out, then leaving");
+  else if (r.dueAt) out.push(r.dueAt <= st.now ? "due to leave now" : `due to leave ${inOrAgo(r.dueAt)}`);
+  if (r.deadline) out.push(`stops by ${clock(r.deadline)}`);
+  if (r.quarantine) out.push(`quarantined for ${fmtDur(r.quarantine.until - st.now)}: ${r.quarantine.why ?? "it stayed hot after an app was moved off it"}`);
+  if (r.strikes?.length) out.push(`${plural(r.strikes.length, "strike")} (${r.strikes.join("; ")})`);
+  if (r.edges === 0) out.push("its tunnel has no connection to Cloudflare: nothing reaches it");
+  if (r.disk?.total) out.push(`${Math.round((100 * r.disk.free) / r.disk.total)}% of its disk free`);
+  if (r.cpus) out.push(`${r.cpus} cores`);
+  return out.length ? `<div class="meta" style="margin-top:4px">${esc(out.join(" · "))}</div>` : "";
+}
+
+function vActivity() {
+  const A = { feed: FEED[localStorage.getItem("activity-feed")] !== undefined ? localStorage.getItem("activity-feed") : "all", events: null, err: null, busy: false, at: 0 };
+  const drawFeed = () => {
+    const box = $("#ac-feed");
+    if (!box) return;
+    if (!A.events) return setHtml(box, `<div class="meta">${A.err ? esc(A.err) : "Loading…"}</div>`);
+    setHtml(box, `<div class="card">${eventLines(A.events)}</div>`);
+  };
+  const load = async () => {
+    if (A.busy) return;
+    A.busy = true;
+    const feed = A.feed;
+    try {
+      const kinds = FEED[feed];
+      const res = await api("GET", `/events?limit=300${kinds ? `&kinds=${kinds.join(",")}` : ""}`);
+      if (feed === A.feed) {
+        A.events = res.events.filter((e) => kinds || !QUIET_KINDS.includes(e.kind)).slice(0, 200);
+        A.err = null;
+      }
+    } catch (e) {
+      A.err = e.message;
+    } finally {
+      A.busy = false;
+      A.at = Date.now();
+    }
+    drawFeed();
+  };
+  return {
+    title: "Activity",
+    html: `<h1>Activity</h1><div class="sub">What changed in the fleet, and why: copies started and moved, servers leaving, replicas without a healthy copy, and what automation gave up on.</div>
+      <h2>Automatic moves</h2><div class="card" id="ac-rebalance"></div>
+      <h2>Churn</h2><div id="ac-churn"></div>
+      <h2>Departures</h2><div id="ac-deps"></div>
+      <h2>Dark replicas</h2><div id="ac-dark"></div>
+      <h2>Alerts, last day</h2><div id="ac-alerts"></div>
+      <h2><span class="grow">Events</span><span class="seg" role="group" aria-label="Show">${Object.keys(FEED).map((k) => `<button type="button" data-feed="${k}" aria-pressed="${k === A.feed}">${FEED_LABEL[k]}</button>`).join("")}</span></h2>
+      <div id="ac-feed"><div class="meta">Loading…</div></div>`,
+    mount() { load(); },
+    status() {
+      const st = S.status, ch = st.churn, dep = st.departures;
+      setHtml($("#ac-rebalance"), `${rebalanceLine(false)}${st.rebalance.hot.length ? `<div class="meta" style="margin-top:4px">Hot now: ${st.rebalance.hot.map((n) => `server ${n}`).join(", ")}</div>` : ""}`);
+      setHtml($("#ac-churn"), `${tiles([
+          { label: "Copies started, last hour", value: String(ch.h1.starts), sub: churnSub(ch.h1) },
+          { label: "Copies started, last day", value: String(ch.h24.starts), sub: churnSub(ch.h24) },
+          { label: "Moves, last day", value: String(ch.h24.moved), sub: movesSub(ch.h24.moves) },
+          { label: "DNS re-points, last day", value: String(ch.h24.dns), sub: `${ch.h1.dns} in the last hour` },
+        ])}
+        <h3>Copies started per app</h3>
+        ${table(["App", "Last hour", "Last day"], ch.apps.map((a) => ({ href: appHref(a.app), cells: [`<b>${esc(a.app)}</b>`, String(a.h1), String(a.h24)] })), { empty: "No copies started in the last day", num: [1, 2] })}
+        ${ch.stateful.length ? `<h3>Stateful apps: copies started against how many may change at once</h3>
+        ${table(["App", "At once", "Last 2 min", "Last 10 min", "Last hour"], ch.stateful.map((x) => ({ href: appHref(x.app), cells: [`<b>${esc(x.app)}</b>`, String(x.budget), String(x.m2), String(x.m10), String(x.m60)] })), { num: [1, 2, 3, 4] })}` : ""}`);
+      setHtml($("#ac-deps"), `${departureStrip(12)}
+        <h3>Every server's departure</h3>
+        ${table(["Server", "Pool", "Leaving", "Stops by"], dep.list.map((d) => ({ href: machineHref(d.machine), cells: [`<b>Server ${d.machine}</b>`, esc(d.pool ?? "–"), esc(depText(d) || "–"), d.deadline ? esc(clock(d.deadline)) : "–"] })),
+          { empty: "No server says when it stops" })}
+        <h3>Last day, per pool</h3>
+        <p class="meta">Planned: the control plane's (handovers and evictions). Stopped: by the platform at the job's limit. Cold: a replica had no healthy copy because of it. Handover: a successor's start, its build, and the overlap before the old server leaves (medians).</p>
+        ${table(["Pool", "Planned", "Stopped", "Lost", "Handover"], dep.pools.map((x) => ({ cells: [esc(x.pool ?? "standalone"),
+          `${x.planned}${x.plannedCold ? ` (${x.plannedCold} cold)` : ""}`, `${x.stopped}${x.stoppedCold ? ` (${x.stoppedCold} cold)` : ""}`, String(x.lost),
+          x.handover ? `${fmtDur(x.handover.queue)} · ${fmtDur(x.handover.build)} · ${fmtDur(x.handover.overlap)} <span class="meta">(${x.handover.n})</span>` : "–"] })),
+          { empty: "No departures in the last day", num: [1, 2, 3] })}
+        ${dep.capped.length ? `<p class="meta">Can't start servers right now: ${dep.capped.map((c) => `pool ${esc(c.pool)} (until ${esc(clock(c.until))})`).join(", ")}</p>` : ""}`);
+      setHtml($("#ac-dark"), `${st.dark.length
+          ? table(["Replica", "Dark for", "Why"], st.dark.map((d) => ({ href: appHref(d.app), cells: [`<b>${esc(d.app)}</b> #${d.replica}`, fmtDur(st.now - d.since), esc(d.why)] })))
+          : `<div class="card ok-line">✓ Every replica has a healthy copy</div>`}
+        <p class="meta">Last day: ${plural(st.cold.spells, "dark spell")}${st.cold.seconds ? `, ${fmtDur(st.cold.seconds * 1000)} in all` : ""}.</p>`);
+      setHtml($("#ac-alerts"), st.alerts.length ? `<div class="card">${eventLines(st.alerts)}</div>` : `<div class="card ok-line">✓ No alerts in the last day</div>`);
+      if (Date.now() - A.at > 15_000) load();
+    },
+    click(e) {
+      const b = e.target.closest("[data-feed]");
+      if (!b) return;
+      A.feed = b.dataset.feed;
+      localStorage.setItem("activity-feed", A.feed);
+      $$("[data-feed]").forEach((x) => x.setAttribute("aria-pressed", x.dataset.feed === A.feed));
+      A.events = null;
+      drawFeed();
+      load();
+    },
+  };
 }
 
 // Server cards: state, label, live CPU and memory, and what runs there.
@@ -1782,7 +1955,7 @@ function vMachine(n) {
       setHtml($("#md-head"), `<div class="row"><h1 class="grow">Server ${n}</h1>${pill(ms.kind, ms.text)}</div>
         <div class="sub">${r ? `${r.label ? `${esc(r.label)} · ` : ""}up ${ago(st.now - r.started)}${whereAndHowFar(r) ? ` · ${whereAndHowFar(r)}` : ""}${r.replacing ? " · a fresh server is starting to take over" : ""}`
           : (st.starting ?? []).includes(n) ? "A server is being started for this slot." : leavingSlot(n) ? "On its way out."
-          : known ? "Not checking in right now; the charts show what it sent earlier." : "No server has used this slot recently."}</div>`);
+          : known ? "Not checking in right now; the charts show what it sent earlier." : "No server has used this slot recently."}</div>${serverFacts(r)}`);
       const apps = st.projects.flatMap((p) => p.placed.filter((x) => x.machine === n).map((x) => ({ p, x })));
       setHtml($("#md-apps"), table(["App", "Replica", "Version", "State"], apps.map(({ p, x }) => {
         const s = r?.projects[keyOn(p, n, x.replica)];
@@ -2006,6 +2179,7 @@ function route() {
     : a === "apps" ? vApps()
     : a === "machines" && b ? vMachine(Number(b))
     : a === "machines" ? vMachines()
+    : a === "activity" ? vActivity()
     : a === "metrics" ? vMetrics()
     : a === "fleet" ? vFleet()
     : a === "guide" ? vGuide()
@@ -2020,7 +2194,7 @@ function route() {
     if (tr && !e.target.closest("a,button,input,select")) location.hash = tr.dataset.href;
     view.click?.(e);
   };
-  const sec = ["apps", "machines", "metrics", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
+  const sec = ["apps", "machines", "activity", "metrics", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
   for (const link of $$("nav.tabs a")) {
     if (link.dataset.nav === sec) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");

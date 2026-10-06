@@ -19,8 +19,11 @@
 #   runnerctl join-token             the token another host joins with (see /install.sh)
 #   runnerctl move <name> <from> [to] [replica]  move one copy of a project off a machine (new copy first, old one removed once
 #                                    healthy); with two copies there, say which replica
-#   runnerctl evict <machine>        move every placed project off a machine
-#   runnerctl rebalance on|off       automatic rebalancing (hot or overloaded machines move a project off)
+#   runnerctl evict <machine> [--force]  move every placed project off a machine (apps already changing as much as
+#                                    they may wait for later, unless forced)
+#   runnerctl events [n] [kinds]     the last n events (default 30), newest last: what moved, left or went dark and why;
+#                                    kinds narrows them, e.g. move-start,depart,alert
+#   runnerctl rebalance on|off       automatic moves (hot servers, failing copies, doubled-up copies)
 #   runnerctl retire <machine>       retire an empty slot: delete its tunnel and <app>-n names
 # The admin password (the fleet owner's: locked apps and fleet changes need it, nothing else does) comes from
 # $ADMIN_PASSWORD or ~/.config/runnerctl/admin-password.
@@ -131,7 +134,8 @@ PY
   pool) [ $# -eq 2 ] || usage; api /settings -X PUT -d "{\"pools\": {\"$1\": $2}}" | jq . ;;
   join-token) api /join-token | jq -r .token ;;
   move) [ $# -ge 2 ] || usage; api "/projects/$1/move?from=$2${3:+&to=$3}${4:+&replica=$4}" -X POST | jq -c '.placed' ;;
-  evict) [ $# -eq 1 ] || usage; api "/machines/$1/evict" -X POST | jq . ;;
+  evict) [ $# -ge 1 ] || usage; api "/machines/$1/evict$([ "${2:-}" = --force ] && echo '?force=1')" -X POST | jq . ;;
+  events) api "/events?limit=${1:-30}${2:+&kinds=$2}" | jq -r '.events | reverse | .[] | "\(.t / 1000 | strflocaltime("%m-%d %H:%M"))  \(.text)"' ;;
   rebalance) case ${1:-} in on) v=true ;; off) v=false ;; *) usage ;; esac; api /settings -X PUT -d "{\"rebalance\": $v}" | jq . ;;
   retire) [ $# -eq 1 ] || usage; api "/slots/$1" -X DELETE | jq . ;;
   *) usage ;;

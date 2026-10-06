@@ -19,7 +19,7 @@ declare -A LOAD=([1]="80 80" [2]="10 20" [3]="30 40" [4]="20 30" [5]="5 10")
 declare -A REPORT
 sync() { # machine: reports every copy it was told to run as healthy from the next check-in on
   local m=$1 l=(${LOAD[$1]}) res
-  res=$(curl -s -X POST $B/api/sync -H 'authorization: Bearer node' "${J[@]}" -d "{\"machine\":$m,\"run\":\"r$m\",\"agent\":\"agent-r$m\",\"pool\":\"main\",\"started\":$START,\"ready\":true,\"status\":${REPORT[$m]:-{\}},\"metrics\":{\"live\":{\"t\":$(date +%s%3N),\"h\":{\"cpu\":${l[0]},\"memUsed\":${l[1]},\"memTotal\":100},\"a\":{}}}}")
+  res=$(curl -s -X POST $B/api/sync -H 'authorization: Bearer node' "${J[@]}" -d "{\"machine\":$m,\"run\":\"r$m\",\"agent\":\"agent-r$m\",\"pool\":\"main\",\"starts\":false,\"started\":$START,\"ready\":true,\"status\":${REPORT[$m]:-{\}},\"metrics\":{\"live\":{\"t\":$(date +%s%3N),\"h\":{\"cpu\":${l[0]},\"memUsed\":${l[1]},\"memTotal\":100},\"a\":{}}}}")
   REPORT[$m]=$(echo "$res" | jq -c '[.desired | to_entries[] | {key, value: {v: .value.v, s: "healthy"}}] | from_entries')
   echo "$res"
 }
@@ -49,6 +49,7 @@ check "replica 6 is on 3 now, with moved ports, while the old copy leaves" "6@3*
 tick; tick
 check "the old copy is dropped once machine 3 reports it healthy" "4,6" "$(onMachine web 3)"
 check "machine 5 runs only replica 1 now" "1" "$(onMachine web 5)"
+sleep 3; tick # DNS follows the new copy 2 s after it's healthy; then the old copy goes and the move is over
 echo "== 'move apps off' machine 2 moves both of its copies, by replica"
 check "evict names both copies" '["web (replica 7)","web (replica 2)"]' "$(curl -s -X POST $B/api/machines/2/evict -H "$A" | jq -c '.moved | sort | reverse')"
 tick; tick

@@ -18,7 +18,7 @@ MACHINES="1 2 3 4"
 sync() { # machine [leaving]
   local m=$1 l=(${LOAD[$1]}) res
   res=$(curl -s -X POST $B/api/sync -H 'authorization: Bearer node' -H content-type:application/json -d "{\"machine\":$m,\"run\":\"r$m\",\"agent\":\"agent-r$m\",\"pool\":\"main\",\"started\":$START,\"ready\":true,\"status\":${REPORT[$m]:-{\}},\"leaving\":${2:-false},\"metrics\":{\"live\":{\"t\":$(date +%s%3N),\"h\":{\"cpu\":${l[0]},\"memUsed\":${l[1]},\"memTotal\":100},\"a\":{}}}}")
-  if echo "$res" | jq -e '.desired.web' >/dev/null; then REPORT[$m]='{"web":{"v":1,"s":"healthy"}}'; else REPORT[$m]='{}'; fi
+  REPORT[$m]=$(echo "$res" | jq -c '[.desired // {} | to_entries[] | {key, value: {v: .value.v, s: "healthy"}}] | from_entries')
 }
 tick() { for m in $MACHINES; do sync $m; done; }
 show() { curl -s $B/api/status | jq -c '.projects[] | {name, replicas, placed:[.placed[] | "r\(.replica)@m\(.machine)\(if .leaving then " (leaving→m\(.leaving.to))" else "" end)"]}'; }
@@ -32,7 +32,7 @@ echo "== down to 1: the highest numbers go:"; put web '{"port":8080,"dockerfile"
 m=$(machineOf 1)
 echo "== move replica 1 off machine $m: the new copy is replica 1 too:"; curl -s -X POST "$B/api/projects/web/move?from=$m" -H "$A" >/dev/null; show
 echo "-- the new copy is starting: replica 1's URL stays on the old one:"; tick; routes
-echo "-- the new copy reports healthy: the old one is dropped and the URL follows:"; tick; show; routes
+echo "-- the new copy reports healthy: the URL follows, then the old one is dropped:"; tick; sleep 3; tick; show; routes
 m=$(machineOf 1)
 echo "== machine $m leaves for good and machine 5 joins the pool: replica 1 goes to the best machine, same number:"
 join e 5; MACHINES=$(echo 1 2 3 4 5 | tr ' ' '\n' | grep -vx "$m" | tr '\n' ' '); sync $m true; tick; tick; show; routes

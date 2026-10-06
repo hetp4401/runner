@@ -53,6 +53,7 @@ async function readHost() {
     at: performance.now(),
     cpuTotal: cpu.reduce((a, b) => a + b, 0),
     cpuIdle: cpu[3] + cpu[4], // idle + iowait
+    cpuSteal: cpu[7] ?? 0, // time the hypervisor gave to other guests
     memTotal: mem.MemTotal ?? 0,
     memAvail: mem.MemAvailable ?? mem.MemFree ?? 0,
     diskRead: rsect * 512,
@@ -68,6 +69,7 @@ function hostSample(a, b) {
   const dt = b.cpuTotal - a.cpuTotal;
   return {
     cpu: dt > 0 ? 100 - (100 * (b.cpuIdle - a.cpuIdle)) / dt : 0,
+    steal: dt > 0 ? (100 * Math.max(0, b.cpuSteal - a.cpuSteal)) / dt : 0, // part of cpu that wasn't this machine's own work
     memUsed: b.memTotal - b.memAvail,
     memTotal: b.memTotal,
     diskRead: rate("diskRead"),
