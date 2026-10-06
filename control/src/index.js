@@ -1504,7 +1504,11 @@ export class Control {
         }
         // (A lost stateful copy is never just dropped: it's rebuilt elsewhere first, see lostMove.)
         const why = !p ? "removed" : !p.enabled ? "disabled" : extra ? "replicas" : lost && !spec.policy.stateful ? "gone" : null;
-        if (why === "gone") this.alert("grace", { machine: x.machine }, `server ${x.machine} is gone and no replacement took its slot in time: its copies are placed elsewhere`, now);
+        if (why === "gone") {
+          const left = [...this.runs.values()].filter((r) => r.machine === x.machine).sort((a, b) => b.seen - a.seen)[0]?.left;
+          this.alert("grace", { machine: x.machine }, left ? `server ${x.machine} was stopped before it could hand over: its copies are placed elsewhere`
+            : `server ${x.machine} is gone and no replacement took its slot in time: its copies are placed elsewhere`, now);
+        }
         if (why) {
           this.dropCopy(name, x.machine, x.replica, why, now);
           if (why === "replicas" && cut !== Infinity) this.lastCut.set(name, now);
@@ -2872,6 +2876,11 @@ export class Control {
     return Boolean(r.drain) || this.rolled(r) || Boolean(d && now >= d) || this.pulled.has(r.id);
   }
 
+  // Due only because a roll asked for it (nothing of its own: no drain, not past its due time, not pulled forward).
+  rollOnly(r, now) {
+    return this.rolled(r) && !r.drain && !this.pulled.has(r.id) && !(this.dueAt(r) && now >= this.dueAt(r));
+  }
+
   urgent(r, now) {
     return Boolean(r.deadline) && r.deadline - now < URGENT_MS;
   }
@@ -2937,8 +2946,7 @@ export class Control {
     if (inFlight.length >= 3) return out("3 servers are leaving already");
     // A roll replaces healthy servers on request (after an agent update, say), with no deadline behind it: one server
     // at a time fleet-wide, as it always has. Servers due for their own reasons don't wait for it.
-    const rollOnly = (x) => this.rolled(x) && !x.drain && !this.pulled.has(x.id) && !(this.dueAt(x) && now >= this.dueAt(x));
-    const rollWaits = (x) => rollOnly(x) && inFlight.length > 0;
+    const rollWaits = (x) => this.rollOnly(x, now) && inFlight.length > 0;
     const poolBusy = (x) => inFlight.some((y) => (y.pool ?? null) === (x.pool ?? null));
     const busyApp = (x) => [...this.copies].find(([name, list]) => list.some((c) => c.machine === x.machine && !c.leaving) && !this.mayTransition(name, now))?.[0];
     const carriesBusyApp = (x) => Boolean(busyApp(x));
@@ -2992,7 +3000,8 @@ export class Control {
       else {
         const w = this.dueWait.get(r.id) ?? this.dueWait.set(r.id, { since: now }).get(r.id);
         w.why = g.wait;
-        if (now - w.since >= 20 * MIN) this.alert("departure-waiting", { machine: r.machine }, `server ${r.machine} has been due to leave for ${Math.round((now - w.since) / MIN)} minutes: ${g.wait}`, now);
+        // (A roll takes hours by design: its waits aren't news.)
+        if (now - w.since >= 20 * MIN && !this.rollOnly(r, now)) this.alert("departure-waiting", { machine: r.machine }, `server ${r.machine} has been due to leave for ${Math.round((now - w.since) / MIN)} minutes: ${g.wait}`, now);
       }
       return false;
     }

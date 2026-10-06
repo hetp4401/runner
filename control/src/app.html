@@ -659,8 +659,17 @@ function problems() {
   if (st.rebalance.state === "paused") out.push({ kind: "failed", href: "#/activity", text: `Automatic moves are paused until ${clock(st.rebalance.paused)}: they looked like thrashing` });
   for (const c of st.departures?.capped ?? []) out.push({ kind: "deploying", href: "#/activity", text: `Pool ${c.pool} can't start servers right now: its departures move apps out first` });
   // What automation gave up on in the last 2 hours (dark replicas, the pause and capped pools have their own lines while they last).
+  // The newest alert per cause and subject; more than 3 of one cause are one line (a roll's waits, say).
+  const seenAlert = new Set(), byCause = new Map();
   for (const a of (st.alerts ?? []).filter((x) => st.now - x.t < 2 * 3600_000 && !["dark", "paused", "capped"].includes(x.cause))) {
-    out.push({ kind: "failed", href: a.app ? appHref(a.app) : a.machine ? machineHref(a.machine) : "#/activity", text: `${ago(st.now - a.t)} ago: ${a.text}` });
+    const key = `${a.cause}|${a.app ?? ""}|${a.machine ?? ""}`;
+    if (seenAlert.has(key)) continue;
+    seenAlert.add(key);
+    (byCause.get(a.cause) ?? byCause.set(a.cause, []).get(a.cause)).push(a);
+  }
+  for (const list of byCause.values()) {
+    if (list.length > 3) out.push({ kind: "failed", href: "#/activity", text: `${list.length} alerts like this one in the last 2 hours (${ago(st.now - list[0].t)} ago): ${list[0].text}` });
+    else for (const a of list) out.push({ kind: "failed", href: a.app ? appHref(a.app) : a.machine ? machineHref(a.machine) : "#/activity", text: `${ago(st.now - a.t)} ago: ${a.text}` });
   }
   const short = st.pools.reduce((n, x) => n + Math.max(0, x.size - x.live), 0); // the servers the fleet should have that aren't up
   const starting = (st.starting ?? []).length;
