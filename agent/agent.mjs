@@ -17,7 +17,7 @@
 //   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then: the control plane plans
 //                 its departure before that. Without it, the machine has no deadline.
 import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import * as fsp from "node:fs/promises";
 import http from "node:http";
@@ -35,6 +35,7 @@ const METRICS_PORT = ROUTER_PORT + 1; // the tunnel's own metrics (its live edge
 const dir = `${base}/projects`;
 const routerDir = `${base}/router`;
 const MANIFEST = ".runner-files"; // in each project's folder: the files the agent wrote there last time
+const BUILT = ".runner-built"; // and a hash of the files its containers were last brought up from
 let machine = 0; // the slot, from the control plane
 let tunnelToken = "";
 let agent = "";
@@ -145,9 +146,17 @@ async function apply(name, want, { recreate = false } = {}) {
     }
     await writeFile(`${projectDir}/${MANIFEST}`, JSON.stringify(paths));
     await writeFile(file, want.compose);
+    // Compose recreates a container whose configuration changed, but an image rebuilt from changed files has been seen
+    // to leave the old container running. So when the files differ from the ones the containers were last brought up
+    // from here, every container is made anew.
+    const built = createHash("sha256").update(JSON.stringify([...paths].sort().map((path) => [path, want.files[path]]))).digest("hex");
+    const builtBefore = await readFile(`${projectDir}/${BUILT}`, "utf8").catch(() => "");
+    const fresh = recreate || (builtBefore !== "" && builtBefore !== built);
+    if (fresh && !recreate) log(`${name}: its files changed, so its containers are made anew`);
     // --wait fails if a container won't stay up.
     const up = await sh("docker", ["compose", "-p", name, "-f", file, "up", "-d", "--build", "--remove-orphans",
-      "--wait", "--wait-timeout", "300", ...(recreate ? ["--force-recreate"] : [])]);
+      "--wait", "--wait-timeout", "300", ...(fresh ? ["--force-recreate"] : [])]);
+    if (up.ok) await writeFile(`${projectDir}/${BUILT}`, built);
     if (!up.ok) [s, e] = ["failed", up.out.split("\n").slice(-6).join("\n").slice(-600)];
     else if (want.port && !(await answers(name, 60))) [s, e] = ["failed", `nothing answers on port ${want.port} through the router`];
     if (s === "healthy" && paths.length) sh("docker", ["image", "prune", "-f"]); // layers of earlier builds, so the disk doesn't fill up

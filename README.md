@@ -129,7 +129,7 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 - **Agent** ([`agent/agent.mjs`](agent/agent.mjs)), on every machine (run by [`machine.yml`](.github/workflows/machine.yml) on GitHub Actions, by `install.sh` on a host). It's configured by environment variables (listed at the top of the file) and:
   - checks in every 20 seconds, describing its machine: pool, label, whether it starts machines, and keeps one request open at `/api/wake` so the control plane can ask it to check in at once
   - streams a copy's logs to the control plane while someone watches them (`agent/ws.mjs` is its WebSocket client)
-  - writes each project's files and runs `docker compose up -d --build --wait`; a project that fails is tried again (every 30 seconds while the machine is starting up, every 3 minutes once it's online), and a project that stops answering is recreated
+  - writes each project's files and runs `docker compose up -d --build --wait` (with `--force-recreate` when the files changed since its containers were last brought up there: compose has been seen to keep an old container running after its image was rebuilt); a project that fails is tried again (every 30 seconds while the machine is starting up, every 3 minutes once it's online), and a project that stops answering is recreated
   - opens its tunnel only once every project it was given is up and answering (or after 10 minutes), so a fresh machine never takes traffic it can't serve
   - removes what's no longer wanted
   - routes each replica's name, `<project>-<k>`, through a local Caddy router behind the tunnel (the visitor's address and the https scheme reach the app as `X-Forwarded-*`)
