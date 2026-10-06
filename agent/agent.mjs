@@ -16,7 +16,7 @@
 //                 handover restarts the agent (where it runs under a supervisor, it comes back with the latest code)
 //   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then: the control plane plans
 //                 its departure before that. Without it, the machine has no deadline.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import * as fsp from "node:fs/promises";
@@ -451,6 +451,7 @@ let leaving = false; // telling the control plane this run is going away for goo
 async function shutdown(reason, code = 0) {
   if (stopping) return;
   stopping = true;
+  for (const stop of streams.values()) stop(); // (live logs: their docker processes end with them)
   log(`${reason}; stopping the tunnel`);
   // Under a supervisor (Docker's restart policy, say) the agent comes back with the same slot.
   await sh("docker", ["stop", "-t", "10", "tunnel"]);
@@ -467,9 +468,103 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
+// The control plane can't call a machine, only answer it. So that "check in now" (someone is waiting on this
+// machine: its logs, say) doesn't wait a whole check-in interval, the agent keeps one request open at /api/wake,
+// which the control plane holds for up to 45 s and answers at once when it wants something. A control plane without
+// it (404) ends the loop.
+let wakeNow = null; // ends the current wait between check-ins
+let wakePending = false; // a wake that came while no wait was going on: the next one ends at once
+const nap = (ms) => new Promise((resolve) => {
+  if (wakePending) {
+    wakePending = false;
+    return resolve();
+  }
+  const done = () => {
+    clearTimeout(timer);
+    wakeNow = null;
+    resolve();
+  };
+  const timer = setTimeout(done, ms);
+  wakeNow = done;
+});
+async function wakeLoop() {
+  while (!stopping && !leaving) {
+    try {
+      const res = await fetch(`${env.CONTROL_URL}/api/wake?run=${encodeURIComponent(run)}`, {
+        headers: { authorization: `Bearer ${env.JOIN_TOKEN}` }, signal: AbortSignal.timeout(75_000),
+      });
+      if (res.status === 404) return;
+      const body = await res.json().catch(() => ({}));
+      if (body.wake) {
+        if (wakeNow) wakeNow();
+        else wakePending = true;
+      } else if (!res.ok) await sleep(30_000);
+    } catch {
+      await sleep(15_000);
+    }
+  }
+}
+
+// Live logs of a copy someone is watching (the control plane names the session in a check-in, having woken the agent):
+// `docker compose logs --follow` of the copy's containers, the last `tail` lines first, sent to the control plane as
+// they come, in whole lines at most every quarter second, over a WebSocket the agent opens. It stops when the viewer
+// leaves (the control plane closes the socket) or the containers go. At most 4 at once. Without ws.mjs (an install
+// from before live logs) the agent just doesn't stream.
+const wsClient = import("./ws.mjs").catch(() => null);
+const streams = new Map(); // session -> stop()
+function streamLogs(wanted) {
+  for (const w of Array.isArray(wanted) ? wanted : []) {
+    const session = String(w?.session ?? "");
+    const key = String(w?.key ?? "");
+    if (!/^[0-9a-f-]{36}$/.test(session) || streams.has(session) || streams.size >= 4 || !projects.has(key)) continue;
+    streams.set(session, () => {});
+    (async () => {
+      const ws = await wsClient;
+      if (!ws) throw new Error("this install has no ws.mjs");
+      const conn = await ws.connect(`${env.CONTROL_URL}/api/logs/stream?session=${session}&run=${encodeURIComponent(run)}`, { authorization: `Bearer ${env.JOIN_TOKEN}` });
+      const tail = Math.max(0, Math.min(1000, Number(w.tail) || 200));
+      const child = spawn("docker", ["compose", "-p", key, "-f", `${dir}/${key}/compose.yaml`, "logs", "--follow", "--no-color", "--timestamps", "--tail", String(tail)],
+        { env: cleanEnv, stdio: ["ignore", "pipe", "pipe"] });
+      let pending = "";
+      let timer = null;
+      const flush = (all = false) => {
+        clearTimeout(timer);
+        timer = null;
+        const cut = all ? pending.length : pending.lastIndexOf("\n") + 1;
+        if (!cut) return;
+        const out = pending.slice(0, cut);
+        pending = pending.slice(cut);
+        if (!conn.send(out)) { // backed up: wait for the socket before reading more
+          child.stdout.pause();
+          child.stderr.pause();
+          conn.socket.once("drain", () => { child.stdout.resume(); child.stderr.resume(); });
+        }
+      };
+      const take = (d) => {
+        pending += d;
+        if (pending.length > 64_000) flush(true);
+        else timer ??= setTimeout(flush, 250);
+      };
+      child.stdout.setEncoding("utf8").on("data", take);
+      child.stderr.setEncoding("utf8").on("data", take);
+      child.on("error", () => conn.close());
+      child.on("close", () => {
+        flush(true);
+        conn.close();
+      });
+      streams.set(session, () => conn.close());
+      await new Promise((resolve) => conn.onEnd(() => {
+        child.kill();
+        resolve();
+      }));
+    })().catch((e) => log(`live logs of ${key}: ${e.message}`)).finally(() => streams.delete(session));
+  }
+}
+
 async function main() {
   await mkdir(dir, { recursive: true });
   await join();
+  wakeLoop();
   log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}${pool ? `, pool ${pool}` : ""}`);
   // Left from before a restart, maybe.
   await sh("docker", ["rm", "-f", "router", "tunnel"]);
@@ -505,6 +600,7 @@ async function main() {
         updateRouter();
       }
       reconcile(plan.desired);
+      streamLogs(plan.logs);
       if (!cleaned) {
         cleaned = true;
         await removeLeftovers(plan.desired);
@@ -542,7 +638,7 @@ async function main() {
       const summary = [...projects].map(([name, p]) => `${name} v${p.v} ${p.s}`).join(", ") || "no projects";
       log(`${ready ? "online" : "starting"}: ${summary}`);
     }
-    await sleep((plan?.poll ?? 20) * 1000);
+    await nap((plan?.poll ?? 20) * 1000);
   }
 }
 

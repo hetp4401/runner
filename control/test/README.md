@@ -15,6 +15,7 @@ control/test/clashes.sh     # port and container-name clashes in placement, repl
 control/test/doubling.sh    # more replicas than machines: second copies with moved ports, their routes, moves by replica (ok/WRONG)
 control/test/env.sh         # an app's env variables and each copy's .env
 control/test/gap.sh         # a gap in check-ins isn't machines dying
+control/test/logs.sh        # live logs: passwords, the wake-up, the agent's stream to the viewer, hidden env values (ok/WRONG)
 ```
 
 They need Node 24 (`node:sqlite`), `jq` and `curl`, and use ports 8911 (control plane, started by `start.sh`) and 8790 (mock).

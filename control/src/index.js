@@ -30,7 +30,7 @@
 //                                 here rather than in the compose file, which everyone can read. A change is a new version.
 //                                            /admin/api/*  the same, for the UI (changes from other sites are refused)
 //   /admin, /metrics  redirect to the app      /api/metrics  machine and app metrics (no token needed)
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import YAML from "yaml";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
@@ -60,7 +60,7 @@ const MAX_ENV_VALUE = 8192;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const STANDALONE_HOLD_MS = 30 * 60_000; // a standalone machine that drops out keeps its slot this long, so a restart gets the same one
 const DNS_COMMENT = "runner fleet"; // on the DNS records this makes, so they can be told apart in the zone
-// Where machines that join with install.sh get the agent's code: a URL serving agent.mjs and metrics.mjs (AGENT_URL).
+// Where machines that join with install.sh get the agent's code: a URL serving agent.mjs, metrics.mjs and ws.mjs (AGENT_URL).
 const DEFAULT_AGENT_URL = "https://raw.githubusercontent.com/hetp4401/runner/main/agent";
 const NUMBERED = /-m?\d+$/; // <project>-<k> is replica k's URL and <project>-m<n> machine n's, so no project name ends like that
 const MAX_REPLICAS = 50; // as many as the fleet can have machines; with more replicas than machines, machines run two or more copies
@@ -94,6 +94,11 @@ const SICK_DRAIN_GAP_MS = 30 * 60_000; // at most one sick server per pool is as
 const HOT_DEST_MS = 30 * 60_000; // a server that took a hot move isn't a hot move's destination again for this long
 const PAUSE_MS = 60 * 60_000; // the thrash breaker pauses automatic moves this long
 const DEFAULT_CPUS = 4; // cores assumed for a server whose agent doesn't say
+// Logs are streamed from a copy's server while someone watches them, and never kept (see openLogSession).
+const LOG_TAIL = 200; // lines of each container's log a stream starts with
+const LOG_CONNECT_MS = 30_000; // a session's viewer connects within this long, or it's dropped
+const LOG_SESSIONS_MAX = 50; // watched at once, fleet-wide
+const WAKE_HOLD_MS = 45_000; // an agent's open /api/wake request is answered after this long if nothing's wanted
 // Metrics: agents send one summary per machine per minute; the fleet's minute is stored as one row (few writes),
 // and rolled up into 10-minute rows for the day view
 const MIN = 60_000;
@@ -521,7 +526,7 @@ docker run -d --name runner-agent --restart unless-stopped --stop-timeout 180 --
     set -e
     apk add --no-cache nodejs >/dev/null
     mkdir -p /agent && cd /agent
-    for f in agent.mjs metrics.mjs; do wget -qO $f ${agentUrl}/$f; done
+    for f in agent.mjs metrics.mjs ws.mjs; do wget -qO $f ${agentUrl}/$f; done
     exec node agent.mjs'
 echo "Joined. Follow it with: docker logs -f runner-agent"
 `;
@@ -704,6 +709,8 @@ export class Control {
     this.dueWait = new Map(); // run -> { since, why }: a due departure waiting at its gate
     this.handoverTimes = []; // [{ t, machine, queue, build, overlap }] (ms), the last 24 hours
     this.webhookLog = []; // when alerts were last posted to ALERT_WEBHOOK (at most 30 an hour)
+    this.logSessions = new Map(); // id -> { name, replica, machine, key, created, viewer, agent, run, waiting }: logs being watched
+    this.wakers = new Map(); // run -> wake(woken): its agent's open /api/wake request
     this.recentEvents = this.all("SELECT * FROM events ORDER BY id DESC LIMIT 200").reverse(); // the newest, for the pages
     this.slots = new Map(this.all("SELECT n, tunnel, token FROM slots").map((x) => [x.n, x])); // slot -> its tunnel
     this.agents = new Map(this.all("SELECT * FROM agents").map((a) => [a.id, a])); // agent -> the slot it last had
@@ -1001,6 +1008,7 @@ export class Control {
       return json({ start: this.claimStarts(pool, "claim", Date.now()) });
     }
     if (method === "POST" && route === "/drain") return need(node, "the join token"), json(this.drain(await body()));
+    if (method === "GET" && route === "/wake") return need(node, "the join token"), json(await this.wait(url.searchParams.get("run")));
     if (method === "POST" && route === "/roll") return need(admin || node, "the admin password or the join token"), json(this.roll(url.searchParams.get("machine")));
     if (method === "DELETE" && route === "/roll") return need(admin, "the admin password"), json(this.cancelRoll());
     if (method === "GET" && route === "/join-token") return need(admin), json({ token: this.env.JOIN_TOKEN });
@@ -1036,7 +1044,7 @@ export class Control {
     // Apps are open: anyone can look, deploy a new one, change or remove one. Unless it's locked: a "password" sent
     // with a new app (or set later at /password) locks it, and changing it then needs that password (x-app-password)
     // or the admin password.
-    const m = route.match(/^\/projects\/([^/]+)(?:\/(enable|disable|move|unlock|password|env))?$/);
+    const m = route.match(/^\/projects\/([^/]+)(?:\/(enable|disable|move|unlock|password|env|logs))?$/);
     if (m) {
       const [, name, action] = m;
       if (!action && method === "GET") return json(this.getProject(name, url.searchParams.get("version")));
@@ -1068,6 +1076,12 @@ export class Control {
         } else if (adminWrong) throw new HttpError(401, "wrong admin password");
       }
       if (action === "unlock" && method === "POST") return json({ ok: true });
+      // Logs can hold secrets and other people's data: watching them needs the app's password, or the admin password
+      // (an app without a password of its own: the admin password).
+      if (action === "logs" && method === "POST") {
+        if (!admin && !this.appPasswords.has(name)) throw new HttpError(401, `${name} has no app password, so its logs need the admin password`);
+        return json(this.openLogSession(name, Number(url.searchParams.get("replica") ?? 1), Date.now()));
+      }
       if (action === "password" && method === "PUT") {
         this.project(name);
         this.saveAppPassword(name, secret);
@@ -2555,6 +2569,87 @@ export class Control {
     return Boolean(size) && new Set(this.liveRuns(now).filter((r) => r.pool === pool).map((r) => r.machine)).size < size;
   }
 
+  // ---- logs ----
+  // Watching a replica's logs: a session, opened with the app's password or the admin password. Its viewer connects
+  // (a WebSocket), which wakes the copy's server (see wait); the server's next check-in names the session, and its
+  // agent connects its own WebSocket and sends the copy's log lines as they come (the last LOG_TAIL first). The control
+  // plane passes them on, with the app's env values blanked out, and keeps nothing. Either side leaving ends it.
+  openLogSession(name, k, now) {
+    this.project(name);
+    const copies = this.copiesOf(name).filter((x) => x.replica === k);
+    const x = copies.find((y) => !y.leaving) ?? copies[0];
+    if (!x) throw new HttpError(404, `replica ${k} of ${name} has no copy`);
+    for (const [id, s] of this.logSessions) if (!s.viewer && now - s.created > LOG_CONNECT_MS) this.logSessions.delete(id);
+    if (this.logSessions.size >= LOG_SESSIONS_MAX) throw new HttpError(429, "too many logs are being watched; try again in a minute");
+    const id = randomUUID();
+    this.logSessions.set(id, { id, name, replica: k, machine: x.machine, key: x.key, created: now, viewer: null, agent: null, run: null, waiting: null });
+    return { session: id, machine: x.machine, key: x.key };
+  }
+
+  // A viewer connected: ask the copy's server to stream (it's woken, so that's its next check-in, within seconds).
+  attachLogViewer(id, sock) {
+    const s = this.logSessions.get(id);
+    if (!s || s.viewer) return sock.close(4404, "no such session");
+    s.viewer = sock;
+    sock.onClose(() => this.endLogSession(id, null));
+    const say = (t, text) => sock.send(JSON.stringify({ t, text }));
+    const runs = this.liveRuns(Date.now()).filter((r) => r.machine === s.machine);
+    if (!runs.length) say("info", `server ${s.machine} isn't checking in right now; waiting for it`);
+    else say("info", `asking server ${s.machine} to stream ${s.name} replica ${s.replica}`);
+    for (const r of runs) this.wakers.get(r.id)?.(true);
+    s.waiting = setTimeout(() => {
+      if (this.logSessions.get(id) === s && !s.agent) say("info", `server ${s.machine} hasn't started streaming: its agent may be older than live logs (servers get the new one as they're replaced)`);
+    }, 25_000);
+  }
+
+  // The copy's agent connected: from now on its messages (log text) go to the viewer.
+  attachLogAgent(id, run, sock) {
+    const s = this.logSessions.get(String(id ?? ""));
+    if (!s || !s.viewer || s.agent) return sock.close(4404, "no such session");
+    s.agent = sock;
+    s.run = String(run ?? "");
+    clearTimeout(s.waiting);
+    const secrets = [...(this.appEnv.get(s.name)?.values() ?? [])].flatMap((v) => [v, ...v.split("\n")]).filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
+    const hide = (text) => secrets.reduce((t, v) => (t.includes(v) ? t.split(v).join("[hidden]") : t), text);
+    s.viewer.send(JSON.stringify({ t: "open", text: `streaming from server ${s.machine}` }));
+    sock.onMessage((text) => {
+      if (this.logSessions.get(s.id) === s && typeof text === "string") s.viewer.send(JSON.stringify({ t: "log", text: hide(text) }));
+    });
+    sock.onClose(() => this.endLogSession(s.id, `server ${s.machine} stopped streaming`));
+  }
+
+  // One side left (why: the viewer's last message, null when the viewer is the one who left): the other is closed.
+  endLogSession(id, why) {
+    const s = this.logSessions.get(id);
+    if (!s) return;
+    this.logSessions.delete(id);
+    clearTimeout(s.waiting);
+    if (why && s.viewer) s.viewer.send(JSON.stringify({ t: "end", text: why }));
+    s.viewer?.close(1000, "");
+    s.agent?.close(1000, "");
+  }
+
+  isJoinToken(header) {
+    return Boolean(this.env.JOIN_TOKEN) && header === `Bearer ${this.env.JOIN_TOKEN}`;
+  }
+
+  // An agent waiting to be told to check in now (it keeps this request open, so it hears at once when someone's
+  // waiting on its server): answered with { wake: true } when that happens, else { wake: false } after WAKE_HOLD_MS.
+  wait(runId) {
+    const run = String(runId ?? "");
+    if (!run) throw new HttpError(400, "run is required");
+    this.wakers.get(run)?.(false); // an earlier wait of the same run ends
+    return new Promise((resolve) => {
+      const done = (wake) => {
+        clearTimeout(timer);
+        if (this.wakers.get(run) === done) this.wakers.delete(run);
+        resolve({ wake });
+      };
+      const timer = setTimeout(() => done(false), WAKE_HOLD_MS);
+      this.wakers.set(run, done);
+    });
+  }
+
   // ---- cold replicas, churn, departures (for the pages) ----
 
   // Replica k is lit while a live run of its server reports its copy healthy and ready, with the run's tunnel connected
@@ -2786,9 +2881,13 @@ export class Control {
     this.cleanup(now);
     const older = r.retire ? null : this.predecessorOf(r, now);
     const desired = r.retire ? {} : this.desiredFor(r.machine, older ? r : null);
+    // Logs someone's waiting to watch, of copies this run has: the agent streams them (see openLogSession).
+    const logs = r.retire ? [] : [...this.logSessions.values()].filter((x) => x.viewer && !x.agent && x.machine === r.machine && x.key in (r.status ?? {}))
+      .map((x) => ({ session: x.id, key: x.key, tail: LOG_TAIL }));
     return {
       domain: this.env.DOMAIN,
       poll: this.pollS,
+      ...(logs.length ? { logs } : {}),
       desired,
       retire: Boolean(r.retire),
       handover,
@@ -3323,6 +3422,7 @@ export class Control {
 
   cleanup(now) {
     this.flushMetrics(now);
+    for (const [id, x] of this.logSessions) if (!x.viewer && now - x.created > LOG_CONNECT_MS) this.logSessions.delete(id);
     if (now - this.lastRollup > MIN) {
       this.lastRollup = now;
       this.rollupMetrics(now);

@@ -217,6 +217,7 @@
   .guide ol { margin: 4px 0; padding-left: 22px; }
   .guide code { font: 13px var(--mono); background: var(--soft); padding: 1px 4px; border-radius: 4px; overflow-wrap: anywhere; }
   .codebox { position: relative; margin: 8px 0; }
+  pre.logbox { border-radius: var(--r-md); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; height: min(55dvh, 520px); max-height: none; }
   .codebox pre.code { border-radius: var(--r-md); padding-right: 70px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .codebox.plain pre.code { padding-right: 12px; }
   .codebox button { position: absolute; top: 6px; right: 6px; }
@@ -366,12 +367,12 @@ const locked = (name) => S.status?.projects.find((x) => x.name === name)?.hasPas
 
 // Runs fn(secret) for a change: straight away when no password is needed, else once one has been typed into a sheet.
 // A wrong password keeps the sheet open to try again; cancelling gives null; any other failure is thrown to the caller.
-async function withPassword({ app = null, admin = false }, fn) {
+async function withPassword({ app = null, admin = false, why = null }, fn) {
   if (!admin && !(app && locked(app))) return fn({});
   let result, failure = null;
   const ok = await sheet({
     title: admin ? "Admin password" : `Password for ${app}`, ok: "Continue",
-    html: `<p class="meta">${admin ? "This changes the fleet, which takes the admin password (the fleet owner's)."
+    html: `<p class="meta">${why ? esc(why) : admin ? "This changes the fleet, which takes the admin password (the fleet owner's)."
       : `${esc(app)} has an app password. Changing it takes that password, or the admin password.`}</p>
       <label class="f" for="pw-in">Password</label><input id="pw-in" type="password" autocomplete="current-password" required>
       ${admin ? "" : `<label class="check"><input type="checkbox" id="pw-admin"> This is the admin password</label>`}`,
@@ -1549,8 +1550,92 @@ function vApps() {
   };
 }
 
-function vApp(name) {
+function vApp(name, q = new URLSearchParams()) {
   const st = { spec: null, shown: null, tab: null, version: null };
+  // Live logs: a password opens a session (kept here only while the viewer is open), then a WebSocket streams the
+  // replica's container output from its server, through the control plane, which keeps none of it. Leaving the page,
+  // closing the viewer or pausing ends the stream; resuming or switching replicas opens a new one.
+  const lg = { open: false, secret: null, replica: Number(q.get("logs")) || 1, ws: null, state: "", text: "", err: null, paused: false, ended: false };
+  const LOG_KEEP = 400_000; // characters kept on the page (the oldest go)
+  const stopStream = () => {
+    const ws = lg.ws;
+    lg.ws = null;
+    if (ws) { ws.onclose = null; ws.close(); }
+  };
+  const startStream = async (session = null) => {
+    stopStream();
+    Object.assign(lg, { text: "", ended: false, err: null, state: "opening…" });
+    renderLogs(true);
+    try {
+      session ??= (await api("POST", `/projects/${enc(name)}/logs?replica=${lg.replica}`, null, { secret: lg.secret })).session;
+    } catch (e) {
+      lg.err = e.message;
+      if (e.status === 401) Object.assign(lg, { open: false, secret: null });
+      return renderLogs(true);
+    }
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/admin/api/logs/${session}`);
+    lg.ws = ws;
+    ws.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.t === "log") {
+        lg.text += m.text;
+        if (lg.text.length > LOG_KEEP) lg.text = lg.text.slice(lg.text.indexOf("\n", lg.text.length - LOG_KEEP) + 1);
+      } else {
+        lg.state = m.text;
+        if (m.t === "end") lg.ended = true;
+      }
+      renderLogs();
+    };
+    ws.onclose = () => {
+      if (lg.ws !== ws) return;
+      lg.ws = null;
+      if (!lg.ended) lg.state = "the stream closed";
+      lg.ended = true;
+      renderLogs();
+    };
+  };
+  function renderLogs(fresh = false) {
+    const box = $("#ad-logs");
+    const p = S.status?.projects.find((x) => x.name === name);
+    if (!box || !p) return;
+    if (!lg.open) {
+      const pass = p.hasPassword ? "its app password, or the admin password" : "the admin password (it has no app password)";
+      setHtml(box, `<div class="card"><div class="row"><span class="grow meta">Live output of a replica's containers, streamed from its server while you watch (nothing is kept). Logs can hold secrets and other people's data, so they need ${esc(pass)}; the app's env values are hidden.</span>
+        <button type="button" data-act="logs-open">Show logs</button></div>${lg.err ? `<div class="errbox">${esc(lg.err)}</div>` : ""}</div>`);
+      return;
+    }
+    const reps = [...new Set(p.placed.map((x) => x.replica))].sort((a, b) => a - b);
+    if (!$("#ad-logbar")) {
+      setHtml(box, `<div class="row" id="ad-logbar" style="margin-bottom:8px"></div><pre class="code logbox" id="ad-logtext" tabindex="0" aria-label="Logs of ${esc(name)}"></pre>`);
+    }
+    const state = lg.err ?? (lg.paused ? "paused" : lg.state);
+    setHtml($("#ad-logbar"), `${reps.length > 1 ? `<span class="seg" role="group" aria-label="Replica">${reps.map((k) => `<button type="button" data-act="logs-rep" data-v="${k}" aria-pressed="${k === lg.replica}">#${k}</button>`).join("")}</span>` : `<b>Replica ${lg.replica}</b>`}
+      <span class="grow meta" aria-live="polite">${esc(state)}</span>
+      ${lg.ended && !lg.paused ? `<button type="button" class="small" data-act="logs-again">Reconnect</button>` : `<button type="button" class="small" data-act="logs-pause">${lg.paused ? "Resume" : "Pause"}</button>`}
+      <button type="button" class="small" data-act="logs-copy"${lg.text ? "" : " disabled"}>Copy</button>
+      <button type="button" class="small" data-act="logs-close">Close</button>`);
+    const el = $("#ad-logtext");
+    if (el.textContent !== lg.text) {
+      const stick = fresh || el.scrollTop + el.clientHeight >= el.scrollHeight - 8; // at the bottom: stay there
+      el.textContent = lg.text;
+      if (stick) el.scrollTop = el.scrollHeight;
+    }
+  }
+  const openLogs = async () => {
+    const p = S.status.projects.find((x) => x.name === name);
+    try {
+      const session = await withPassword({ app: name, admin: !p.hasPassword, why: `Logs can hold secrets and other people's data, so they need ${p.hasPassword ? `${name}'s app password, or the admin password` : "the admin password: this app has no password of its own"}.` },
+        async (secret) => { const r = await api("POST", `/projects/${enc(name)}/logs?replica=${lg.replica}`, null, { secret }); lg.secret = secret; return r.session; });
+      if (!session) return;
+      Object.assign(lg, { open: true, paused: false, err: null });
+      $("#ad-logs").innerHTML = "";
+      startStream(session);
+    } catch (e) {
+      lg.err = e.message;
+      renderLogs();
+    }
+  };
   const loadSpec = async (version) => {
     try {
       st.spec = await getSpec(name, version);
@@ -1576,8 +1661,11 @@ function vApp(name) {
   }
   return {
     title: name, wantsMetrics: true,
+    mount() { if (q.get("logs")) setTimeout(() => $("#ad-logs-h")?.scrollIntoView({ block: "start" })); },
+    unmount() { stopStream(); lg.secret = null; },
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
       <h2>Replicas</h2><div id="ad-replicas"></div>
+      <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
       <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div id="ad-charts"><div class="meta">Loading…</div></div>
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
       <h2>Versions</h2><div id="ad-versions"></div>`,
@@ -1637,6 +1725,7 @@ function vApp(name) {
           ${want > up && up ? `<div class="hint">${plural(up, "server")} up, so ${want - up === 1 ? "one server runs two copies" : `${want - up} servers run two copies`} (the least busy ones), each copy with its own URL.</div>` : ""}
           ${want !== p.replicas ? `<div class="hint">Saving makes a new version with the same files.</div>` : ""}</div>
         ${table(["Replica", "Server", "Version", "State", "URL", ""], rows)}`);
+      renderLogs();
       const versions = st.spec?.versions ?? [];
       setHtml($("#ad-versions"), table(["Version", "", "Port", "Replicas", "Created", ""], [...versions].reverse().map((v) => ({
         cls: v.version === st.shown ? "shown" : "",
@@ -1689,6 +1778,19 @@ function vApp(name) {
       if (act === "view") { await loadSpec(v); this.status(); return $("#ad-spec").scrollIntoView({ behavior: "smooth", block: "start" }); }
       if (act === "diff") return showDiff(name, v);
       if (act === "rollback") return rollback(name, v);
+      if (act === "logs-open") return openLogs();
+      if (act === "logs-close") { stopStream(); Object.assign(lg, { open: false, secret: null, text: "", err: null }); $("#ad-logs").innerHTML = ""; return renderLogs(); }
+      if (act === "logs-pause") {
+        lg.paused = !lg.paused;
+        if (lg.paused) { stopStream(); lg.ended = false; return renderLogs(); }
+        return startStream();
+      }
+      if (act === "logs-again") return startStream();
+      if (act === "logs-rep") { lg.replica = v; lg.paused = false; return startStream(); }
+      if (act === "logs-copy") {
+        try { await navigator.clipboard.writeText($("#ad-logtext").textContent); toast("Copied the logs"); } catch { toast("Couldn't copy", { kind: "failed" }); }
+        return;
+      }
       if (act === "copyfile") {
         const f = specFiles(st.spec).find(([path]) => path === st.tab);
         try { await navigator.clipboard.writeText(f[1]); toast(`Copied ${f[0]}`); } catch { toast("Couldn't copy", { kind: "failed" }); }
@@ -1974,11 +2076,12 @@ function vMachine(n) {
           : (st.starting ?? []).includes(n) ? "A server is being started for this slot." : leavingSlot(n) ? "On its way out."
           : known ? "Not checking in right now; the charts show what it sent earlier." : "No server has used this slot recently."}</div>${serverFacts(r)}`);
       const apps = st.projects.flatMap((p) => p.placed.filter((x) => x.machine === n).map((x) => ({ p, x })));
-      setHtml($("#md-apps"), table(["App", "Replica", "Version", "State"], apps.map(({ p, x }) => {
+      setHtml($("#md-apps"), table(["App", "Replica", "Version", "State", ""], apps.map(({ p, x }) => {
         const s = r?.projects[keyOn(p, n, x.replica)];
         const kind = x.leaving ? "leaving" : !r ? "gone" : runKind(s);
         return { href: appHref(p.name), cells: [`<a href="${appHref(p.name)}"><b>${esc(p.name)}</b></a>`, `#${x.replica}`, s ? `v${esc(s.v)}` : "–",
-          `${pill(kind, x.leaving ? `moving to server ${x.leaving.to}` : !r ? "server down" : s ? s.s : "not running yet")}${s?.e ? `<div class="errbox"><pre>${esc(s.e)}</pre></div>` : ""}`] };
+          `${pill(kind, x.leaving ? `moving to server ${x.leaving.to}` : !r ? "server down" : s ? s.s : "not running yet")}${s?.e ? `<div class="errbox"><pre>${esc(s.e)}</pre></div>` : ""}`,
+          `<a class="btn small" href="${appHref(p.name)}?logs=${x.replica}">Logs</a>`] };
       }), { empty: "No apps are placed here" }));
       setHtml($("#md-actions"), `<div class="card"><p class="meta" style="margin-top:0">These change the fleet, so they need the password.</p><div class="actions">
         ${r ? `<button type="button" data-act="restart">Restart</button><button type="button" data-act="evict">Move apps off</button>`
@@ -2193,11 +2296,12 @@ function parseHash() {
   return { parts: path.split("/").filter(Boolean).map(decodeURIComponent), q: new URLSearchParams(query) };
 }
 function route() {
+  view?.unmount?.();
   const { parts, q } = parseHash();
   const [a, b, c] = parts;
   view = a === "apps" && b === "new" ? vEditor(null, q.get("sample"))
     : a === "apps" && b && c === "edit" ? vEditor(b)
-    : a === "apps" && b ? vApp(b)
+    : a === "apps" && b ? vApp(b, q)
     : a === "apps" ? vApps()
     : a === "machines" && b ? vMachine(Number(b))
     : a === "machines" ? vMachines()

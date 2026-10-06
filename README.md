@@ -56,6 +56,8 @@ Moves in flight stay under min(8, 10% of the servers), one arriving per server a
 
 Servers can be short-lived, so the control plane decides when each one leaves. A run that reports its deadline is due somewhere between 4 h and 5 h 10 min after its start (a fixed spread per run), and never later than 45 minutes before its deadline. A due run hands over to a successor on its own slot: the successor builds the same copies and opens its tunnel once it serves everything the old run does, then the old run exits, so nothing moves and no DNS name changes. Departures go one per pool and 3 fleet-wide at a time, earliest deadline first, at most 4 in 10 minutes; a run whose apps are already changing as much as they may waits, and the Activity page says why. Under 25 minutes from its deadline, a run goes regardless. When new servers aren't arriving (a requested start doesn't join within minutes), departures that would wait for one move their copies out first instead. A server that goes silent keeps its copies for its slot for a while, so the replacement its pool starts inherits them; 3 or more going silent together is treated as the control plane losing its network, not as deaths. Drains and rolls wait their turn the same way.
 
+**Live logs.** An app's page shows a replica's logs as they're written: watching them takes the app's password, or the admin password (an app without one: the admin password), and the app's env values are hidden. Nothing is collected or kept: the page opens a WebSocket to the control plane, which wakes the copy's server; its agent runs `docker compose logs --follow` for that copy and streams it over its own WebSocket, and the control plane passes the lines through. Closing the viewer or leaving the page stops it all.
+
 The Activity page shows the churn (copies started by cause, moves, DNS re-points), the departures coming up and how the last day's went (cold when a replica had no healthy copy because of one, with handover times), replicas with no healthy copy right now, and alerts. Set `ALERT_WEBHOOK` to have alerts posted as JSON (`text` and `content`, for Slack- and Discord-style hooks).
 
 ### Rollouts
@@ -79,12 +81,15 @@ DELETE /api/roll                                call a roll off: servers go back
 PUT    /api/settings                            {"pools": {"<pool>": 10}, "rebalance": true}  (machines to keep per pool; automatic rebalancing)
 POST   /api/projects/<name>/move?from=N[&to=M][&replica=K]  move one copy off machine N (to M, or the machine with the most room)
 POST   /api/machines/<n>/evict[?force=1]        move every placed project off machine n (apps changing as much as they may wait, unless forced)
+POST   /api/projects/<name>/logs?replica=K      watch a replica's live logs: a session, for the WebSocket /admin/api/logs/<session> (the app's password or the admin password)
 GET    /api/events?since=&kinds=&app=&machine=&limit=  what changed and why, 30 days: placements, moves, departures, strikes, dark and lit replicas, alerts
 DELETE /api/slots/<n>                           retire an empty slot: tunnel, records and DNS names go
 GET    /api/join-token                          the join token (needs the admin password)
 POST   /api/join                                an agent starting up: {"agent", "pool", "url", "label", "want"} -> its slot and tunnel token
 POST   /api/claim?pool=<name>                    machines to start so the pool has its size (for a watchdog outside the pool)
 POST   /api/drain                               {"agent": id}, {"run": id} or {"machine": n}: it's going down soon, hand it over
+GET    /api/wake?run=<run>                      (agents) held open up to 45 s, answered at once when the control plane wants a check-in now
+WS     /api/logs/stream?session=<id>&run=<run>  (agents) a live log stream for a session
 ```
 
 ```sh
@@ -123,7 +128,8 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
   - tracks machines and hands out restarts
   - keeps the DNS in line: `<project>-<k>` is a CNAME to the tunnel of the machine running replica *k*, moved when the copy moves
 - **Agent** ([`agent/agent.mjs`](agent/agent.mjs)), on every machine (run by [`machine.yml`](.github/workflows/machine.yml) on GitHub Actions, by `install.sh` on a host). It's configured by environment variables (listed at the top of the file) and:
-  - checks in every 20 seconds, describing its machine: pool, label, whether it starts machines
+  - checks in every 20 seconds, describing its machine: pool, label, whether it starts machines, and keeps one request open at `/api/wake` so the control plane can ask it to check in at once
+  - streams a copy's logs to the control plane while someone watches them (`agent/ws.mjs` is its WebSocket client)
   - writes each project's files and runs `docker compose up -d --build --wait`; a project that fails is tried again (every 30 seconds while the machine is starting up, every 3 minutes once it's online), and a project that stops answering is recreated
   - opens its tunnel only once every project it was given is up and answering (or after 10 minutes), so a fresh machine never takes traffic it can't serve
   - removes what's no longer wanted
@@ -138,7 +144,7 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 
 ## Running the control plane
 
-`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` package). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). `AGENT_URL` is where machines joining with `install.sh` fetch the agent's code (default: this repo's main branch). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. It listens on 127.0.0.1 only; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
+`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). `AGENT_URL` is where machines joining with `install.sh` fetch the agent's code (default: this repo's main branch). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. It listens on 127.0.0.1 only; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
 The live one runs on the owner's VPS as systemd user units `runner-control.service` (the server, from this repo's checkout) and `runner-control-tunnel.service` (cloudflared), with the settings in `~/.config/runner-control/env`. To deploy a change: pull, then `systemctl --user restart runner-control.service`; the agents keep what's running while it's down for the second that takes. `GET /api/export` and `POST /api/import` (admin password) move the whole state to another server.
 

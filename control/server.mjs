@@ -1,10 +1,12 @@
 // The control plane as one process: SQLite in DATA_DIR, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
 // runners.<domain>). Settings and secrets come from the environment (see the README).
 //   PORT (8920), DATA_DIR (.), DOMAIN, CONTROL_HOST, ZONE, ACCOUNT_ID, POOLS, MAX_SLOTS (optional cap on machines), FLEET_PASSWORD, JOIN_TOKEN,
-//   CF_API_TOKEN (or CF_API_KEY + CF_API_EMAIL), CF_API_BASE (tests), HOT_MS (tests), POLL_S, DNS=off (no DNS changes)
+//   CF_API_TOKEN (or CF_API_KEY + CF_API_EMAIL), CF_API_BASE (tests), POLL_S, DNS=off (no DNS changes), ALERT_WEBHOOK,
+//   QUIET_MS and YOUNG_MS (tests)
 import http from "node:http";
 import { mkdirSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { WebSocketServer } from "ws";
 import { Control } from "./src/index.js";
 
 const env = process.env;
@@ -73,6 +75,50 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.keepAliveTimeout = 65_000;
+
+// WebSockets, for live logs: the web app's viewer (/admin/api/logs/<session>, from its own site) and the agent that
+// streams them (/api/logs/stream?session=...&run=..., with the join token). The control plane passes lines from one
+// to the other and keeps nothing (see openLogSession).
+const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+server.on("upgrade", (req, socket, head) => {
+  const refuse = (status) => {
+    socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
+  };
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const viewer = url.pathname.match(/^\/admin\/api\/logs\/([0-9a-f-]{36})$/);
+    if (viewer) {
+      const origin = req.headers.origin;
+      if (origin && new URL(origin).host !== req.headers.host) return refuse(403); // another site's page
+      return wss.handleUpgrade(req, socket, head, (ws) => control.attachLogViewer(viewer[1], adapt(ws)));
+    }
+    if (url.pathname === "/api/logs/stream") {
+      if (!control.isJoinToken(req.headers.authorization)) return refuse(401);
+      return wss.handleUpgrade(req, socket, head, (ws) => control.attachLogAgent(url.searchParams.get("session"), url.searchParams.get("run"), adapt(ws)));
+    }
+    refuse(404);
+  } catch (e) {
+    log(`upgrade failed: ${e.message}`);
+    refuse(400);
+  }
+});
+// What the control plane sees of a socket. Pinged every 25 s, so a quiet one stays open through the tunnel; one that
+// falls more than 2 MB behind drops what doesn't fit.
+function adapt(ws) {
+  const ping = setInterval(() => ws.readyState === ws.OPEN && ws.ping(), 25_000);
+  ws.on("close", () => clearInterval(ping));
+  ws.on("error", () => {});
+  return {
+    send(text) {
+      if (ws.readyState === ws.OPEN && ws.bufferedAmount < 2_000_000) ws.send(text);
+    },
+    close(code = 1000, reason = "") {
+      try { ws.close(code, reason); } catch { ws.terminate(); }
+    },
+    onMessage: (fn) => ws.on("message", (data, binary) => fn(binary ? data : data.toString())),
+    onClose: (fn) => ws.on("close", () => fn()),
+  };
+}
 server.listen(port, "127.0.0.1", () => log(`control plane listening on 127.0.0.1:${port}, data in ${dataDir}`));
 
 let stopping = false;
@@ -80,6 +126,7 @@ function shutdown(code) {
   if (stopping) return;
   stopping = true;
   clearTimeout(timer);
+  for (const ws of wss.clients) ws.terminate();
   server.close(() => {
     db.close();
     process.exit(code);
