@@ -2935,6 +2935,10 @@ export class Control {
     if (how === "evict" && recent.filter((d) => d.kind === "evict").length >= 2) return out("2 evictions started in the last 10 minutes");
     const inFlight = this.departing(now);
     if (inFlight.length >= 3) return out("3 servers are leaving already");
+    // A roll replaces healthy servers on request (after an agent update, say), with no deadline behind it: one server
+    // at a time fleet-wide, as it always has. Servers due for their own reasons don't wait for it.
+    const rollOnly = (x) => this.rolled(x) && !x.drain && !this.pulled.has(x.id) && !(this.dueAt(x) && now >= this.dueAt(x));
+    const rollWaits = (x) => rollOnly(x) && inFlight.length > 0;
     const poolBusy = (x) => inFlight.some((y) => (y.pool ?? null) === (x.pool ?? null));
     const busyApp = (x) => [...this.copies].find(([name, list]) => list.some((c) => c.machine === x.machine && !c.leaving) && !this.mayTransition(name, now))?.[0];
     const carriesBusyApp = (x) => Boolean(busyApp(x));
@@ -2942,8 +2946,9 @@ export class Control {
     const queue = this.liveRuns(now).filter((x) => !x.retire && !x.evict && !x.handover && !this.successorOf(x, now) && this.due(x, now))
       .sort((a, b) => (this.sickWhy.has(a.id) ? 0 : 1) - (this.sickWhy.has(b.id) ? 0 : 1) ||
         (a.deadline ?? a.started + 6 * 3600_000) - (b.deadline ?? b.started + 6 * 3600_000));
-    const first = queue.find((x) => !poolBusy(x) && !carriesBusyApp(x));
+    const first = queue.find((x) => !poolBusy(x) && !carriesBusyApp(x) && !rollWaits(x));
     if (first?.id === r.id) return out(null);
+    if (rollWaits(r)) return out("a roll replaces one server at a time");
     if (poolBusy(r)) return out(`another server of ${r.pool ? `pool ${r.pool}` : "its own"} is leaving`);
     if (carriesBusyApp(r)) return out(`${busyApp(r)} is already changing as much as it may`);
     return out(first ? `server ${first.machine} goes first` : "waiting its turn");

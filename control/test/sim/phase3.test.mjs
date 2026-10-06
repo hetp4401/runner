@@ -121,4 +121,29 @@ function watcher(c, f, apps) {
   ok("the stuck successor was retired", c.recentEvents.some((e) => e.kind === "retire" && e.cause === "stuck-successor"), c.recentEvents.filter((e) => e.kind === "retire").map((e) => e.cause).join(","));
   ok("the drained server still left, warm", !s0.alive && f.log.every((l) => !l.includes("hard stop")));
 }
+
+{ // 6. a roll (after an agent update) replaces healthy servers one at a time fleet-wide, while servers due for their own
+  //    reasons keep going through the usual gates
+  const c = makeControl();
+  const f = new Fleet(c, { a: { size: 4, cap: 20 }, b: { size: 4, cap: 20 } }, { drainAt: () => null, reportDeadline: true });
+  for (const p of ["a", "b"]) await f.startPool(p);
+  await f.run(15 * MIN);
+  deploy(c, "web", app("web", 4));
+  await f.run(5 * MIN);
+  const before = new Set(f.alive().map((s) => s.run));
+  c.roll();
+  let most = 0;
+  let drainedLeft = null; // how many rolled servers were still there when it left
+  const drained = f.alive().find((s) => s.pool === "b");
+  await f.run(2 * MIN);
+  c.drain({ agent: drained.agent }); // a server that's going away soon anyway
+  await f.run(60 * MIN, () => {
+    most = Math.max(most, c.liveRuns(T).filter((r) => before.has(r.id) && (r.handover || r.evict) && r.id !== drained.run).length);
+    if (!drained.alive && drainedLeft == null) drainedLeft = f.alive().filter((s) => before.has(s.run) && s !== drained).length;
+  });
+  ok("rolled servers left one at a time", most === 1, `at most ${most} at once`);
+  ok("every server was replaced", f.alive().every((s) => !before.has(s.run)), `${f.alive().filter((s) => before.has(s.run)).length} left`);
+  ok("the drained server didn't wait for the roll", drainedLeft >= 3, `${drainedLeft} rolled servers still waiting when it left`);
+  ok("all warm: no hard stops, nothing dark", f.log.every((l) => !l.includes("hard stop")) && !c.all("SELECT 1 FROM events WHERE kind = 'dark'").length);
+}
 summary();
