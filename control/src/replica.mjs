@@ -73,10 +73,12 @@ export class Store {
 
 // The lease: {holder, url, until, since}, kept by writing it at its version (so of two copies only one can ever win).
 export class Lease {
-  constructor(store, me, ms = 30_000) {
+  constructor(store, me, ms = 30_000, delay = 0) {
     this.store = store;
     this.me = me; // {id, url}
     this.ms = ms;
+    this.delay = delay; // how long the lease must have been free before this copy takes it (a copy of last resort waits)
+    this.freeSince = null;
     this.version = null; // the version this copy last wrote, while it's the leader
   }
 
@@ -85,10 +87,18 @@ export class Lease {
     return got ? { ...JSON.parse(got.data.toString()), version: got.version } : null;
   }
 
-  // Takes the lease if it's free: nobody has it, it ran out (with 5 s for clocks that disagree), or it's this copy's.
+  // Takes the lease if it's free (nobody has it, it ran out with 5 s for clocks that disagree, or it's this copy's), and
+  // has been for `delay` as far as this copy has seen.
   async take(now = Date.now()) {
     const cur = await this.read();
-    if (cur && cur.holder !== this.me.id && cur.until > now - 5_000) return { taken: false, cur };
+    if (cur && cur.holder !== this.me.id && cur.until > now - 5_000) {
+      this.freeSince = null;
+      return { taken: false, cur };
+    }
+    if (cur?.holder !== this.me.id) {
+      this.freeSince ??= now;
+      if (now - this.freeSince < this.delay) return { taken: false, cur };
+    }
     const v = await this.store.put(LEASE, this.body(now), { version: cur ? cur.version : NEW });
     if (v == null) {
       const after = await this.read();

@@ -5,7 +5,7 @@
 //   DNS=off (no DNS changes), ALERT_WEBHOOK, QUIET_MS and YOUNG_MS (tests)
 // As one of several copies (see src/replica.mjs): STORE_URLS (zkmetadata replicas, comma-separated), STATE_KEY (seals
 // the snapshots), TUNNEL_CMD (the tunnel connector, run while this copy leads), SELF_URL (where this copy answers),
-// LEASE_MS (30000), SNAP_S (60).
+// LEASE_MS (30000), SNAP_S (60), TAKEOVER_DELAY_S (0: how long the lease must be free before this copy takes it).
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -142,7 +142,7 @@ let stopping = false;
 // ---- one of several copies ----
 const me = { id: `${env.FLEET_APP ? `${env.FLEET_APP}-${env.FLEET_REPLICA}` : hostname()}-${randomUUID().slice(0, 8)}`, url: env.SELF_URL || null };
 const store = replicated ? new Store(env.STORE_URLS.split(",").map((u) => u.trim()).filter(Boolean), env.ADMIN_PASSWORD) : null;
-const lease = replicated ? new Lease(store, me, Number(env.LEASE_MS) || 30_000) : null;
+const lease = replicated ? new Lease(store, me, Number(env.LEASE_MS) || 30_000, (Number(env.TAKEOVER_DELAY_S) || 0) * 1000) : null;
 const snaps = replicated ? new Snapshots(store, sealKey(env.STATE_KEY || ""), me) : null;
 const tunnel = new Tunnel(env.TUNNEL_CMD, log);
 const SNAP_MS = (Number(env.SNAP_S) || 60) * 1000;
