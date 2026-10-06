@@ -1,0 +1,8 @@
+# The leader's tunnel connector (TUNNEL_TOKEN comes from the app's env): runners.<domain> and control.<domain> reach
+# the control plane in the same container.
+ingress:
+  - hostname: runners.billybishop4-workers.xyz
+    service: http://127.0.0.1:8080
+  - hostname: control.billybishop4-workers.xyz
+    service: http://127.0.0.1:8080
+  - service: http_status:404

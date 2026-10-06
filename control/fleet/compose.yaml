@@ -1,0 +1,27 @@
+# The control plane on the fleet: copies that share a lease and the state in zkmetadata; the leader serves and runs the
+# tunnel connector for runners.<domain> (see the README's "Several copies, on no particular server"). REF is the
+# commit of this repo the copies run (deploy.sh sets it).
+x-runner:
+  port: 8080
+  replicas: 2
+services:
+  control:
+    build:
+      context: .
+      args:
+        REF: main
+    env_file: .env
+    environment:
+      PORT: "8080"
+      HOST: 0.0.0.0
+      DATA_DIR: /data
+      SELF_URL: https://${FLEET_HOST}
+      TUNNEL_CMD: cloudflared tunnel --no-autoupdate --config /app/tunnel.yml run
+    ports:
+      - "8080:8080"
+    volumes:
+      - data:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+volumes:
+  data:
