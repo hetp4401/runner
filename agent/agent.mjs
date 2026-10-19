@@ -107,7 +107,7 @@ async function isReady(p) {
 
 // Keyed by what the control plane calls each copy: a project's name for the lowest-numbered replica of it here (the
 // usual, only copy), <name>-r<k> for any further copy of it on this machine.
-const projects = new Map(); // key -> { app, replica, v, port, readyPath, websockets, s: "applying" | "healthy" | "failed", r, e, busy, at, misses, t0, n }
+const projects = new Map(); // key -> { app, replica, v, port, readyPath, s: "applying" | "healthy" | "failed", r, e, busy, at, misses, t0, n }
 let domain = "";
 
 // Writes the project's files and brings it up. `recreate` is for trying the same version again after a failure: compose
@@ -115,7 +115,7 @@ let domain = "";
 async function apply(name, want, { recreate = false } = {}) {
   const before = projects.get(name);
   const same = before && before.replica === (want.replica ?? 1) && before.app === (want.app ?? name);
-  const p = { app: want.app ?? name, replica: want.replica ?? 1, v: want.v, port: want.port, readyPath: want.ready ?? null, websockets: want.websockets === true, s: "applying", e: "",
+  const p = { app: want.app ?? name, replica: want.replica ?? 1, v: want.v, port: want.port, readyPath: want.ready ?? null, s: "applying", e: "",
     busy: true, at: Date.now(), misses: 0,
     t0: same ? before.t0 : Date.now(), // when this copy was first started on this machine (for the control plane's clocks)
     n: (same ? before.n ?? 0 : 0) + (recreate ? 1 : 0) }; // restarts of it here
@@ -256,20 +256,12 @@ let routerConfig = "";
 const updateRouter = () => (routerChain = routerChain.then(loadRouter, loadRouter).catch((e) => log(`router update failed: ${e.message}`)));
 
 function routerJson() {
-  // Each copy answers its replica's public name. WebSocket upgrades only reach an app that asked for them
-  // (x-runner.websockets: true); others get 403. (stream_close_delay: a config reload would otherwise cut every
+  // Each copy answers its replica's public name. (stream_close_delay: a config reload would otherwise cut every
   // websocket on the machine.)
-  const routes = [...projects.values()].filter((p) => p.port && domain).flatMap((p) => [
-    ...(p.websockets ? [] : [{
-      match: [{ host: [replicaHost(p.app, p.replica)], header_regexp: { Upgrade: { pattern: "(?i)websocket" } } }],
-      handle: [{ handler: "static_response", status_code: 403, headers: { "X-Runner-Route": ["no-websockets"] },
-        body: "WebSockets are off for this app: set x-runner.websockets: true in its compose file\n", close: true }],
-    }]),
-    {
-      match: [{ host: [replicaHost(p.app, p.replica)] }],
-      handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }], flush_interval: -1, stream_close_delay: "1h" }],
-    },
-  ]);
+  const routes = [...projects.values()].filter((p) => p.port && domain).map((p) => ({
+    match: [{ host: [replicaHost(p.app, p.replica)] }],
+    handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }], flush_interval: -1, stream_close_delay: "1h" }],
+  }));
   routes.push({
     handle: [{
       handler: "static_response",

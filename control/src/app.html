@@ -345,7 +345,7 @@ function rebuild(box, fn) {
   requestAnimationFrame(() => (box.style.minHeight = ""));
 }
 // The compose file the control plane makes for a Dockerfile on its own; the editor leaves it out, since it's made again on every deploy.
-const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?(?:  websockets: true\n)?)?services:\n  app:\n    build: \.\n(?:    ports: \["\d+:\d+"\]\n)?    restart: unless-stopped\n?$/;
+const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?)?services:\n  app:\n    build: \.\n(?:    ports: \["\d+:\d+"\]\n)?    restart: unless-stopped\n?$/;
 
 // ======================================================================== state
 const S = {
@@ -2273,7 +2273,7 @@ function vGuide() {
         <li><b>Deploy.</b> The app's page shows each replica come up, and every server's error if one fails.</li></ol>
       <p class="hint">Roll back from the app's Versions list: <b>Roll back</b> deploys that version's files again (it becomes the newest version) and keeps the replica count. The app's page also sets or changes an app's password.</p>
       <h3>With the API</h3>
-      <p>Send JSON to <code>PUT ${esc(o)}/api/projects/&lt;name&gt;</code>, no credentials needed. Fields: <code>compose</code>, <code>dockerfile</code>, <code>files</code> (<code>{"path": "text"}</code>), <code>port</code>, <code>replicas</code> (1–${MAX_REPLICAS}, default 1), <code>websockets</code> (<code>true</code>: the replica URLs also take WebSocket connections, <code>wss://&lt;name&gt;-<i>k</i>.${d}/…</code>; off by default, when upgrade requests get 403; kept in the compose file as <code>x-runner.websockets: true</code>), and optionally <code>password</code> (${MIN_APP_PASSWORD} characters or more), which locks the app. Sending only <code>{"replicas": N}</code> (or <code>{"websockets": true}</code>) to an existing app changes that and keeps its files.
+      <p>Send JSON to <code>PUT ${esc(o)}/api/projects/&lt;name&gt;</code>, no credentials needed. Fields: <code>compose</code>, <code>dockerfile</code>, <code>files</code> (<code>{"path": "text"}</code>), <code>port</code>, <code>replicas</code> (1–${MAX_REPLICAS}, default 1), and optionally <code>password</code> (${MIN_APP_PASSWORD} characters or more), which locks the app. Sending only <code>{"replicas": N}</code> to an existing app changes the count and keeps its files.
         Changes to an app with a password (<code>PUT</code>, <code>/disable</code>, <code>/enable</code>, <code>/move</code>, <code>DELETE</code>) need the header <code>x-app-password</code>; <code>PUT …/projects/&lt;name&gt;/password</code> with <code>{"password": "new"}</code> sets or changes it.
         The admin password, in <code>x-admin-password</code>, can change any app, and fleet changes (<code>/settings</code>, <code>/roll</code>, <code>/machines/&lt;n&gt;/evict</code>, <code>/slots/&lt;n&gt;</code>, <code>/join-token</code>) need it.</p>
       ${codebox(`curl -X PUT ${o}/api/projects/whoami \\\n  -H 'Content-Type: application/json' \\\n  -d '{"port": 8080, "replicas": 2, "compose": "services:\\n  web:\\n    image: traefik/whoami\\n    command: [\\"--port\\", \\"8080\\"]\\n    ports: [\\"8080:8080\\"]\\n"}'`)}

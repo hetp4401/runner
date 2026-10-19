@@ -29,7 +29,6 @@ A project is a docker compose file, optionally with Dockerfiles and other files 
   ```
 
 - **Dockerfile only:** a custom image. The control plane wraps it in a one-service compose file (`build: .`) that publishes the port. The app should listen on that port.
-- **WebSockets:** `x-runner.websockets: true` (or `"websockets": true` in the deploy API, which writes it there) lets the replica URLs take WebSocket connections: `wss://<project>-<k>.billybishop4-workers.xyz/...` goes through Cloudflare's tunnel and the machine's router to the app's port, like its HTTP. Off by default: the router answers an upgrade request with 403. Cloudflare closes a WebSocket that's silent for 100 s, so send a ping more often than that; a router reload (another app changing on the machine) keeps open ones for up to an hour.
 - **Readiness:** `x-runner.ready: /path` makes the agent ask each copy for that path; a copy counts as healthy (for moves, DNS, handovers) only while it answers 2xx. The agent never restarts a copy for not being ready; one unready for 10 minutes while ready elsewhere is moved like a failing one.
 - **Compose plus files:** files sit next to the compose file, so `build: .` or `build: ./web` (with `web/Dockerfile`) find them. You can also include whatever the Dockerfiles `COPY`, as long as it's text. Every machine builds the image when the version changes.
 

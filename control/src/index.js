@@ -300,8 +300,6 @@ function keysOn(replicas, name) {
 // What an app says about itself in its compose file's x-runner block, beyond port and replicas:
 //   ready: /path     a path that answers 2xx once a copy is ready to serve (synced, say): "healthy" waits for it, but a
 //                    copy that isn't ready is never restarted for it (only a copy that stops answering at all is)
-//   websockets: true its replicas' URLs take WebSocket connections (wss://<app>-<k>.<domain>/...), passed through
-//                    Cloudflare's tunnel and the machine's router to the app; without it, an upgrade request gets 403
 // Every app is treated alike otherwise: a move starts the new copy and drops the old one only once the new one works.
 function policyOf(compose) {
   let xr = {};
@@ -311,7 +309,6 @@ function policyOf(compose) {
   if (!isMap(xr)) xr = {};
   return {
     ready: typeof xr.ready === "string" ? xr.ready : null,
-    websockets: xr.websockets === true,
   };
 }
 
@@ -390,7 +387,7 @@ function remapCompose(compose, ports) {
 
 // The compose file made below for a Dockerfile on its own, as the editor sends it back. It's made afresh on every
 // deploy from the port and replica count given now, so a changed port can't disagree with it.
-const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?(?:  websockets: true\n)?)?services:\n  app:\n    build: \.\n(?:    ports: \["\d+:\d+"\]\n)?    restart: unless-stopped\n?$/;
+const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?)?services:\n  app:\n    build: \.\n(?:    ports: \["\d+:\d+"\]\n)?    restart: unless-stopped\n?$/;
 
 // Turns what was submitted into a spec the machines can run: { compose, port, files }.
 // Accepts a compose file, a Dockerfile, extra build files, or a mix; a Dockerfile on its own becomes a
@@ -398,8 +395,7 @@ const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?(?:  w
 // with the admin password (trusted), anything that would reach outside the app's container (sandboxProblems).
 function buildSpec(body, { trusted = false } = {}) {
   if (!isMap(body)) throw new HttpError(400, "send a JSON object");
-  let { compose = "", dockerfile = null, files = {}, port = null, replicas = null, websockets = null } = body;
-  if (websockets !== null && typeof websockets !== "boolean") throw new HttpError(400, "websockets must be true or false");
+  let { compose = "", dockerfile = null, files = {}, port = null, replicas = null } = body;
   if (typeof compose !== "string") throw new HttpError(400, "compose must be the compose file as text");
   if (!isMap(files)) throw new HttpError(400, "files must be an object of path: content");
   files = { ...files };
@@ -431,17 +427,15 @@ function buildSpec(body, { trusted = false } = {}) {
     const old = YAML.parse(compose)["x-runner"] ?? {};
     port ??= old.port ?? null;
     replicas ??= parseReplicas(old.replicas, "x-runner.replicas");
-    websockets ??= old.websockets === true;
     compose = "";
   }
   if (!compose.trim()) {
     if (!files.Dockerfile) throw new HttpError(400, "send a compose file, a Dockerfile, or both");
     // A Dockerfile on its own: build it and publish the port (the app should listen on it inside the container).
     compose = [
-      ...(port || replicas !== null || websockets ? ["x-runner:"] : []),
+      ...(port || replicas !== null ? ["x-runner:"] : []),
       ...(port ? [`  port: ${port}`] : []),
       ...(replicas !== null ? [`  replicas: ${replicas}`] : []),
-      ...(websockets ? ["  websockets: true"] : []),
       "services:",
       "  app:",
       "    build: .",
@@ -470,15 +464,6 @@ function buildSpec(body, { trusted = false } = {}) {
   replicas ??= parseReplicas(doc["x-runner"]?.replicas, "x-runner.replicas") ?? 1;
   const xr = isMap(doc["x-runner"]) ? doc["x-runner"] : {};
   if (xr.ready != null && !(typeof xr.ready === "string" && /^\/[\x21-\x7e]{0,199}$/.test(xr.ready))) throw new HttpError(400, "x-runner.ready is a path, like /healthz");
-  if (xr.websockets != null && typeof xr.websockets !== "boolean") throw new HttpError(400, "x-runner.websockets is true or false");
-  if (websockets !== null && websockets !== (xr.websockets === true)) {
-    // The websockets field sets x-runner.websockets in the compose file, the one place it's kept (comments stay).
-    const d = YAML.parseDocument(compose);
-    if (websockets) d.setIn(["x-runner", "websockets"], true);
-    else d.deleteIn(["x-runner", "websockets"]);
-    if (isMap(d.toJS()?.["x-runner"]) && !Object.keys(d.toJS()["x-runner"]).length) d.delete("x-runner");
-    compose = d.toString();
-  }
   if (!trusted) {
     // Checked as compose reads it: with YAML merge keys (<<) applied.
     const merged = YAML.parse(compose, { merge: true });
@@ -1147,7 +1132,6 @@ export class Control {
       env: this.envKeys(name), // the keys only
       port: spec.port,
       replicas: spec.replicas,
-      websockets: spec.policy.websockets,
       versions: this.all("SELECT version, port, replicas, created FROM versions WHERE name = ? ORDER BY version", name)
         .map((v) => ({ ...v, replicas: v.replicas ?? 1 })),
     };
@@ -1163,7 +1147,7 @@ export class Control {
     const latest = p && this.version(name, p.version);
     // Only a replica count or port: the latest version's files are kept as they are, so a page that was open for a
     // while can't put back files someone else has changed since.
-    if (latest && isMap(body) && body.compose == null && body.dockerfile == null && body.files == null) {  // (websockets too)
+    if (latest && isMap(body) && body.compose == null && body.dockerfile == null && body.files == null) {
       body = { ...body, compose: latest.compose, files: latest.files, port: body.port === undefined ? latest.port : body.port,
         replicas: body.replicas === undefined ? latest.replicas : body.replicas };
     }
@@ -1351,7 +1335,7 @@ export class Control {
         // A successor doesn't build copies that are moving off the machine.
         if (successor && x.leaving) continue;
         out[x.key] = { v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica,
-          ...(spec.policy.ready ? { ready: spec.policy.ready } : {}), ...(spec.policy.websockets ? { websockets: true } : {}) };
+          ...(spec.policy.ready ? { ready: spec.policy.ready } : {}) };
       }
     }
     return out;

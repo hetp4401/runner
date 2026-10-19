@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # runnerctl: manage projects on the runner control plane (same API as the admin portal).
-#   runnerctl apply <folder|compose.yml|Dockerfile> [name] [--port N] [--replicas N] [--websockets on|off]
+#   runnerctl apply <folder|compose.yml|Dockerfile> [name] [--port N] [--replicas N]
 #       add or update a project. A folder sends its compose file (if any) plus every other file in it,
 #       e.g. a Dockerfile and what it COPYs. A Dockerfile on its own becomes a one-service project.
 #       The name defaults to the folder or file name. Every machine updates at once.
@@ -39,13 +39,12 @@ case "$cmd" in
   apply)
     [ $# -ge 1 ] || usage
     src=$1; shift
-    name="" port="" replicas="" websockets=""
+    name="" port="" replicas=""
     while [ $# -gt 0 ]; do
       case $1 in
         --now) ;; # every deploy goes to every machine at once now; kept so old commands still work
         --port) port=${2:?--port needs a number}; shift ;;
         --replicas) replicas=${2:?--replicas needs a number}; shift ;;
-        --websockets) websockets=${2:?--websockets needs on or off}; shift ;;
         *) name=$1 ;;
       esac
       shift
@@ -55,9 +54,9 @@ case "$cmd" in
       elif [[ $(basename "$src") == *[Dd]ockerfile ]]; then name=$(basename "$(dirname "$(realpath "$src")")")
       else name=$(basename "${src%.*}"); fi
     fi
-    body=$(python3 - "$src" "$port" "$replicas" "$websockets" <<'PY'
+    body=$(python3 - "$src" "$port" "$replicas" <<'PY'
 import json, os, sys
-src, port, replicas, websockets = sys.argv[1:5]
+src, port, replicas = sys.argv[1:4]
 COMPOSE = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 body = {}
 if os.path.isdir(src):
@@ -85,8 +84,6 @@ if port:
     body["port"] = int(port)
 if replicas:
     body["replicas"] = int(replicas) if replicas.isdigit() else replicas  # the control plane explains a bad value
-if websockets:
-    body["websockets"] = {"on": True, "true": True, "off": False, "false": False}.get(websockets.lower(), websockets)
 print(json.dumps(body))
 PY
 )
