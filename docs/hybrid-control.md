@@ -44,6 +44,8 @@ The Mac runs `control/mac.mjs` with `CONTROL_URL` and `MAC_TOKEN`. Its runtime i
 
 `GET /internal/hybrid/status` reports the active scheduler, connection state, recovery gate and this instance's D1 row counters. `/api/status` includes the same `controlPlane` object; the dashboard labels the active scheduler. Run entries include `protocol`, `recoveryAt` and `witnessAt` to verify that agents have returned their stored receipts.
 
+Cloudflare can restart the DO during platform updates or when enabling live logs. That triggers configuration reload and agent recovery even when no application code changed; see [Cloudflare's known issues](https://developers.cloudflare.com/durable-objects/platform/known-issues/).
+
 Authenticated migration endpoints require `Authorization: Bearer <MAC_TOKEN>`:
 
 - `POST /internal/enable` with `{"enabled":false|true}` controls staging.
@@ -59,5 +61,7 @@ At 100 agents with one report per minute, reports produce 144,000 incoming DO We
 One continuously resident DO at the 128 MB billing size uses approximately 11,059 GB-s/day, within the 13,000 GB-s/day free allowance. This budgets continuous operation, including a full-day Mac outage; 80% uptime is not required for the duration budget. Do not create extra always-running coordinator objects under the same free allowance.
 
 The free allowances are shared by other account workloads. The current design fits its expected control traffic; unusually heavy public API use or log streaming can consume the remaining request budget. No paid upgrade or automatic paid overage is configured. Source/version growth also needs monitoring against D1 storage and Worker memory limits; the initial migration contains 166 versions and about 18 MB of source. Older history is preserved, not silently pruned.
+
+Startup loads small configuration records in pages of 100 and source versions in pages of 10. A regression check restores 300 tunnel slots and 250 saved versions within the free limit of 50 D1 queries per invocation. Routine reports still use only the memory cache.
 
 References: [DO pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/), [Workers limits](https://developers.cloudflare.com/workers/platform/limits/), [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/).

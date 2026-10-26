@@ -29,26 +29,29 @@ export class Configuration {
     return JSON.parse(text.decode(raw));
   }
   async load() {
-    // Pages bound memory and D1 response size, including large source bundles.
+    // Source bundles need small pages. Credentials and specs are much smaller;
+    // larger pages keep a 100-machine fleet below the free plan's 50 queries per
+    // invocation. Rowid scans avoid repeatedly sorting/scanning a bucket index.
     const tables = Object.fromEntries(CONFIG_TABLES.map((table) => [table, []]));
-    let cursor = 0;
-    for (;;) {
-      const res = await this.db.prepare("SELECT rowid AS cursor,bucket,id,payload FROM runner_config WHERE rowid>? ORDER BY rowid LIMIT 10").bind(cursor).all();
-      this.reads += res.meta?.rows_read ?? res.results.length;
-      for (const row of res.results) {
-        const data = await this.open(row.bucket, row.id, row.payload);
-        cursor = row.cursor;
-        if (row.bucket === "credentials") {
-          if (!CREDENTIAL_KEYS.includes(data.key)) throw new Error("unknown controller credential");
-          this.credentials.set(data.key, data.value);
-          continue;
+    for (const [filter, size] of [["bucket != 'versions'", 100], ["bucket = 'versions'", 10]]) {
+      let cursor = 0;
+      for (;;) {
+        const res = await this.db.prepare(`SELECT rowid AS cursor,bucket,id,payload FROM runner_config NOT INDEXED WHERE rowid>? AND ${filter} ORDER BY rowid LIMIT ${size}`).bind(cursor).all();
+        this.reads += res.meta?.rows_read ?? res.results.length;
+        for (const row of res.results) {
+          const data = await this.open(row.bucket, row.id, row.payload);
+          cursor = row.cursor;
+          if (row.bucket === "credentials") {
+            if (!CREDENTIAL_KEYS.includes(data.key)) throw new Error("unknown controller credential");
+            this.credentials.set(data.key, data.value);
+            continue;
+          }
+          if (!tables[row.bucket]) throw new Error("unknown configuration bucket");
+          tables[row.bucket].push(data);
+          this.known.get(row.bucket).set(row.id, fingerprint(data));
         }
-        if (!tables[row.bucket]) throw new Error("unknown configuration bucket");
-        tables[row.bucket].push(data);
-        this.known.get(row.bucket).set(row.id, fingerprint(data));
-        cursor = row.cursor;
+        if (res.results.length < size) break;
       }
-      if (res.results.length < 10) break;
     }
     return tables;
   }

@@ -81,9 +81,10 @@ check("incremental mirror retains Maps, Sets and nested runtime values", () => a
 // A local D1 binding substitute executes real SQL and atomic batches.
 const durable = new DatabaseSync(":memory:");
 durable.exec("CREATE TABLE runner_config(bucket TEXT,id TEXT,payload TEXT,updated INTEGER,PRIMARY KEY(bucket,id))");
+let queries = 0;
 const binding = {
   prepare(sql) { return { bind(...args) { return { sql, args,
-    async all() { const rows = durable.prepare(sql).all(...args); return { results: rows, meta: { rows_read: rows.length } }; },
+    async all() { queries++; const rows = durable.prepare(sql).all(...args); return { results: rows, meta: { rows_read: rows.length } }; },
   }; } }; },
   async batch(statements) {
     durable.exec("BEGIN");
@@ -134,4 +135,20 @@ check("configuration decrypts after restart", () => assert.equal(loaded.app_env.
 check("runtime observations are absent from the D1 restore", () => assert.equal(loaded.runs, undefined));
 await assert.rejects(new Configuration(binding, Buffer.alloc(32, 8).toString("base64")).load());
 checks++; console.log("ok an incorrect encryption key cannot read configuration");
+// Three tunnel slots per machine, with existing version history and room to grow.
+for (let n = 1; n <= 300; n++) {
+  const id = JSON.stringify([n]);
+  durable.prepare("INSERT OR REPLACE INTO runner_config VALUES(?,?,?,?)").run("slots", id, await config.seal("slots", id, { n, token: `tunnel-${n}` }), T);
+}
+for (let version = 1; version <= 250; version++) {
+  const id = JSON.stringify(["web", version]);
+  durable.prepare("INSERT OR REPLACE INTO runner_config VALUES(?,?,?,?)").run("versions", id, await config.seal("versions", id, { name: "web", version, files: "{}" }), T);
+}
+queries = 0;
+const scaled = await new Configuration(binding, key).load();
+check("100 machines and version history cold-load within the free D1 query limit", () => {
+  assert.equal(scaled.slots.length, 300);
+  assert.equal(scaled.versions.length, 250);
+  assert.ok(queries < 50, `${queries} startup queries exceed the free allowance`);
+});
 console.log(`${checks} hybrid checks passed`);
