@@ -161,12 +161,13 @@ function appSample(a, b) {
 
 // ---- the sampler ----
 
-export function startMetrics({ appOf = (project) => project } = {}) {
+export function startMetrics({ appOf = (project) => project, history = [] } = {}) {
   let host = null;
   let cont = null;
   let latest = null;
   let minute = null; // { t, h: acc, apps: { app: acc } }, acc = { n, sum, max }
   const done = [];
+  const retained = history.filter((x) => Number(x?.t) > Date.now() - 6 * 3600_000).slice(-360);
   let ticking = false;
 
   const acc = () => ({ n: 0, sum: {}, max: {} });
@@ -198,7 +199,10 @@ export function startMetrics({ appOf = (project) => project } = {}) {
         if (minute?.t !== t) {
           if (minute) {
             const apps = Object.fromEntries(Object.entries(minute.apps).map(([k, a]) => [k, summarize(a)]));
-            done.push({ t: minute.t, h: summarize(minute.h), a: apps });
+            const summary = { t: minute.t, h: summarize(minute.h), a: apps };
+            done.push(summary);
+            retained.push(summary);
+            if (retained.length > 360) retained.splice(0, retained.length - 360);
             if (done.length > KEEP_MINUTES) done.splice(0, done.length - KEEP_MINUTES);
           }
           minute = { t, h: acc(), apps: {} };
@@ -219,9 +223,10 @@ export function startMetrics({ appOf = (project) => project } = {}) {
   setInterval(tick, SAMPLE_MS).unref();
 
   return {
+    history() { return retained.slice(); },
     // What to send with a check-in. Call confirm() once the control plane has taken it.
     payload() {
-      return { live: latest, minutes: done.slice() };
+      return { live: latest, minutes: done.slice(), recent: retained.slice(-10) };
     },
     confirm(sent) {
       done.splice(0, sent.minutes.length);

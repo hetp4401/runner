@@ -1,6 +1,6 @@
 // A small WebSocket client (RFC 6455) with no dependencies, for the agent's outgoing streams (live logs): it connects
 // with any headers (the join token goes in one), sends text, answers pings, and reports its end once, whichever side
-// ends it. The agent only sends; what the control plane sends back besides pings and the close is ignored.
+// ends it. Text messages carry plans and wake requests in the other direction.
 import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
@@ -28,6 +28,10 @@ export function connect(url, headers = {}) {
       socket.setTimeout(0);
       let open = true;
       const ends = [];
+      const messages = [];
+      let fragments = [];
+      let fragmentBytes = 0;
+      let fragmentOp = 0;
       const end = () => {
         if (!open) return;
         open = false;
@@ -56,6 +60,8 @@ export function connect(url, headers = {}) {
       const read = () => {
         while (buf.length >= 2) {
           const op = buf[0] & 15;
+          const final = Boolean(buf[0] & 0x80);
+          if ((buf[0] & 0x70) || (buf[1] & 0x80) || ![0, 1, 2, 8, 9, 10].includes(op)) return end();
           let n = buf[1] & 127;
           let at = 2;
           if (n === 126) {
@@ -67,7 +73,8 @@ export function connect(url, headers = {}) {
             n = Number(buf.readBigUInt64BE(2));
             at = 10;
           }
-          if (buf[1] & 0x80) at += 4; // a server doesn't mask; skip a mask if one came anyway
+          if (!Number.isSafeInteger(n) || n > 16_000_000 || fragmentBytes + n > 16_000_000) return end();
+          if (op >= 8 && (!final || n > 125)) return end();
           if (buf.length < at + n) return;
           const data = buf.subarray(at, at + n);
           buf = buf.subarray(at + n);
@@ -76,6 +83,20 @@ export function connect(url, headers = {}) {
             return end();
           }
           if (op === 9) write(10, data); // ping: pong
+          if (op === 1 || op === 2 || op === 0) {
+            if (op !== 0) {
+              if (fragmentOp) return end();
+              fragmentOp = op;
+            } else if (!fragmentOp) return end();
+            fragments.push(Buffer.from(data));
+            fragmentBytes += data.length;
+            if (final) {
+              const payload = Buffer.concat(fragments);
+              const kind = fragmentOp;
+              fragments = []; fragmentBytes = 0; fragmentOp = 0;
+              for (const fn of messages) fn(kind === 1 ? payload.toString("utf8") : payload);
+            }
+          }
         }
       };
       socket.on("data", (d) => {
@@ -94,6 +115,7 @@ export function connect(url, headers = {}) {
           end();
         },
         onEnd: (fn) => (open ? ends.push(fn) : fn()),
+        onMessage: (fn) => messages.push(fn),
         get open() { return open; },
         socket,
       });

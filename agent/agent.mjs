@@ -24,11 +24,16 @@ import http from "node:http";
 import { availableParallelism } from "node:os";
 import { dirname, resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
+import { ControlLink } from "./control-link.mjs";
 
 const env = process.env;
 const pool = env.POOL || null;
 const base = resolve(env.RUNNER_DATA || "/var/lib/runner");
-const started = Date.now();
+const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => "")).trim();
+let saved = null;
+try { saved = JSON.parse(await readFile(`${base}/agent-state.json`, "utf8")); } catch {}
+if (!bootId || saved?.bootId !== bootId || saved?.control !== env.CONTROL_URL) saved = null;
+const started = saved?.started || Date.now();
 const settleBy = started + 10 * 60_000; // open the tunnel by then even if a project is still struggling
 const ROUTER_PORT = Number(env.ROUTER_PORT) || 19080; // the tunnel sends everything here, and the router (Caddy) picks the project by hostname
 const METRICS_PORT = ROUTER_PORT + 1; // the tunnel's own metrics (its live edge connections)
@@ -36,10 +41,12 @@ const dir = `${base}/projects`;
 const routerDir = `${base}/router`;
 const MANIFEST = ".runner-files"; // in each project's folder: the files the agent wrote there last time
 const BUILT = ".runner-built"; // and a hash of the files its containers were last brought up from
-let machine = 0; // the slot, from the control plane
-let tunnelToken = "";
-let agent = "";
-let run = ""; // this start of the agent
+let machine = saved?.machine || 0; // the slot, from the control plane
+let tunnelToken = saved?.tunnelToken || "";
+let agent = saved?.agent || "";
+let run = saved?.run || ""; // stable across an agent restart on this VM
+let recovery = saved?.recovery || null;
+let cachedDesired = saved?.desired || {};
 // What this agent tells the control plane about its machine.
 const deadline = Number(env.LIFETIME_MIN) > 0 ? started + Number(env.LIFETIME_MIN) * 60_000 : undefined;
 const describe = () => ({
@@ -107,8 +114,19 @@ async function isReady(p) {
 
 // Keyed by what the control plane calls each copy: a project's name for the lowest-numbered replica of it here (the
 // usual, only copy), <name>-r<k> for any further copy of it on this machine.
-const projects = new Map(); // key -> { app, replica, v, port, readyPath, s: "applying" | "healthy" | "failed", r, e, busy, at, misses, t0, n }
-let domain = "";
+const projects = new Map((saved?.projects || []).map(([key, value]) => [key, { ...value, busy: false, s: value.busy ? "failed" : value.s }]));
+let domain = saved?.domain || "";
+let stateWrites = Promise.resolve();
+function saveState() {
+  const data = JSON.stringify({ v: 1, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, domain,
+    recovery, desired: cachedDesired, projects: [...projects], metrics: metrics.history() });
+  stateWrites = stateWrites.catch(() => {}).then(async () => {
+    const path = `${base}/agent-state.json`;
+    await writeFile(`${path}.tmp`, data, { mode: 0o600 });
+    await fsp.rename(`${path}.tmp`, path);
+  });
+  return stateWrites;
+}
 
 // Writes the project's files and brings it up. `recreate` is for trying the same version again after a failure: compose
 // only recreates the containers whose config changed, so a container that's running but hung would be left as it is.
@@ -199,14 +217,15 @@ async function remove(name) {
 // wait for them: a project on its way out may still hold the ports the new one publishes (the same copy under a new
 // name, say), and compose would refuse to start it.
 const queued = new Set(); // new projects waiting for removals to finish
-function reconcile(desired) {
+function reconcile(desired, { repairOnly = false } = {}) {
   const removals = [];
   for (const [name, p] of projects) {
-    if (!(name in desired) && !p.busy) removals.push(remove(name).catch((e) => log(`${name}: ${e.message}`)));
+    if (!repairOnly && !(name in desired) && !p.busy) removals.push(remove(name).catch((e) => log(`${name}: ${e.message}`)));
   }
   for (const [name, want] of Object.entries(desired)) {
     const p = projects.get(name);
     if (p?.busy || queued.has(name)) continue;
+    if (repairOnly && (!p || p.v !== want.v || p.replica !== (want.replica ?? 1) || p.app !== (want.app ?? name))) continue;
     if (!p) {
       queued.add(name);
       Promise.all(removals).then(() => {
@@ -362,11 +381,12 @@ let ready = false;
 
 // Only this machine's own projects (and the agent's own containers) go into the metrics, under their project's name
 // (a second copy of a project here is compose project <name>-r<k>, but the same app).
-const metrics = startMetrics({ appOf: (project) => projects.get(project)?.app ?? null });
+const metrics = startMetrics({ appOf: (project) => projects.get(project)?.app ?? null, history: saved?.metrics ?? [] });
 
 // Get a slot and its tunnel token. Keeps trying while the control plane is unreachable or every slot is taken; gives up
 // (so whatever runs this machine can start another) if the token is refused, or, for a pool member, after 10 minutes.
 async function join() {
+  if (saved && machine && tunnelToken && agent && run) return log(`resuming machine ${machine} on the same VM`);
   agent = env.AGENT_ID || "";
   if (!agent) {
     const idFile = `${base}/agent-id`;
@@ -400,6 +420,7 @@ async function join() {
         throw new Error(`the control plane's answer makes no sense: ${JSON.stringify(data).slice(0, 200)}`);
       }
       ({ machine, tunnelToken, domain } = data);
+      await saveState();
       return log(`joined as machine ${machine} (${agent})`);
     } catch (e) {
       if (e.message.startsWith("the join token was refused")) throw e;
@@ -431,10 +452,13 @@ async function sync() {
   const t0 = Date.now();
   const edges = ready ? await tunnelEdges() : undefined;
   const disk = await diskSpace();
+  const body = { machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt, edges, disk, protocol: 2, recovery };
+  const linked = await controlLink.report(body);
+  if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); return linked; }
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
     method: "POST",
     headers: { authorization: `Bearer ${env.JOIN_TOKEN}`, "content-type": "application/json" },
-    body: JSON.stringify({ machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt, edges, disk }),
+    body: JSON.stringify(body),
     signal: AbortSignal.timeout(15_000),
   });
   rtt = Date.now() - t0;
@@ -477,12 +501,12 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-// The control plane can't call a machine, only answer it. So that "check in now" (someone is waiting on this
-// machine: its logs, say) doesn't wait a whole check-in interval, the agent keeps one request open at /api/wake,
-// which the control plane holds for up to 45 s and answers at once when it wants something. A control plane without
-// it (404) ends the loop.
+// The outgoing WebSocket lets the controller request a fresh report immediately,
+// without a second HTTP polling loop or any inbound port on the machine.
 let wakeNow = null; // ends the current wait between check-ins
 let wakePending = false; // a wake that came while no wait was going on: the next one ends at once
+const wake = () => { if (wakeNow) wakeNow(); else wakePending = true; };
+const controlLink = new ControlLink(env.CONTROL_URL, env.JOIN_TOKEN, wake);
 const nap = (ms) => new Promise((resolve) => {
   if (wakePending) {
     wakePending = false;
@@ -496,23 +520,6 @@ const nap = (ms) => new Promise((resolve) => {
   const timer = setTimeout(done, ms);
   wakeNow = done;
 });
-async function wakeLoop() {
-  while (!stopping && !leaving) {
-    try {
-      const res = await fetch(`${env.CONTROL_URL}/api/wake?run=${encodeURIComponent(run)}`, {
-        headers: { authorization: `Bearer ${env.JOIN_TOKEN}` }, signal: AbortSignal.timeout(75_000),
-      });
-      if (res.status === 404) return;
-      const body = await res.json().catch(() => ({}));
-      if (body.wake) {
-        if (wakeNow) wakeNow();
-        else wakePending = true;
-      } else if (!res.ok) await sleep(30_000);
-    } catch {
-      await sleep(15_000);
-    }
-  }
-}
 
 // Live logs of a copy someone is watching (the control plane names the session in a check-in, having woken the agent):
 // `docker compose logs --follow` of the copy's containers, the last `tail` lines first, sent to the control plane as
@@ -573,14 +580,18 @@ function streamLogs(wanted) {
 async function main() {
   await mkdir(dir, { recursive: true });
   await join();
-  wakeLoop();
   log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}${pool ? `, pool ${pool}` : ""}`);
   // Left from before a restart, maybe.
-  await sh("docker", ["rm", "-f", "router", "tunnel"]);
+  if (saved) {
+    const running = await sh("docker", ["inspect", "--format", "{{.State.Running}}", "router", "tunnel"]);
+    ready = running.ok && running.out.split("\n").every((line) => line === "true");
+  }
+  if (!ready) await sh("docker", ["rm", "-f", "router", "tunnel"]);
   // Nothing can be served or checked without the router, so keep trying (its image pull may have failed).
   for (;;) {
     try {
-      await startRouter();
+      if (!ready) await startRouter();
+      else await updateRouter();
       break;
     } catch (e) {
       log(`${e.message.split("\n")[0]}; trying again in 30s`);
@@ -591,6 +602,21 @@ async function main() {
   let successorAt = 0;
   let lastReport = 0;
   let tunnelRetryAt = 0;
+  let checking = false;
+  setInterval(async () => {
+    if (checking || stopping || leaving) return;
+    checking = true;
+    try {
+      const before = JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
+      await checkHealth();
+      // Repair an already-authorized workload even while both controllers are
+      // unreachable. Placement changes and new workloads still need a plan.
+      reconcile(cachedDesired, { repairOnly: true });
+      const changed = before !== JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
+      if (changed) { await saveState(); wake(); }
+    } catch (error) { log(`health: ${error.message}`); }
+    finally { checking = false; }
+  }, 10_000).unref();
   for (;;) {
     if (leaving) { // a signal handler is checking in for the last time; don't start anything meanwhile
       await sleep(1000);
@@ -602,8 +628,12 @@ async function main() {
     } catch (e) {
       log(`control plane unreachable (${e.message}); keeping what's running`);
     }
-    if (plan?.retire) return shutdown("a newer run of this machine is healthy, so this one is leaving");
-    if (plan) {
+    if (plan?.retire && !plan.hold) return shutdown("a newer run of this machine is healthy, so this one is leaving");
+    if (plan && !plan.hold) {
+      if (!plan.desired || typeof plan.desired !== "object") throw new Error("controller sent no desired state");
+      recovery = plan.recovery ?? recovery;
+      cachedDesired = plan.desired;
+      await saveState(); // accept the receipt durably before executing commands
       if (plan.domain !== domain) {
         domain = plan.domain;
         updateRouter();
@@ -628,7 +658,7 @@ async function main() {
     // copies), with no 10-minute fallback: the predecessor keeps serving meanwhile. A tunnel that won't connect is
     // tried again in a minute.
     const serves = (key) => projects.get(key)?.s === "healthy" && !projects.get(key)?.busy && projects.get(key)?.r !== false;
-    const openNow = plan?.successor
+    const openNow = plan?.hold ? false : plan?.successor
       ? Array.isArray(plan.serve) && plan.serve.every(serves) && (plan.serve.length > 0 || settled(plan.desired))
       : plan && (settled(plan.desired) || Date.now() > settleBy);
     if (!ready && plan && Date.now() >= tunnelRetryAt && openNow) {
@@ -641,7 +671,7 @@ async function main() {
         tunnelRetryAt = Date.now() + 60_000;
       }
     }
-    await checkHealth();
+    await saveState();
     if (Date.now() - lastReport > 5 * 60_000) {
       lastReport = Date.now();
       const summary = [...projects].map(([name, p]) => `${name} v${p.v} ${p.s}`).join(", ") || "no projects";
