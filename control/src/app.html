@@ -1220,9 +1220,10 @@ async function changeAppPassword(name) {
 }
 async function moveSheet(name, from, replica) {
   const p = S.status.projects.find((x) => x.name === name);
+  const region = p.region ?? (p.regions?.length ? p.regions[(replica - 1) % p.regions.length] : null);
   const runs = runsBy(), live = S.metrics?.live ?? {};
   const on = new Set(p.placed.filter((x) => !x.leaving).map((x) => x.machine));
-  const opts = [...runs.values()].filter((r) => r.ready).sort((a, b) => a.machine - b.machine).map((r) => {
+  const opts = [...runs.values()].filter((r) => r.ready && (!region || r.region === region)).sort((a, b) => a.machine - b.machine).map((r) => {
     const h = live[r.machine]?.h;
     const count = S.status.projects.reduce((n, q) => n + q.placed.filter((x) => x.machine === r.machine && !x.leaving).length, 0);
     const dis = r.machine === from;
@@ -1232,7 +1233,8 @@ async function moveSheet(name, from, replica) {
   const res = await sheet({
     title: `Move replica ${replica} of ${name} off server ${from}`, ok: "Move",
     html: `<p class="meta">The new copy starts first and the old one is removed once the new one is healthy, so nothing goes down. The replica keeps its number and URL. A server that already runs a copy of ${esc(name)} gets a second one with its ports moved aside.</p>
-      <label class="opt"><input type="radio" name="to" value="" checked><span><b>The server with the most room</b></span></label>${opts}`,
+      ${region ? `<p class="meta">Replica ${replica} stays in ${esc(region)}. Destinations below are in that region.</p>` : ""}
+      <label class="opt"><input type="radio" name="to" value="" checked><span><b>The server with the most room${region ? " in its region" : ""}</b></span></label>${opts}`,
     onOk: (d) => ({ to: $("input[name=to]:checked", d).value }),
   });
   if (!res) return;
@@ -1688,7 +1690,7 @@ function vApp(name, q = new URLSearchParams()) {
       }
       document.title = `${name} · Runners`;
       setHtml($("#ad-head"), `<div class="row"><h1 class="grow">${esc(name)}</h1>${appPill(p, runs)}</div>
-        <div class="sub">v${p.version} · ${p.port ? `port ${p.port}` : "no port"} · updated ${ago(S.status.now - p.updated)} ago · ${p.files.length ? "built from files" : "published images"}</div>
+        <div class="sub">v${p.version} · ${p.port ? `port ${p.port}` : "no port"}${p.region ? ` · region ${esc(p.region)}` : p.regions?.length ? ` · regions ${p.regions.map(esc).join(" / ")}` : ""} · updated ${ago(S.status.now - p.updated)} ago · ${p.files.length ? "built from files" : "published images"}</div>
         ${p.port ? `<div class="url" style="margin-top:4px">${p.enabled ? appUrls(p, true) : `<span class="meta">Disabled: its URLs answer 503 until it's enabled again.</span>`}</div>` : ""}
         <div class="actions"><a class="btn primary" href="#/apps/${enc(name)}/edit">Edit</a>
           <button type="button" data-act="${p.enabled ? "disable" : "enable"}">${p.enabled ? "Disable" : "Enable"}</button>
@@ -1706,7 +1708,7 @@ function vApp(name, q = new URLSearchParams()) {
         const kind = x.leaving ? "leaving" : !p.enabled || x.machine == null || !r ? "gone" : runKind(s);
         const text = !p.enabled ? "disabled" : x.leaving ? `moving to server ${x.leaving.to}` : x.machine == null ? "waiting for a server" : !r ? "server down" : s ? s.s : "not running yet";
         return { cells: [
-          `<b><span class="mob">Replica </span>${x.replica}</b>`,
+          `<b><span class="mob">Replica </span>${x.replica}</b>${x.region ? `<div class="s">${esc(x.region)}</div>` : ""}`,
           x.machine != null ? `<a href="${machineHref(x.machine)}">Server ${x.machine}</a>${whereAndHowFar(r) ? `<div class="s">${whereAndHowFar(r)}</div>` : ""}` : "–",
           `${s ? `v${esc(s.v)}` : "–"}${target != null && s && s.v !== target ? ` <span class="s">→ v${target}</span>` : ""}`,
           `${pill(kind, text)}${x.since && !x.leaving ? `<div class="s">placed ${esc(ago(S.status.now - x.since))} ago: ${esc(x.reason)}</div>` : ""}${
@@ -1903,7 +1905,7 @@ function vEditor(name, sample) {
         <p class="hint" id="ed-fields-hint">Port: what the app listens on (or <code>x-runner.port</code> in the compose file); without one the app has no URL. Replicas: 1–${MAX_REPLICAS} (default 1), spread over the servers with the most room; more replicas than servers means some servers run two or more.</p>
         <label class="f" for="ed-compose">Docker Compose</label>
         <textarea id="ed-compose" spellcheck="false" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports: [&quot;8080:80&quot;]&#10;    restart: unless-stopped"></textarea>
-        <p class="hint">Optional with a Dockerfile: then one service is made that builds it and publishes the port.</p>
+        <p class="hint">Optional with a Dockerfile: then one service is made that builds it and publishes the port. Set <code>x-runner.region</code> to keep all replicas in one region, or <code>x-runner.regions: [us-west, us-central, us-east]</code> to assign a region to each replica as servers are replaced.</p>
         <label class="f" for="ed-dockerfile">Dockerfile</label>
         <textarea id="ed-dockerfile" spellcheck="false" placeholder="FROM node:22-alpine&#10;WORKDIR /app&#10;COPY . .&#10;CMD [&quot;node&quot;, &quot;server.js&quot;]"></textarea>
         <label class="f">Other files</label>
@@ -2262,7 +2264,7 @@ function vGuide() {
       const d = esc(dom());
       $("#guide").innerHTML = `
       <p>An app is a <b>Docker Compose file</b>, a <b>Dockerfile</b>, or both, plus any text files the build needs. It runs as many <b>replicas</b> as it asks for (1 to ${MAX_REPLICAS}, 1 by default), spread over the servers with the most free CPU and memory, one per server while there are servers without one; with more replicas than servers, some servers run two copies (the second one's ports are moved aside for it).
-        Each replica has its own URL: replica <i>k</i> is always at <code>https://&lt;name&gt;-<i>k</i>.${d}</code>, whichever server it's on. There's no shared URL that spreads visitors across replicas, so hand out the replica URL you want people on.
+        Each replica has its own URL: replica <i>k</i> is always at <code>https://&lt;name&gt;-<i>k</i>.${d}</code>, whichever server it's on. There's no shared URL that spreads visitors across replicas, so hand out the replica URL you want people on. WebSockets work there too with nothing to set (<code>wss://&lt;name&gt;-<i>k</i>.${d}/…</code>, any path, on the app's port); Cloudflare closes one that's silent for 100 s, so ping more often.
         Each deploy is a new version, and every replica switches to it at once. If it fails, it stays failing (the app's page shows each server's error) until you deploy a fix or roll back.</p>
       <h3>From this site</h3>
       <ol><li>Open <a href="#/apps/new">New app</a>, or start from one of its examples.</li>
@@ -2272,6 +2274,11 @@ function vGuide() {
         <li><b>App password</b> (optional): leave it empty and anyone can change or remove the app; with one, changing it needs that app password (or the admin password). If it's lost, the fleet's owner can set a new one with the admin password.</li>
         <li><b>Deploy.</b> The app's page shows each replica come up, and every server's error if one fails.</li></ol>
       <p class="hint">Roll back from the app's Versions list: <b>Roll back</b> deploys that version's files again (it becomes the newest version) and keeps the replica count. The app's page also sets or changes an app's password.</p>
+      <h3>Keep an app in a region</h3>
+      <p>Set <code>x-runner.region</code> to <code>us-west</code>, <code>us-central</code> or <code>us-east</code>. All replicas stay in that broad region while individual servers come and go. Leaving servers are excluded, and servers with at least 30 minutes before their scheduled departure are preferred. If the region has no usable server, the app waits there; its page explains why. Apps with no region use the whole fleet.</p>
+      ${codebox("x-runner:\n  port: 8080\n  replicas: 3\n  region: us-west\nservices:\n  web:\n    image: traefik/whoami\n    command: [\"--port\", \"8080\"]\n    ports: [\"8080:8080\"]\n")}
+      <p>To put one of three replicas in each region, replace <code>region: us-west</code> with <code>regions: [us-west, us-central, us-east]</code>. Replica 1 stays in West, 2 in Central and 3 in East. The list repeats for additional replicas without changing the assignments of existing ones. A region without capacity leaves its assigned replica waiting while the others can start.</p>
+      <p class="hint">Current fleet: ${(S.status?.regions ?? []).map((r) => `${esc(r.label)}: ${r.machines} servers`).join(" · ") || "locations are being looked up"}. US West includes California, Arizona, Washington and Wyoming; US Central includes Iowa and Illinois; US East includes Virginia. A runner's region follows its actual location, including during a handover.</p>
       <h3>With the API</h3>
       <p>Send JSON to <code>PUT ${esc(o)}/api/projects/&lt;name&gt;</code>, no credentials needed. Fields: <code>compose</code>, <code>dockerfile</code>, <code>files</code> (<code>{"path": "text"}</code>), <code>port</code>, <code>replicas</code> (1–${MAX_REPLICAS}, default 1), and optionally <code>password</code> (${MIN_APP_PASSWORD} characters or more), which locks the app. Sending only <code>{"replicas": N}</code> to an existing app changes the count and keeps its files.
         Changes to an app with a password (<code>PUT</code>, <code>/disable</code>, <code>/enable</code>, <code>/move</code>, <code>DELETE</code>) need the header <code>x-app-password</code>; <code>PUT …/projects/&lt;name&gt;/password</code> with <code>{"password": "new"}</code> sets or changes it.
@@ -2339,7 +2346,9 @@ function renderChrome() {
   if (S.statusErr) banner.textContent = `${S.statusErr}. ${S.status ? `Showing what it said ${ago(Date.now() - S.statusAt)} ago.` : ""}`;
   if (!S.status) { $("#summary").textContent = S.statusErr ? "" : "Loading…"; return; }
   const n = problems().filter((x) => x.kind === "failed" || x.kind === "gone").length;
-  setHtml($("#summary"), `${pill(n ? "failed" : "healthy", `${runsBy().size} up${n ? ` · ${n} problem${n === 1 ? "" : "s"}` : ""}`)}`);
+  const cp = S.status.controlPlane;
+  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "mac" ? "Mac controller" : "Cloudflare fallback"} · </span>` : "";
+  setHtml($("#summary"), `${controller}${pill(n ? "failed" : "healthy", `${runsBy().size} up${n ? ` · ${n} problem${n === 1 ? "" : "s"}` : ""}`)}`);
 }
 
 // Global controls: copy buttons, the time range.

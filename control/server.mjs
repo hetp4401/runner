@@ -80,12 +80,39 @@ server.keepAliveTimeout = 65_000;
 // streams them (/api/logs/stream?session=...&run=..., with the join token). The control plane passes lines from one
 // to the other and keeps nothing (see openLogSession).
 const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
+const agentSockets = new Map();
+const originalWake = control.wake.bind(control);
+control.wake = (run) => {
+  const ws = agentSockets.get(run);
+  if (ws?.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "wake" }));
+  originalWake(run);
+};
 server.on("upgrade", (req, socket, head) => {
   const refuse = (status) => {
     socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
   };
   try {
     const url = new URL(req.url, "http://localhost");
+    if (url.pathname === "/api/agent") {
+      if (!control.isJoinToken(req.headers.authorization)) return refuse(401);
+      return wss.handleUpgrade(req, socket, head, (ws) => {
+        let run = null;
+        ws.on("message", (raw) => {
+          let message;
+          try {
+            message = JSON.parse(raw);
+            if (message.type !== "sync" || !Number.isSafeInteger(message.id)) throw new Error("invalid report");
+            run = message.body?.run;
+            if (run) agentSockets.set(run, ws);
+            control.setPace(Date.now());
+            const plan = control.sync(message.body, req.headers["cf-connecting-ip"] || null);
+            ws.send(JSON.stringify({ type: "plan", id: message.id, plan }));
+          } catch (error) { ws.send(JSON.stringify({ type: "error", id: message?.id, error: error.message })); }
+        });
+        ws.on("close", () => { if (agentSockets.get(run) === ws) agentSockets.delete(run); });
+        ws.on("error", () => {});
+      });
+    }
     const viewer = url.pathname.match(/^\/admin\/api\/logs\/([0-9a-f-]{36})$/);
     if (viewer) {
       const origin = req.headers.origin;

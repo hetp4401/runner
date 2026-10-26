@@ -34,4 +34,17 @@ node control/test/sim/phase2.test.mjs   # every app alike, readiness, replica ch
 node control/test/sim/phase3.test.mjs   # scheduled departures and their gates, same-slot handovers, capped pools, losses
 node control/test/sim/phase4.test.mjs   # failing copies, sick servers, the hot rule, the thrash breaker, moves in flight
 node control/test/sim/phase5.test.mjs   # dark and lit replicas, cold departures, churn, wait reasons, the alert webhook
+node control/test/sim/regions.test.mjs  # regional placement, shortages, moves, eviction, deadlines, cross-region handovers
+node control/test/sim/hybrid.test.mjs   # D1 encryption/write suppression, receipts, witnesses and cold recovery
+node control/test/agent-link.mjs        # large reports, fragmented WebSocket replies, ping and wake
 ```
+
+## Hybrid integration
+
+Use Node 24. From `control/`, initialize a disposable local D1 database:
+
+```sh
+npx wrangler d1 execute CONFIG --local --file migrations/0001_configuration.sql --config test/wrangler.hybrid.jsonc --persist-to /tmp/runner-hybrid-test
+```
+
+In separate terminals, run `node test/cloudflare-mock.mjs` (port 8790) and `npx wrangler dev --config test/wrangler.hybrid.jsonc --persist-to /tmp/runner-hybrid-test --port 8787`. Then run `node test/hybrid-live.mjs`. The test starts its own Mac process, pauses/resumes it to simulate sleep, checks takeover and handback, verifies authentication and zero D1 traffic for reports, and forces a cold DO restart to recover from agent witnesses. All credentials in the test config are fake; the Cloudflare API target is local.

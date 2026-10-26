@@ -1,0 +1,23 @@
+{
+  "name": "runner-control-hybrid",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [
+    { "pattern": "runners.billybishop4-workers.xyz/*", "zone_id": "44fb65648f475249f22e9d0cffdd393d" },
+    { "pattern": "control.billybishop4-workers.xyz/*", "zone_id": "44fb65648f475249f22e9d0cffdd393d" }
+  ],
+  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
+  "durable_objects": { "bindings": [{ "name": "CONTROL", "class_name": "FleetCoordinator" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["FleetCoordinator"] }],
+  "d1_databases": [{ "binding": "CONFIG", "database_name": "runners-config", "database_id": "6932a8c6-397b-490c-bca8-66044a16a270", "migrations_dir": "migrations" }],
+  "vars": {
+    "DOMAIN": "billybishop4-workers.xyz",
+    "CONTROL_HOST": "runners.billybishop4-workers.xyz",
+    "ACCOUNT_ID": "8eaec409542ced2fc62e1b31228e8f85",
+    "ZONE": "44fb65648f475249f22e9d0cffdd393d",
+    "POLL_S": "60",
+    "MEMORY_HISTORY_MIN": "60"
+  }
+}

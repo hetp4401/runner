@@ -1,6 +1,6 @@
 # runner
 
-A self-healing fleet of machines that join a control plane: pools of GitHub Actions machines plus any of your own hosts, each online through its own Cloudflare tunnel. A project says how many replicas it wants, and the control plane places them on the machines with the most room. The control plane is one Node process with a SQLite file ([`control/`](control)), running on a server of yours behind its own Cloudflare tunnel; Cloudflare provides nothing else than the tunnels and the DNS names. Machines find it: each one that starts up claims a free slot *n*, and the control plane creates tunnel `runner-n` for it the first time that slot is used.
+A self-healing fleet of machines that join a control plane: pools of GitHub Actions machines plus any of your own hosts, each online through its own Cloudflare tunnel. A project says how many replicas it wants, and the control plane places them on the machines with the most room. The [hybrid control plane](docs/hybrid-control.md) uses a Mac as its preferred scheduler, a Cloudflare Durable Object for automatic fallback, and encrypted D1 for configuration and credentials. Its runtime database is disposable; agents retain the recovery state. Each machine claims a free slot *n*, and the control plane creates tunnel `runner-n` the first time that slot is used.
 
 Neither the control plane nor the agent knows what a machine is, where it comes from, or how long it lives; they're told. An agent describes its machine with a **pool** (the name of a replaceable set it belongs to, which the control plane keeps at its size; or none, for a standalone host that keeps its slot across restarts), whether it **starts** machines (it has a `START_CMD`), an optional label (a name for the pages; `install.sh` uses the host's hostname), and sends **leaving** on its last check-in when it's going for good. An agent that knows how long its machine lives (`LIFETIME_MIN`) reports its deadline, and the control plane schedules its departure (see Departures); whatever runs the machine can also ping **`POST /api/drain`** when it's going down soon. Everything about GitHub Actions lives in [`machine.yml`](.github/workflows/machine.yml): the job's lifetime (355 minutes, under GitHub's 6-hour limit), a backstop drain at 330 minutes, and the command that starts another machine.
 
@@ -9,7 +9,7 @@ Neither the control plane nor the agent knows what a machine is, where it comes 
   - **An app's env holds its secrets:** `runnerctl env <name> KEY=value` (or `"env": {...}` in a deploy) keeps variables in the control plane and writes them into every copy's `.env`, so compose fills `${KEY}` from it and `env_file: .env` passes them into containers. Values are never shown again, only the names, while the compose file itself is public. Every copy also gets `FLEET_APP`, `FLEET_REPLICA`, `FLEET_MACHINE`, `FLEET_HOST` (its public hostname) and `FLEET_DOMAIN` there: nothing that changes with the replica count or the version, so a replica change restarts no copy that stays. An env change is a new version (same files), so the copies restart with it.
   - **An app with a password asks for it on every change:** whoever deploys an app can give it an app password (optional), or set one later from its page or with `runnerctl password <name>`. From then on, every change made from the site (deploy, replicas, move, enable, disable, delete, a new password) asks, right then, for that password or the admin password. Nothing is kept in the browser: the next change asks again. Fleet changes ask for the admin password the same way.
   - **Needs the admin password (the fleet owner's):** changing the fleet, which covers automatic rebalancing, restarting machines, moving every app off a machine, retiring slots, and showing the join command for a new machine. Those controls show a lock, and using one asks for the password once per browser session (or remembers it on that device if you tick the box).
-  - **Metrics:** CPU, memory, disk I/O and network I/O for the whole fleet, for each machine and for each app. History is kept at 1-minute resolution for 48 hours, 10-minute resolution for 3 days and hourly for 30 days.
+  - **Metrics:** CPU, memory, disk I/O and network I/O for the fleet, machines and apps. Hybrid mode keeps an hour in controller memory and six hours on each agent. Long-term history is not written to D1 and disappears with the machines that held it. The standalone SQLite server retains its original longer history.
 
 ## Projects
 
@@ -29,6 +29,7 @@ A project is a docker compose file, optionally with Dockerfiles and other files 
   ```
 
 - **Dockerfile only:** a custom image. The control plane wraps it in a one-service compose file (`build: .`) that publishes the port. The app should listen on that port.
+- **WebSockets:** nothing to set: every app's replica URLs take WebSocket connections on the app's port like its HTTP (`wss://<project>-<k>.billybishop4-workers.xyz/...`, any path, through Cloudflare's tunnel and the machine's router). Cloudflare closes a WebSocket that's silent for 100 s, so ping more often than that; a client should reconnect when one closes (a copy moving or handing over ends its connections), and a router reload (another app changing on the machine) keeps open ones for up to an hour.
 - **Readiness:** `x-runner.ready: /path` makes the agent ask each copy for that path; a copy counts as healthy (for moves, DNS, handovers) only while it answers 2xx. The agent never restarts a copy for not being ready; one unready for 10 minutes while ready elsewhere is moved like a failing one.
 - **Compose plus files:** files sit next to the compose file, so `build: .` or `build: ./web` (with `web/Dockerfile`) find them. You can also include whatever the Dockerfiles `COPY`, as long as it's text. Every machine builds the image when the version changes.
 
@@ -37,6 +38,10 @@ Project names are lowercase letters, digits and dashes, and can't end in `-<numb
 Sending only `{"replicas": N}` (or only a port) for an existing project makes a new version with the latest version's files, so a replica change never puts back files someone else has changed since.
 
 ### Placement
+
+Set `x-runner.region: us-west` (or `us-central` / `us-east`) in an app's Compose spec to keep its replicas in that broad region as runners come and go. Moves and replacements honor the region; if it has no usable runner, copies wait there. Placement prefers runners with at least 30 minutes before their scheduled departure or hard deadline. The status API and deploy guide show the fleet's current region groups and counts. See [region affinity](docs/region-affinity.md) for the grouping, handover behavior and an example.
+
+For one of three replicas in each region, use `x-runner.regions: [us-west, us-central, us-east]` instead. Each replica keeps its assigned region across replacements; the list repeats if the count grows.
 
 Each replica goes to the machine with the most room: the least CPU and memory in use (from the machine's latest metrics) and the fewest copies already placed on it, machines that don't run the project yet first. Once every machine has a copy, the next replicas double up on the least busy machines: the second copy on a machine runs as compose project `<name>-r<k>` with its published host ports moved out of the first copy's way; each copy answers its own replica's name, so the machine's router tells them apart. A project can't double up if its compose file uses `network_mode: host`, a `container_name` or variables in `ports`; that replica waits and the app's page says why. Two different projects that publish the same host port, or use the same `container_name`, are never placed on one machine either (the second would fail to start). A replica stays on its machine until that machine goes away (its run stops checking in); then it moves to the best machine left, within about a minute, keeping its number and URL. To move one by hand (you're about to remove the machine, say), use **Move** in the project's details or **Move apps off** on the machine: the new copy is placed first, and the old one is removed once the new one is healthy, so nothing goes down. A machine counts as gone only after the control plane has been reachable for a while: after a restart, and after any gap in check-ins longer than the liveness window (its own tunnel dropping, say), nothing is re-placed for 5 minutes, so the first machine back doesn't get every copy.
 
@@ -81,13 +86,13 @@ PUT    /api/settings                            {"pools": {"<pool>": 10}, "rebal
 POST   /api/projects/<name>/move?from=N[&to=M][&replica=K]  move one copy off machine N (to M, or the machine with the most room)
 POST   /api/machines/<n>/evict[?force=1]        move every placed project off machine n (apps changing as much as they may wait, unless forced)
 POST   /api/projects/<name>/logs?replica=K      watch a replica's live logs: a session, for the WebSocket /admin/api/logs/<session> (the app's password or the admin password)
-GET    /api/events?since=&kinds=&app=&machine=&limit=  what changed and why, 30 days: placements, moves, departures, strikes, dark and lit replicas, alerts
+GET    /api/events?since=&kinds=&app=&machine=&limit=  recent changes; hybrid history is disposable and partly recovered from agents
 DELETE /api/slots/<n>                           retire an empty slot: tunnel, records and DNS names go
 GET    /api/join-token                          the join token (needs the admin password)
 POST   /api/join                                an agent starting up: {"agent", "pool", "url", "label", "want"} -> its slot and tunnel token
 POST   /api/claim?pool=<name>                    machines to start so the pool has its size (for a watchdog outside the pool)
 POST   /api/drain                               {"agent": id}, {"run": id} or {"machine": n}: it's going down soon, hand it over
-GET    /api/wake?run=<run>                      (agents) held open up to 45 s, answered at once when the control plane wants a check-in now
+WS     /api/agent                              (agents) authenticated reports, plans and requests for a fresh report; replaces /api/wake
 WS     /api/logs/stream?session=<id>&run=<run>  (agents) a live log stream for a session
 ```
 
@@ -120,14 +125,16 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 
 ## How it works
 
-- **Control plane** ([`control/`](control)): one Node process (`server.mjs`) with a SQLite file, reached through its own Cloudflare tunnel at `runners.<domain>`. It:
+- **Control plane** ([`control/`](control)): a Worker gateway and one Durable Object coordinate the Mac scheduler and fallback at `runners.<domain>`. Both use SQLite in memory, with durable configuration loaded from D1 once at startup. It:
   - holds every project's versions
   - places each project's replicas on the machines with the most room, and moves them when a machine goes
   - runs the rollouts
   - tracks machines and hands out restarts
   - keeps the DNS in line: `<project>-<k>` is a CNAME to the tunnel of the machine running replica *k*, moved when the copy moves
 - **Agent** ([`agent/agent.mjs`](agent/agent.mjs)), on every machine (run by [`machine.yml`](.github/workflows/machine.yml) on GitHub Actions, by `install.sh` on a host). It's configured by environment variables (listed at the top of the file) and:
-  - checks in every 20 seconds, describing its machine: pool, label, whether it starts machines, and keeps one request open at `/api/wake` so the control plane can ask it to check in at once
+  - reports every 60 seconds over one outgoing WebSocket, describing its machine and metrics; the controller can request a report immediately over that connection
+  - checks health locally every 10 seconds and can repair already-authorized containers during a controller outage
+  - privately retains its identity, approved plan, signed recovery receipt and recent metrics; three healthy agents also retain the fleet scheduling snapshot
   - streams a copy's logs to the control plane while someone watches them (`agent/ws.mjs` is its WebSocket client)
   - writes each project's files and runs `docker compose up -d --build --wait` (with `--force-recreate` when the files changed since its containers were last brought up there: compose has been seen to keep an old container running after its image was rebuilt); a project that fails is tried again (every 30 seconds while the machine is starting up, every 3 minutes once it's online), and a project that stops answering is recreated
   - opens its tunnel only once every project it was given is up and answering (or after 10 minutes), so a fresh machine never takes traffic it can't serve
@@ -143,9 +150,13 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 
 ## Running the control plane
 
+The Mac + Cloudflare deployment and recovery procedure is documented in [Hybrid control plane](docs/hybrid-control.md). `control/mac.mjs` needs Node 24 and opens an outbound connection only. D1 stores configuration and credentials; the only Worker secret needed after bootstrap is `CONFIG_KEY`.
+
+The standalone server below remains available for development and migration:
+
 `control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). `AGENT_URL` is where machines joining with `install.sh` fetch the agent's code (default: this repo's main branch). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. It listens on 127.0.0.1 only; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
-The live one runs on the owner's VPS as systemd user units `runner-control.service` (the server, from this repo's checkout) and `runner-control-tunnel.service` (cloudflared), with the settings in `~/.config/runner-control/env`. To deploy a change: pull, then `systemctl --user restart runner-control.service`; the agents keep what's running while it's down for the second that takes. `GET /api/export` and `POST /api/import` (admin password) move the whole state to another server.
+The previous VPS deployment used systemd user units `runner-control.service` and `runner-control-tunnel.service`, with settings in `~/.config/runner-control/env`. Keep its database and configuration as migration backups. `GET /api/export` and `POST /api/import` (admin password) move standalone server state; hybrid staging uses its authenticated `/internal/import` endpoint while disabled.
 
 ## Tests
 

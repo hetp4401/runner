@@ -3,12 +3,20 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
+    "sql.js": "^1.15.2",
     "ws": "^8.22.0",
     "yaml": "^2.9.1"
   },
   "private": true,
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "mac": "node mac.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test:hybrid": "node test/sim/hybrid.test.mjs && node test/agent-link.mjs"
   },
-  "description": "runner control plane: one Node process with SQLite"
+  "description": "Runner control plane with a Mac scheduler, Durable Object fallback and encrypted D1 configuration",
+  "devDependencies": {
+    "wrangler": "^4.153.0"
+  }
 }

@@ -30,8 +30,9 @@
 //                                 here rather than in the compose file, which everyone can read. A change is a new version.
 //                                            /admin/api/*  the same, for the UI (changes from other sites are refused)
 //   /admin, /metrics  redirect to the app      /api/metrics  machine and app metrics (no token needed)
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import YAML from "yaml";
+import { REGIONS, regionOf, regionForReplica } from "./regions.js";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
 // grows with the number of machines (20 machines: every 20 s; 50: every 43 s). Never under MIN_POLL_S or over
@@ -300,6 +301,8 @@ function keysOn(replicas, name) {
 // What an app says about itself in its compose file's x-runner block, beyond port and replicas:
 //   ready: /path     a path that answers 2xx once a copy is ready to serve (synced, say): "healthy" waits for it, but a
 //                    copy that isn't ready is never restarted for it (only a copy that stops answering at all is)
+//   region: us-west  keep placements and moves in a broad region while individual VMs are replaced
+//   regions: [...]   assign replica 1 to the first region, replica 2 to the next, repeating as needed
 // Every app is treated alike otherwise: a move starts the new copy and drops the old one only once the new one works.
 function policyOf(compose) {
   let xr = {};
@@ -309,6 +312,8 @@ function policyOf(compose) {
   if (!isMap(xr)) xr = {};
   return {
     ready: typeof xr.ready === "string" ? xr.ready : null,
+    region: typeof xr.region === "string" && Object.hasOwn(REGIONS, xr.region) ? xr.region : null,
+    regions: Array.isArray(xr.regions) ? xr.regions.filter((r) => typeof r === "string" && Object.hasOwn(REGIONS, r)) : [],
   };
 }
 
@@ -464,6 +469,14 @@ function buildSpec(body, { trusted = false } = {}) {
   replicas ??= parseReplicas(doc["x-runner"]?.replicas, "x-runner.replicas") ?? 1;
   const xr = isMap(doc["x-runner"]) ? doc["x-runner"] : {};
   if (xr.ready != null && !(typeof xr.ready === "string" && /^\/[\x21-\x7e]{0,199}$/.test(xr.ready))) throw new HttpError(400, "x-runner.ready is a path, like /healthz");
+  if (xr.region != null && !(typeof xr.region === "string" && Object.hasOwn(REGIONS, xr.region))) {
+    throw new HttpError(400, `x-runner.region must be one of: ${Object.keys(REGIONS).join(", ")}`);
+  }
+  if (xr.regions != null && !(Array.isArray(xr.regions) && xr.regions.length > 0 && xr.regions.length <= MAX_REPLICAS &&
+    xr.regions.every((r) => typeof r === "string" && Object.hasOwn(REGIONS, r)))) {
+    throw new HttpError(400, `x-runner.regions must be a nonempty list of up to ${MAX_REPLICAS} regions: ${Object.keys(REGIONS).join(", ")}`);
+  }
+  if (xr.region != null && xr.regions != null) throw new HttpError(400, "set x-runner.region or x-runner.regions, not both");
   if (!trusted) {
     // Checked as compose reads it: with YAML merge keys (<<) applied.
     const merged = YAML.parse(compose, { merge: true });
@@ -513,7 +526,7 @@ docker run -d --name runner-agent --restart unless-stopped --stop-timeout 180 --
     set -e
     apk add --no-cache nodejs >/dev/null
     mkdir -p /agent && cd /agent
-    for f in agent.mjs metrics.mjs ws.mjs; do wget -qO $f ${agentUrl}/$f; done
+    for f in agent.mjs metrics.mjs ws.mjs control-link.mjs; do wget -qO $f ${agentUrl}/$f; done
     exec node agent.mjs'
 echo "Joined. Follow it with: docker logs -f runner-agent"
 `;
@@ -650,6 +663,10 @@ export class Control {
     this.lossNoted = new Set(); // runs whose loss has been noted
     this.pulled = new Set(); // runs made due early to spread a pool's departures (see flatten)
     this.bootAt = Date.now();
+    this.recoveringUntil = this.env.RECOVER_RUNTIME === "1" ? this.bootAt + Number(this.env.RECOVERY_MS ?? 180_000) : 0;
+    this.recoverySeen = new Map();
+    this.recoveryMissing = new Set();
+    this.recoverySettingsAt = 0;
     this.settleAt = this.bootAt; // the (re)start, or the end of the last gap in check-ins: SETTLE_MS and ARRIVAL_MS count from here
     // The last check-in before the (re)start or gap: the runs live then are the ones settling() waits for.
     this.quietSince = Math.max(0, ...[...this.runs.values()].map((r) => r.seen));
@@ -756,6 +773,7 @@ export class Control {
   // passed), a pool looks smaller than it is and copies look lost, so nothing is started, retired, moved or re-placed.
   // However long the gap was: a run counts if it was live at quietSince.
   settling(now) {
+    if (this.recoveryActive(now)) return true;
     return now - this.settleAt < SETTLE_MS &&
       [...this.runs.values()].some((x) => !x.retire && x.seen >= this.quietSince - this.liveMs && x.seen < this.settleAt);
   }
@@ -983,7 +1001,8 @@ export class Control {
     if (method === "GET" && route === "/events") return json(this.events(url.searchParams));
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
-    if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip));
+    if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip,
+      this.env.USE_EDGE_LOCATION === "1" ? decodeURIComponent(request.headers.get("x-runner-location") || "") : null));
     if (method === "POST" && route === "/claim") {
       need(node, "the join token");
       const pool = url.searchParams.get("pool");
@@ -1091,7 +1110,7 @@ export class Control {
 
   describe(p) {
     const latest = this.version(p.name, p.version);
-    const placed = this.copiesOf(p.name).map((x) => ({ machine: x.machine, replica: x.replica, key: x.key, since: x.since, reason: x.reason, cause: x.cause, leaving: x.leaving, moved: Boolean(x.ports) }))
+    const placed = this.copiesOf(p.name).map((x) => ({ machine: x.machine, replica: x.replica, region: regionForReplica(latest?.policy, x.replica), key: x.key, since: x.since, reason: x.reason, cause: x.cause, leaving: x.leaving, moved: Boolean(x.ports) }))
       .sort((a, b) => a.replica - b.replica || Boolean(a.leaving) - Boolean(b.leaving));
     const staying = placed.filter((x) => !x.leaving).length;
     return {
@@ -1100,6 +1119,8 @@ export class Control {
       stable: p.stable,
       port: latest?.port ?? null,
       replicas: latest?.replicas ?? 1,
+      region: latest?.policy.region ?? null,
+      regions: latest?.policy.regions ?? [],
       placed, // each replica's machine, by replica number; a copy being moved away (leaving) comes after its new copy
       staying,
       blocked: this.blocked.get(p.name) ?? null, // why a replica has no machine, when it's a clash rather than a shortage
@@ -1324,7 +1345,7 @@ export class Control {
 
   // What machine n should run: every copy placed on it, at its project's latest version (or the last good one if the
   // latest is halted), keyed by the copy's key (see freeKey). Disabled projects run nowhere.
-  desiredFor(machine, successor = null) {
+  desiredFor(machine, successor = null, run = successor ?? this.liveMachines(Date.now()).get(machine)) {
     const out = {};
     for (const p of this.projects.values()) {
       if (!p.enabled) continue;
@@ -1334,6 +1355,11 @@ export class Control {
       for (const x of this.copiesOn(p.name, machine)) {
         // A successor doesn't build copies that are moving off the machine.
         if (successor && x.leaving) continue;
+        // Keep a serving copy during a region change, while its replacement
+        // starts elsewhere. A fresh VM must establish its own location before
+        // inheriting a constrained app, even when it reuses the same slot.
+        const region = regionForReplica(spec.policy, x.replica);
+        if (region && regionOf(run?.location) !== region && run?.status?.[x.key]?.s !== "healthy") continue;
         out[x.key] = { v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica,
           ...(spec.policy.ready ? { ready: spec.policy.ready } : {}) };
       }
@@ -1468,6 +1494,7 @@ export class Control {
   }
 
   place(now) {
+    if (this.recoveryActive(now)) return;
     const up = this.liveMachines(now); // machine -> its newest live run
     let changed = false;
     // After a (re)start the first machine to check in would get every replica, because it's the only one with
@@ -1528,6 +1555,30 @@ export class Control {
       const have = new Set(this.copiesOf(p.name).filter((x) => !x.leaving).map((x) => x.replica));
       this.blocked.delete(p.name);
       if (!arrived) continue;
+      if (spec?.policy.region || spec?.policy.regions.length) {
+        for (const x of [...this.copiesOf(p.name)]) {
+          const run = up.get(x.machine);
+          const region = regionForReplica(spec.policy, x.replica);
+          // Unknown locations wait for the lookup; they aren't a different region.
+          if (x.leaving || !regionOf(run?.location) || regionOf(run.location) === region) continue;
+          const serving = this.liveRuns(now).some((r) => r.machine === x.machine && r.ready &&
+            r.status?.[x.key]?.s === "healthy" && r.status[x.key].r !== false);
+          // Copies that already have no serving VM are missing capacity, not
+          // additional voluntary disruption. Several wrong-region replacements
+          // must not block one another through the transition budget.
+          if (serving && !this.mayTransition(p.name, now, null, x.replica)) continue;
+          try {
+            const before = new Set(this.copiesOf(p.name));
+            this.move(p.name, x.machine, null, x.replica, { cause: "region", why: `replica ${x.replica} requires ${region}` });
+            const dest = this.copiesOf(p.name).find((y) => !before.has(y) && !y.leaving);
+            if (dest) counts.set(dest.machine, (counts.get(dest.machine) ?? 0) + 1);
+            changed = true;
+          } catch (e) {
+            if (e.status !== 409) throw e;
+            this.blocked.set(p.name, `replica ${x.replica} is waiting for a usable server in ${region}`);
+          }
+        }
+      }
       const missing = [];
       for (let k = 1; k <= want; k++) if (!have.has(k)) missing.push(k);
       if (!missing.length) {
@@ -1535,10 +1586,10 @@ export class Control {
         continue;
       }
       for (const k of missing) {
-        const best = this.bestMachine(p.name, up, counts, now);
+        const best = this.bestMachine(p.name, up, counts, now, k);
         if (!best) {
-          if (up.size) this.blocked.set(p.name, this.whyBlocked(p.name, spec, up));
-          break;
+          if (up.size || regionForReplica(spec?.policy, k)) this.blocked.set(p.name, this.whyBlocked(p.name, spec, up, k));
+          continue; // a missing region must not block later replicas in other regions
         }
         if (best.doubling && want > 1 && this.deferDoubling(p.name, up, now)) {
           this.blocked.set(p.name, "waiting for a server that's starting, rather than running two copies on one");
@@ -1708,6 +1759,13 @@ export class Control {
     const nx = this.copiesOf(name).find((y) => y.machine === lv.to && y.replica === x.replica && !y.leaving);
     if (!nx) return { cancel: "its new copy is gone", noNew: true };
     const run = up.get(lv.to);
+    const policy = this.version(name, this.projects.get(name)?.version)?.policy;
+    const requiredRegion = regionForReplica(policy, x.replica);
+    if (requiredRegion && run) {
+      const region = regionOf(run.location);
+      if (!region) return null; // a process restart may still be looking up this run
+      if (region !== requiredRegion) return { cancel: `server ${lv.to} is outside the required region ${requiredRegion}`, failed: false };
+    }
     if (this.copyHealthy(name, nx, run)) {
       if (!lv.okAt) {
         lv.okAt = now;
@@ -1747,13 +1805,20 @@ export class Control {
   }
 
   // Why no machine could take a copy, for the project's page.
-  whyBlocked(name, spec, up) {
+  whyBlocked(name, spec, up, replica = 1) {
+    const region = regionForReplica(spec?.policy, replica);
+    const scope = region ? `${region}: ` : "";
+    if (region) {
+      const regional = new Map([...up].filter(([, r]) => regionOf(r.location) === region));
+      if (!regional.size) return `replica ${replica} is waiting for a server in ${region}; no live server has a known matching region`;
+      up = regional;
+    }
     const empty = [...up.keys()].filter((m) => !this.copiesOn(name, m).length);
     if (empty.length) {
       const clash = empty.map((m) => this.clash(name, m)).find(Boolean);
-      return clash ? `every other server already has an app using ${clash.what} (${clash.other})` : "no server can take it";
+      return scope + (clash ? `every other server already has an app using ${clash.what} (${clash.other})` : "no usable server can take it");
     }
-    return `every server already runs it, and it can't run twice on one server (${spec?.nodup ?? "its compose file"})`;
+    return scope + `every server already runs it, and it can't run twice on one server (${spec?.nodup ?? "its compose file"})`;
   }
 
   // Host ports for a copy of a project on a machine: each of the project's published ports as it is when nothing on
@@ -1806,13 +1871,15 @@ export class Control {
 
   // The machine for a copy of an app. Out: machines where it would clash, where a second copy can't run, that are
   // leaving (drain, handover, evict, due), mid-handover, quarantined, or where a move of the app just failed. Machines
-  // that will be stopped soon (under 30 minutes left) or are hot (over HOT_CPU / HOT_MEM on their last 3 minutes) are
+  // outside its region are excluded too. Machines near their scheduled departure or hard deadline (under 30 minutes
+  // left), or hot (over HOT_CPU / HOT_MEM on their last 3 minutes), are
   // passed over unless nothing else is left. Then: ready first, fewest copies of the app on the machine (a second copy
   // only where every machine has one), then in its pool, then machines with room (under ROOM_CPU / ROOM_MEM) before
   // busy ones, fewest copies placed, most room.
-  bestMachine(name, up, counts, now) {
+  bestMachine(name, up, counts, now, replica = 1) {
     const p = this.projects.get(name);
     const spec = p && this.version(name, p.version);
+    const region = regionForReplica(spec?.policy, replica);
     const mine = new Map(); // machine -> copies of this app there (ones moving away included: their ports are still in use)
     for (const x of this.copiesOf(name)) mine.set(x.machine, (mine.get(x.machine) ?? 0) + 1);
     const inPool = new Map(); // pool -> staying copies of this app there
@@ -1821,6 +1888,7 @@ export class Control {
     for (const r of this.liveRuns(now)) runsOnSlot.set(r.machine, (runsOnSlot.get(r.machine) ?? 0) + 1);
     const cands = [];
     for (const r of up.values()) {
+      if (region && regionOf(r.location) !== region) continue;
       const doubling = mine.get(r.machine) ?? 0;
       if (this.clash(name, r.machine) || (doubling && spec?.nodup)) continue;
       if (r.drain || r.handover || r.retire || r.evict || (runsOnSlot.get(r.machine) ?? 0) > 1) continue;
@@ -1832,7 +1900,7 @@ export class Control {
       const placed = counts.get(r.machine) ?? 0;
       cands.push({
         machine: r.machine, ready: r.ready, doubling, pool: inPool.get(pool) ?? 0, placed, h: room.h, roomy: room.h > 0,
-        lifeOk: !r.deadline || r.deadline - now >= 30 * MIN, hot: room.cpu > HOT_CPU || room.mem > HOT_MEM,
+        lifeOk: Math.min(r.deadline ?? Infinity, due ?? Infinity) - now >= 30 * MIN, hot: room.cpu > HOT_CPU || room.mem > HOT_MEM,
         reason: `${room.measured ? `cpu ${Math.round(room.cpu)}%, memory ${Math.round(room.mem)}%` : "no metrics yet"}, ${placed} other ${placed === 1 ? "copy" : "copies"} placed`,
       });
     }
@@ -1869,6 +1937,10 @@ export class Control {
     const origin = this.copiesOf(name).find((y) => y.replica === x.replica && y.leaving?.to === from);
     const spec = this.version(name, p.version);
     const up = this.liveMachines(now);
+    const region = regionForReplica(spec?.policy, x.replica);
+    if (to && up.has(Number(to)) && region && regionOf(up.get(Number(to)).location) !== region) {
+      throw new HttpError(409, `${name} replica ${x.replica} requires ${region}; server ${to} is in ${regionOf(up.get(Number(to)).location) ?? "an unknown region"}`);
+    }
     let dest;
     if (origin && to && Number(to) === origin.machine) { // back where it came from: the move is called off
       this.dropCopy(name, from, x.replica, null, now);
@@ -1886,8 +1958,8 @@ export class Control {
       if (clash) throw new HttpError(409, `server ${to} already has ${clash.other}, which uses ${clash.what} too`);
       dest = { machine: m, doubling, reason: `moved here from server ${from} ${why ? `automatically: ${why}` : "by hand"}` };
     } else {
-      const best = this.bestMachine(name, new Map([...up].filter(([m]) => m !== from && m !== origin?.machine && !this.failedHere(name, m, now))), this.placementCounts(), now);
-      if (!best) throw new HttpError(409, `no other server is up for ${name}`);
+      const best = this.bestMachine(name, new Map([...up].filter(([m]) => m !== from && m !== origin?.machine && !this.failedHere(name, m, now))), this.placementCounts(), now, x.replica);
+      if (!best) throw new HttpError(409, `no other usable server${region ? ` in ${region}` : ""} is up for ${name}`);
       dest = { ...best, reason: `moved here from server ${from}${why ? ` automatically: ${why}` : ""}: ${best.reason}` };
     }
     if (origin) {
@@ -2154,7 +2226,7 @@ export class Control {
         const mem = room.mem + (memTotal ? (100 * pick.s.memBytes) / memTotal : pick.s.mem);
         return cpu < ROOM_CPU && mem < ROOM_MEM && !this.hotness(d, now);
       };
-      const dest = this.bestMachine(pick.name, ctx.dests(r.machine, (m) => !tookHot.has(m) && fits(m)), ctx.counts, now);
+      const dest = this.bestMachine(pick.name, ctx.dests(r.machine, (m) => !tookHot.has(m) && fits(m)), ctx.counts, now, pick.x.replica);
       if (!dest) {
         this.noteRebalance(`hotroom|${r.id}`, `${what}, but no server has room for ${pick.name} (${Math.round(share(pick.s))}% of it)`, now, { machine: r.machine, app: pick.name });
         continue;
@@ -2190,7 +2262,7 @@ export class Control {
           if (no) this.noteRebalance(`failno|${name}|${x.replica}`, `${name} replica ${x.replica} is failing on server ${x.machine}, but it's left there: ${no}`, now, { app: name, replica: x.replica, machine: x.machine });
           continue;
         }
-        const dest = this.bestMachine(name, ctx.dests(x.machine), ctx.counts, now);
+        const dest = this.bestMachine(name, ctx.dests(x.machine), ctx.counts, now, x.replica);
         if (!dest) {
           this.noteRebalance(`failroom|${name}|${x.replica}`, `${name} replica ${x.replica} is failing on server ${x.machine}, and no other server can take it`, now, { app: name, replica: x.replica, machine: x.machine });
           continue;
@@ -2219,7 +2291,7 @@ export class Control {
       if (!from) continue;
       const x = list.filter((y) => y.machine === from[0] && !y.leaving).sort((a, b) => b.replica - a.replica)[0];
       if (this.neverAuto(name)) continue;
-      const dest = this.bestMachine(name, ctx.dests(from[0], (m) => !list.some((y) => y.machine === m) && this.hasRoom(m, now)), ctx.counts, now);
+      const dest = this.bestMachine(name, ctx.dests(from[0], (m) => !list.some((y) => y.machine === m) && this.hasRoom(m, now)), ctx.counts, now, x.replica);
       if (dest) ctx.start(name, x, dest, "unstack", `server ${from[0]} ran ${from[1]} copies of ${name} and server ${dest.machine} none`);
     }
     return null;
@@ -2433,7 +2505,7 @@ export class Control {
     const runs = this.liveRuns(Date.now()).filter((r) => r.machine === s.machine);
     if (!runs.length) say("info", `server ${s.machine} isn't checking in right now; waiting for it`);
     else say("info", `asking server ${s.machine} to stream ${s.name} replica ${s.replica}`);
-    for (const r of runs) this.wakers.get(r.id)?.(true);
+    for (const r of runs) this.wake(r.id);
     s.waiting = setTimeout(() => {
       if (this.logSessions.get(id) === s && !s.agent) say("info", `server ${s.machine} hasn't started streaming: its agent may be older than live logs (servers get the new one as they're replaced)`);
     }, 25_000);
@@ -2472,6 +2544,8 @@ export class Control {
 
   // An agent waiting to be told to check in now (it keeps this request open, so it hears at once when someone's
   // waiting on its server): answered with { wake: true } when that happens, else { wake: false } after WAKE_HOLD_MS.
+  wake(runId) { this.wakers.get(runId)?.(true); }
+
   wait(runId) {
     const run = String(runId ?? "");
     if (!run) throw new HttpError(400, "run is required");
@@ -2615,8 +2689,10 @@ export class Control {
 
   // ---- machines ----
 
-  sync(body, ip = null) {
+  sync(body, ip = null, edgeLocation = null) {
     const now = Date.now();
+    const receipt = this.readRecovery(body, now);
+    if (this.recoveringUntil && (now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
     // Every machine silent for longer than the liveness window: this was unreachable, so give the fleet time to show
     // up again before anything counts as gone or gets placed (see SETTLE_MS).
     if (now - this.lastCheckin > this.liveMs) {
@@ -2668,13 +2744,24 @@ export class Control {
     if (Number.isFinite(rtt) && rtt >= 0) r.rtt = Math.min(60_000, Math.round(rtt));
     if (ip) {
       r.ip = ip;
-      r.location = this.locate(ip) ?? r.location ?? null;
+      r.location = edgeLocation || this.locate(ip) || r.location || null;
     }
     if (body.leaving && !r.retire) {
       r.retire = 1; // going away for good: its replicas can be placed elsewhere right now
       r.left = now;
       this.saveRun(r);
       this.logEvent("left", { machine: r.machine, run: r.id, cause: "leaving", detail: "the server said it's going away" });
+    }
+    r.protocol = Number(body.protocol) || 1;
+    if (receipt) {
+      r.recoveryAt = Math.max(r.recoveryAt ?? 0, receipt.at);
+      if (receipt.fleet) r.witnessAt = Math.max(r.witnessAt ?? 0, receipt.at);
+    }
+    if (this.recoveryActive(now)) {
+      // Older agents do not understand hold and would reconcile an absent plan.
+      // An HTTP error makes them keep their containers while inventory recovers.
+      if (r.protocol < 2) throw new HttpError(503, "reconstructing fleet state; keep current workloads");
+      return { hold: true, domain: this.env.DOMAIN, poll: 5, message: "reconstructing fleet state; keep current workloads" };
     }
     this.checkMassLoss(now);
     this.place(now);
@@ -2706,12 +2793,24 @@ export class Control {
     this.followCopies(now);
     this.cleanup(now);
     const older = r.retire ? null : this.predecessorOf(r, now);
-    const desired = r.retire ? {} : this.desiredFor(r.machine, older ? r : null);
+    const desired = r.retire ? {} : this.desiredFor(r.machine, older ? r : null, r);
+    // A successor in another region cannot serve these copies. Hold its tunnel
+    // until their moves finish, so it never replaces its predecessor's routes
+    // with a router that doesn't have those apps.
+    const regionPending = older ? [...this.projects.values()].flatMap((p) => {
+      const spec = this.version(p.name, p.halted ? p.stable : p.version);
+      if (!p.enabled || !spec) return [];
+      return this.copiesOn(p.name, r.machine).filter((x) => {
+        const region = regionForReplica(spec.policy, x.replica);
+        return region && regionOf(r.location) !== region && older.status?.[x.key]?.s === "healthy" && older.status[x.key].r !== false;
+      }).map((x) => x.key);
+    }) : [];
     // Logs someone's waiting to watch, of copies this run has: the agent streams them (see openLogSession).
     const logs = r.retire ? [] : [...this.logSessions.values()].filter((x) => x.viewer && !x.agent && x.machine === r.machine && x.key in (r.status ?? {}))
       .map((x) => ({ session: x.id, key: x.key, tail: LOG_TAIL }));
     return {
       domain: this.env.DOMAIN,
+      ...(this.env.STATE_SIGNING_KEY ? { recovery: this.recoveryFor(r, now) } : {}),
       poll: this.pollS,
       ...(logs.length ? { logs } : {}),
       desired,
@@ -2719,8 +2818,131 @@ export class Control {
       handover,
       start,
       // A successor (an older run of this machine still serves): it opens its tunnel once it serves what that run does.
-      ...(older ? { successor: true, serve: Object.keys(desired).filter((k) => older.status?.[k]?.s === "healthy" && older.status[k].r !== false) } : {}),
+      ...(older ? { successor: true, serve: [...new Set([...Object.keys(desired).filter((k) => older.status?.[k]?.s === "healthy" && older.status[k].r !== false), ...regionPending])] } : {}),
     };
+  }
+
+  // Each agent keeps its own signed scheduling receipt on its host. The receipt
+  // contains no credentials or app source. D1 is authoritative for desired
+  // config and tunnel credentials. The host stores the receipt privately.
+  recoveryActive(now = Date.now()) {
+    if (now < this.recoveringUntil) return true;
+    for (const run of this.recoveryMissing) {
+      const r = this.runs.get(run);
+      if (r && now - r.seen > Math.max(this.liveMs, 180_000)) this.recoveryMissing.delete(run);
+    }
+    return this.recoveryMissing.size > 0;
+  }
+
+  recoveryFor(r, now = Date.now()) {
+    const runtime = this.all("SELECT * FROM settings").filter((x) => !["pools", "rebalance", "roll"].includes(x.key) && !/^roll_\d+$/.test(x.key));
+    const payload = JSON.stringify({ v: 1, at: now, agent: r.agent, run: r.id, machine: r.machine,
+      runRow: this.all("SELECT * FROM runs WHERE id = ?", r.id)[0],
+      copies: this.all("SELECT * FROM copies WHERE machine = ?", r.machine),
+      starts: this.all("SELECT * FROM starts WHERE by = ?", r.id), runtime,
+      location: r.location ?? null,
+      events: this.recentEvents.filter((x) => x.machine === r.machine || x.other === r.machine).slice(-40),
+      // Three healthy agents also retain the small fleet-wide scheduling view.
+      // It bridges older agents during upgrades and preserves moves whose source
+      // disappears at the same time as the controller. No metrics or secrets.
+      ...(this.recoveryWitnesses(now).includes(r.id) ? { fleet: {
+        runs: this.all("SELECT * FROM runs WHERE seen > ?", now - 15 * MIN),
+        copies: this.all("SELECT * FROM copies"), starts: this.all("SELECT * FROM starts"),
+        startPools: [...this.startPools], events: this.recentEvents.slice(-200),
+      } } : {}),
+    });
+    return { payload, signature: createHmac("sha256", this.env.STATE_SIGNING_KEY).update(payload).digest("hex") };
+  }
+
+  recoveryWitnesses(now = Date.now()) {
+    const candidates = this.liveRuns(now).filter((x) => x.protocol >= 2 && x.ready && !x.retire)
+      .sort((a, b) => (b.deadline ?? b.started + 86400_000) - (a.deadline ?? a.started + 86400_000) || a.id.localeCompare(b.id));
+    const chosen = [], regions = new Set();
+    for (const r of candidates) {
+      const region = regionOf(r.location) || r.pool || "unknown";
+      if (regions.has(region)) continue;
+      chosen.push(r.id); regions.add(region);
+      if (chosen.length === 3) return chosen;
+    }
+    for (const r of candidates) if (!chosen.includes(r.id)) {
+      chosen.push(r.id); if (chosen.length === 3) break;
+    }
+    return chosen;
+  }
+
+  recoverRun(row, at, location = null) {
+    if (!row?.id || at <= (this.recoverySeen.get(`run:${row.id}`) ?? 0)) return;
+    const current = this.runs.get(row.id);
+    const observed = current && current.seen >= this.bootAt ? Object.fromEntries(
+      ["status", "seen", "ready", "protocol", "recoveryAt", "witnessAt", "cpus", "disk", "edges", "rtt", "location", "starts", "ip"].filter((key) => current[key] !== undefined).map((key) => [key, current[key]])
+    ) : {};
+    this.recoverySeen.set(`run:${row.id}`, at);
+    this.recoveryMissing.delete(row.id);
+    this.saveRun({ ...row, status: JSON.parse(row.status), savedSeen: row.seen, location, ...observed });
+    this.agents.set(row.agent, { id: row.agent, slot: row.machine, pool: row.pool ?? null, label: row.label ?? null, joined: row.started });
+  }
+
+  recoverCopies(machine, rows, at) {
+    if (at <= (this.recoverySeen.get(machine) ?? 0)) return;
+    this.recoverySeen.set(machine, at);
+    for (const [name, list] of this.copies) this.copies.set(name, list.filter((x) => x.machine !== machine));
+    this.sql.exec("DELETE FROM copies WHERE machine = ?", machine);
+    for (const row of rows) {
+      if (row.machine !== machine || !this.projects.has(row.name)) continue;
+      const copy = { ...row, leaving: row.leaving ? JSON.parse(row.leaving) : null, ports: row.ports ? JSON.parse(row.ports) : null };
+      delete copy.name;
+      (this.copies.get(row.name) ?? this.copies.set(row.name, []).get(row.name)).push(copy);
+      this.saveCopy(row.name, copy);
+    }
+  }
+
+  readRecovery(body, now) {
+    const receipt = body?.recovery;
+    if (!receipt || !this.env.STATE_SIGNING_KEY) return null;
+    const expected = createHmac("sha256", this.env.STATE_SIGNING_KEY).update(String(receipt.payload)).digest("hex");
+    if (!/^[a-f0-9]{64}$/.test(receipt.signature ?? "") || !sameHex(expected, receipt.signature)) throw new HttpError(400, "invalid recovery receipt");
+    const saved = JSON.parse(receipt.payload);
+    if (saved.v !== 1 || saved.run !== body.run || saved.agent !== body.agent || saved.machine !== Number(body.machine) || saved.at > now + 60_000 || now - saved.at > 86400_000) {
+      throw new HttpError(400, "recovery receipt does not identify this agent");
+    }
+    return saved;
+  }
+
+  recoverAgent(body, now, saved = this.readRecovery(body, now)) {
+    if (!saved) {
+      const hasWork = body?.status && Object.keys(body.status).length > 0;
+      if (hasWork && !this.recoverySeen.has(`run:${body?.run}`)) this.recoveryMissing.add(String(body?.run));
+      return;
+    }
+    this.recoveryMissing.delete(saved.run);
+    const rr = saved.runRow;
+    if (saved.fleet) {
+      for (const row of saved.fleet.runs ?? []) this.recoverRun(row, saved.at);
+      const machines = new Set([...(saved.fleet.copies ?? []).map((x) => x.machine), ...(saved.fleet.runs ?? []).map((x) => x.machine), ...[...this.copies.values()].flat().map((x) => x.machine)]);
+      for (const machine of machines) this.recoverCopies(machine, saved.fleet.copies ?? [], saved.at);
+      const pools = new Map(saved.fleet.startPools ?? []);
+      for (const start of saved.fleet.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, pools.get(start.machine));
+    }
+    if (rr) this.recoverRun(rr, saved.at, saved.location);
+    this.recoverCopies(saved.machine, saved.copies ?? [], saved.at);
+    for (const start of saved.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, rr?.pool);
+    if (saved.at > (this.recoverySettingsAt ?? 0)) {
+      this.recoverySettingsAt = saved.at;
+      for (const setting of saved.runtime ?? []) this.setSetting(setting.key, setting.value);
+      this.poolAsks = new Map(Object.entries(JSON.parse(this.settings.get("pool_asks") ?? "{}")));
+      this.autoMoved = new Map(Object.entries(JSON.parse(this.settings.get("auto_moved") ?? "{}")));
+      this.versionFails = new Map(Object.entries(JSON.parse(this.settings.get("version_fails") ?? "{}")).map(([k, v]) => [k, new Set(v)]));
+      this.massArms = JSON.parse(this.settings.get("mass_arms") ?? "[]");
+      this.sickDrains = JSON.parse(this.settings.get("sick_drains") ?? "{}");
+    }
+    for (const event of [...(saved.fleet?.events ?? []), ...(saved.events ?? [])]) {
+      if (now - event.t > EVENTS_KEEP_MS || this.recentEvents.some((x) => x.t === event.t && x.kind === event.kind && x.run === event.run && x.detail === event.detail)) continue;
+      this.sql.exec("INSERT INTO events(t,kind,app,replica,machine,other,run,cause,detail) VALUES(?,?,?,?,?,?,?,?,?)",
+        event.t, event.kind, event.app ?? null, event.replica ?? null, event.machine ?? null, event.other ?? null, event.run ?? null, event.cause ?? null, event.detail ?? "");
+      this.recentEvents.push(event);
+    }
+    this.recentEvents.sort((a, b) => a.t - b.t);
+    this.recentEvents = this.recentEvents.slice(-200);
   }
 
   // Many servers going silent together is the control plane's view of the network failing, not that many deaths: treat
@@ -3116,6 +3338,7 @@ export class Control {
   // An agent starting up: give it a slot and that slot's tunnel token. A machine started for a slot asks for it
   // (`want`); otherwise it gets the slot its agent had last time if that's still free, else the lowest free one.
   async join(body) {
+    if (this.recoveryActive()) throw new HttpError(503, "recovering fleet inventory; retry joining shortly");
     const now = Date.now();
     const agent = String(body?.agent ?? "");
     if (!agent || agent.length > 100) throw new HttpError(400, "agent (an ID for this agent) is required");
@@ -3255,11 +3478,16 @@ export class Control {
     }
     if (now - this.lastCleanup < 10 * 60_000) return;
     this.lastCleanup = now;
-    this.sql.exec("DELETE FROM metrics_1m WHERE t < ?", now - KEEP_1M_MS);
+    const memoryHistory = Number(this.env.MEMORY_HISTORY_MIN) > 0 ? Number(this.env.MEMORY_HISTORY_MIN) * MIN : null;
+    this.sql.exec("DELETE FROM metrics_1m WHERE t < ?", now - (memoryHistory ?? KEEP_1M_MS));
     this.sql.exec("DELETE FROM metrics_10m WHERE t < ? AND t < ?", now - KEEP_10M_MS, Number(this.settings.get("rolled60") ?? 0)); // once rolled into hours
     this.sql.exec("DELETE FROM metrics_1h WHERE t < ?", now - KEEP_1H_MS);
+    if (memoryHistory) {
+      this.sql.exec("DELETE FROM metrics_10m WHERE t < ?", now - memoryHistory);
+      this.sql.exec("DELETE FROM metrics_1h WHERE t < ?", now - memoryHistory);
+    }
     this.sql.exec("DELETE FROM geo WHERE at < ?", now - 30 * 86400_000);
-    this.sql.exec("DELETE FROM events WHERE t < ?", now - EVENTS_KEEP_MS);
+    this.sql.exec("DELETE FROM events WHERE t < ?", now - (memoryHistory ? 6 * 3600_000 : EVENTS_KEEP_MS));
     for (const r of this.runs.values()) {
       if (now - r.seen > 2 * 3600_000) {
         this.runs.delete(r.id);
@@ -3305,7 +3533,8 @@ export class Control {
       while (list.length && now - list[0].t > 5 * MIN) list.shift(); // room is judged on the last 3 minutes
     }
     const mine = this.minutes.get(r.id) ?? [];
-    for (const m of Array.isArray(metrics.minutes) ? metrics.minutes.slice(-60) : []) {
+    const summaries = [...(Array.isArray(metrics.recent) ? metrics.recent.slice(-10) : []), ...(Array.isArray(metrics.minutes) ? metrics.minutes.slice(-60) : [])];
+    for (const m of summaries) {
       const t = Number(m?.t);
       if (!Number.isInteger(t) || t % MIN || t > now || now - t > KEEP_1M_MS || !isMap(m.h)) continue;
       const slot = this.pendingMetrics.get(t) ?? {};
@@ -3432,6 +3661,9 @@ export class Control {
     return {
       now,
       domain: this.env.DOMAIN,
+      regions: Object.entries(REGIONS).map(([name, label]) => ({ name, label,
+        machines: [...this.liveMachines(now).values()].filter((r) => regionOf(r.location) === name).length,
+      })),
       pools: Object.entries(this.pools()).map(([name, size]) => ({ name, size, live: new Set(this.liveRuns(now).filter((r) => r.pool === name).map((r) => r.machine)).size })),
       expected: this.expectedMachines(),
       dnsError: this.dnsError,
@@ -3481,6 +3713,8 @@ export class Control {
           ready: Boolean(r.ready),
           handover: Boolean(r.handover),
           retiring: Boolean(r.retire),
+          protocol: r.protocol ?? 1,
+          recoveryAt: r.recoveryAt ?? null, witnessAt: r.witnessAt ?? null,
           pool: r.pool ?? null,
           draining: Boolean(r.drain),
           label: r.label,
@@ -3494,6 +3728,7 @@ export class Control {
           disk: r.disk ?? null,
           strikes: (this.strikes.get(r.id) ?? []).filter((x) => now - x.t < STRIKE_WINDOW_MS).map((x) => x.why),
           location: r.location ?? null,
+          region: regionOf(r.location),
           projects: r.status,
         })),
     };
@@ -3513,6 +3748,11 @@ export class Control {
   // The alarm keeps DNS in line: hourly, or 2s after a change.
   async alarm() {
     const now = Date.now();
+    if (this.recoveryActive(now)) {
+      this.dnsDue = Math.max(now + 30_000, this.recoveringUntil);
+      this.setAlarm(this.dnsDue);
+      return;
+    }
     if (now >= (this.dnsDue ?? 0)) {
       const due = this.dnsDue; // a change during the sync asks for another one (scheduleDns), which must stand
       try {
