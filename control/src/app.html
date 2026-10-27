@@ -185,6 +185,20 @@
   .heatlegend { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); margin: 0 0 4px; }
   .heatlegend .ramp { width: 120px; height: 8px; border-radius: 4px; }
   .metric-controls { margin: 12px 0; }
+  .metric-heading { border: 0; background: none; border-radius: 0; min-height: 32px; padding: 0; color: inherit; font: inherit; font-weight: 650; }
+  .metric-heading:hover { color: var(--accent); text-decoration: underline; }
+  .metric-state { margin: 8px 0; min-height: 24px; }
+  .metric-state.failed { color: var(--failed); }
+  .metric-rank { list-style: none; padding: 0; margin: 10px 0 14px; }
+  .metric-rank li { margin: 8px 0; }
+  .metric-rank .row { gap: 7px; flex-wrap: nowrap; font-size: var(--fs-sm); }
+  .rank-number { color: var(--muted); width: 16px; flex-shrink: 0; font-size: var(--fs-xs); }
+  .rank-name { flex: 1; min-width: 0; overflow-wrap: anywhere; color: inherit; }
+  .rank-value { flex-shrink: 0; font-variant-numeric: tabular-nums; font-weight: 650; }
+  .rank-track { height: 4px; margin: 4px 0 0 23px; border-radius: 2px; background: var(--heat-none); overflow: hidden; }
+  .rank-track i { display: block; height: 100%; border-radius: 2px; }
+  .metric-panel .chart { margin-top: 5px; }
+  .metric-target { scroll-margin-top: 75px; }
   .spark { display: inline-block; vertical-align: middle; margin-right: 6px; }
   .log { font-size: var(--fs-sm); margin-top: 8px; }
   .log > div { padding: 3px 0; overflow-wrap: anywhere; }
@@ -326,7 +340,7 @@ const MIN_APP_PASSWORD = 6;
 // Replaces a box's contents on a refresh without disturbing whoever's using it: nothing happens when the markup is
 // the same, a text selection inside it is left alone (the next refresh catches up), and keyboard focus goes back to
 // the control it was on, found again by what it is and does.
-const focusKey = (x) => x.id || `${x.tagName}|${x.dataset.act ?? ""}|${x.dataset.v ?? ""}|${x.dataset.machine ?? ""}|${x.dataset.d ?? ""}|${x.dataset.tab ?? ""}|${x.getAttribute("href") ?? ""}`;
+const focusKey = (x) => x.id || `${x.tagName}|${x.dataset.act ?? ""}|${x.dataset.v ?? ""}|${x.dataset.machine ?? ""}|${x.dataset.d ?? ""}|${x.dataset.tab ?? ""}|${x.dataset.metricSort ?? ""}|${x.dataset.rankAll ?? ""}|${x.closest("table")?.getAttribute("aria-label") ?? ""}|${x.getAttribute("href") ?? ""}`;
 function setHtml(el, html) {
   if (!el || el.__html === html) return;
   const sel = getSelection();
@@ -339,9 +353,12 @@ function setHtml(el, html) {
 }
 // Redraws a box without moving the page: its height is held while it's empty, so the page doesn't shrink and jump.
 function rebuild(box, fn) {
+  const focused = document.activeElement;
+  const key = focused && box.contains(focused) ? focusKey(focused) : null;
   box.style.minHeight = `${box.offsetHeight}px`;
   box.replaceChildren();
   fn();
+  if (key) $$("button,a[href],input,select,textarea,[tabindex]", box).find((x) => focusKey(x) === key)?.focus({ preventScroll: true });
   requestAnimationFrame(() => (box.style.minHeight = ""));
 }
 // The compose file the control plane makes for a Dockerfile on its own; the editor leaves it out, since it's made again on every deploy.
@@ -357,7 +374,7 @@ const METRICS = {
 const savedMetric = localStorage.getItem("metrics-sort");
 const S = {
   status: null, statusAt: 0, statusErr: null,
-  metrics: null, metricsAt: 0,
+  metrics: null, metricsAt: 0, metricsErr: null,
   range: localStorage.getItem("metrics-range") || "1h",
   metric: Object.hasOwn(METRICS, savedMetric) ? savedMetric : "cpu",
   fastUntil: 0, filter: "",
@@ -447,24 +464,46 @@ async function loadStatus() {
   renderChrome();
   if (S.status) view?.status?.();
 }
-let metricsBusy = false;
+let metricsRequest = null;
+function renderMetricsStatus() {
+  const old = S.metricsAt ? `Showing the last successful update from ${ago(Date.now() - S.metricsAt)} ago.` : "No metrics have loaded yet.";
+  let message;
+  if (S.metricsErr) message = `${esc(S.metricsErr)}. ${esc(old)} <button type="button" class="small" data-metrics-retry>Retry</button>`;
+  else if (metricsRequest) message = `Loading ${esc(metricsRequest.range)} trends…${S.metrics && S.metrics.range !== S.range ? ` Showing ${esc(S.metrics.range)} until ready.` : ""}`;
+  else if (S.metrics) message = `Current samples · refreshed ${ago(Date.now() - S.metricsAt)} ago · trends over ${esc(S.metrics.range)}`;
+  else message = "Loading metrics…";
+  for (const node of $$("[data-metrics-status]")) {
+    node.classList.toggle("failed", Boolean(S.metricsErr));
+    node.setAttribute("aria-busy", Boolean(metricsRequest));
+    setHtml(node, message);
+  }
+}
 async function loadMetrics() {
-  if (metricsBusy) return;
-  metricsBusy = true;
   const range = S.range;
+  if (metricsRequest?.range === range) return;
+  metricsRequest?.controller.abort();
+  const request = { range, controller: new AbortController() };
+  metricsRequest = request;
+  S.metricsErr = null;
+  renderMetricsStatus();
+  let timedOut = false;
+  const timeout = setTimeout(() => { timedOut = true; request.controller.abort(); }, 15000);
   try {
-    const res = await fetch(`/api/metrics?range=${range}`, { cache: "no-store" });
+    const res = await fetch(`/api/metrics?range=${enc(range)}`, { cache: "no-store", signal: request.controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    S.metrics = await res.json();
+    const data = await res.json();
+    if (metricsRequest !== request || S.range !== range) return;
+    if (data.range !== range || !Array.isArray(data.t) || !data.m || !data.live) throw new Error("invalid metrics response");
+    S.metrics = data;
     S.metricsAt = Date.now();
     if (S.status) view?.status?.();
     view?.charts?.();
-  } catch {
-    // the charts keep what they had; the next poll tries again
+  } catch (error) {
+    if (metricsRequest === request) S.metricsErr = timedOut ? "Metrics refresh timed out" : `Metrics refresh failed (${error.message})`;
   } finally {
-    metricsBusy = false;
+    clearTimeout(timeout);
+    if (metricsRequest === request) { metricsRequest = null; renderMetricsStatus(); }
   }
-  if (S.range !== range) loadMetrics(); // the range was switched meanwhile: get that one
 }
 
 // ======================================================================== UI pieces
@@ -531,11 +570,12 @@ function sheet({ title, html, ok = "OK", okKind = "primary", cancel = "Cancel", 
 const confirmSheet = (title, text, ok, okKind = "primary") => sheet({ title, ok, okKind, html: `<p>${text}</p>` });
 
 // A table; on phones each row becomes a small card (the header becomes labels). rows: [{ cells, href?, cls? }]
-function table(head, rows, { empty = "Nothing here", num = [], sort = null } = {}) {
-  const th = head.map((h, i) => `<th${num.includes(i) ? ' class="num"' : ""}${i === sort ? ' aria-sort="descending"' : ""}>${esc(h)}</th>`).join("");
+function table(head, rows, { empty = "Nothing here", num = [], sort = null, metricHeaders = false, label = null } = {}) {
+  const th = head.map((h, i) => `<th${num.includes(i) ? ' class="num"' : ""}${i === sort ? ' aria-sort="descending"' : ""}>${metricHeaders && i > 0
+    ? `<button type="button" class="metric-heading" data-metric-sort="${Object.keys(METRICS)[i - 1]}" aria-label="Sort by ${esc(Object.values(METRICS)[i - 1].label)}, highest first">${esc(h)}</button>` : esc(h)}</th>`).join("");
   const body = rows.map((r) => `<tr class="${r.href ? "click " : ""}${r.cls ?? ""}"${r.href ? ` data-href="${esc(r.href)}"` : ""}>${r.cells.map((c, i) =>
     `<td data-label="${esc(head[i])}"${num.includes(i) ? ' class="num"' : ""}>${c}</td>`).join("")}</tr>`).join("");
-  return `<div class="tablewrap"><table class="rl"><thead><tr>${th}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}" class="s">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+  return `<div class="tablewrap"><table class="rl"${label ? ` aria-label="${esc(label)}"` : ""}><thead><tr>${th}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}" class="s">${esc(empty)}</td></tr>`}</tbody></table></div>`;
 }
 const meter = (pct) => {
   const p = Math.max(0, Math.min(100, pct || 0));
@@ -544,7 +584,7 @@ const meter = (pct) => {
 const codebox = (text, { copy = true } = {}) => `<div class="codebox${copy ? "" : " plain"}"><pre class="code">${esc(text)}</pre>${copy ? `<button type="button" class="small" data-copy>Copy</button>` : ""}</div>`;
 const rangeSeg = () => `<span class="seg" role="group" aria-label="Time range">${["1h", "6h", "24h", "7d", "30d"].map((r) =>
   `<button type="button" data-range="${r}" aria-pressed="${r === S.range}">${r}</button>`).join("")}</span>`;
-const metricControls = () => `<div class="row metric-controls"><span class="meta">Highest first:</span><span class="seg" role="group" aria-label="Rank usage by">${Object.entries(METRICS).map(([key, metric]) =>
+const metricControls = () => `<div class="row metric-controls"><span class="meta">Sort tables (highest first):</span><span class="seg" role="group" aria-label="Rank usage by">${Object.entries(METRICS).map(([key, metric]) =>
   `<button type="button" data-metric-sort="${key}" aria-pressed="${S.metric === key}">${metric.label}</button>`).join("")}</span></div>`;
 
 // ======================================================================== fleet facts
@@ -1050,18 +1090,20 @@ function appNames() {
   for (const x of Object.values(M().live)) for (const a of Object.keys(x.a ?? {})) set.add(a);
   return [...set].sort((a, b) => (a === "_system") - (b === "_system") || a.localeCompare(b));
 }
-// Apps stacked by a field: the 5 biggest keep a color (the same color for the same app), the rest fold into "other".
+const appColor = (name) => `hsl(${[...name].reduce((hash, ch) => (hash * 31 + ch.charCodeAt(0)) >>> 0, 0) % 360}, 60%, 48%)`;
+// The biggest apps keep their own series; each app keeps its color across metrics and refreshes.
 function appStack(cols) {
   const names = appNames();
-  const totals = names.map((a) => [a, (cols(a) ?? []).reduce((s, v) => s + (isNum(v) ? v : 0), 0)]).filter(([, s]) => s > 0).sort((a, b) => b[1] - a[1]);
+  const columns = new Map(names.map((a) => [a, cols(a)]));
+  const totals = names.filter((a) => columns.get(a)?.some(isNum)).map((a) => [a, columns.get(a).reduce((s, v) => s + (isNum(v) ? v : 0), 0)])
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const keep = totals.slice(0, totals.length > 6 ? 5 : 6).map(([a]) => a);
   const rest = totals.slice(keep.length).map(([a]) => a);
-  const series = keep.map((a, i) => ({ name: appLabel(a), values: cols(a), color: i < 5 ? SERIES[i] : OTHER }));
-  if (rest.length) series.push({ name: `other (${rest.length})`, values: combine(rest.map(cols), "sum"), color: OTHER });
+  const series = keep.map((a) => ({ name: appLabel(a), values: columns.get(a), color: appColor(a) }));
+  if (rest.length) series.push({ name: `other (${rest.length})`, values: combine(rest.map((a) => columns.get(a)), "sum"), color: OTHER });
   return series;
 }
 const liveRows = () => Object.entries(M().live).map(([m, x]) => ({ m: Number(m), ...x })).sort((a, b) => a.m - b.m);
-const sumLive = (f) => liveRows().reduce((s, r) => s + (isNum(f(r)) ? f(r) : 0), 0);
 // Rank numeric samples, not formatted strings. Missing data follows real zeroes;
 // ties use a stable name/number so rows do not shuffle on every refresh.
 const sumNumbers = (values) => {
@@ -1075,8 +1117,8 @@ function descending(rows, value, key) {
     return order || String(key(a)).localeCompare(String(key(b)), undefined, { numeric: true });
   });
 }
-const metricFields = (host) => host && S.metric === "mem" ? ["memUsed"] : METRICS[S.metric].fields;
-const metricValue = (sample, host = false) => sumNumbers(metricFields(host).map((key) => sample?.[key]));
+const metricFields = (host, metric = S.metric) => host && metric === "mem" ? ["memUsed"] : METRICS[metric].fields;
+const metricValue = (sample, host = false, metric = S.metric) => sumNumbers(metricFields(host, metric).map((key) => sample?.[key]));
 const metricColumns = (column, host = false) => combine(metricFields(host).map(column), "sum");
 const ioUsage = (a, b, first, second) => `${F.rate(sumNumbers([a, b]))}<div class="s">${first} ${F.rate(a)} · ${second} ${F.rate(b)}</div>`;
 function usageTable(label, rows, { host = false } = {}) {
@@ -1090,7 +1132,7 @@ function usageTable(label, rows, { host = false } = {}) {
       host ? `${bytes(v.memUsed)} <span class="s">${F.pct(pctOf(v.memUsed, v.memTotal))}</span>` : bytes(v.mem),
       ioUsage(v.diskRead, v.diskWrite, "read", "write"), ioUsage(v.netRx, v.netTx, "in", "out"),
     ] };
-  }), { empty: "Nothing reporting right now", num: [1, 2, 3, 4], sort });
+  }), { empty: "Nothing reporting right now", num: [1, 2, 3, 4], sort, metricHeaders: true, label: `${label} usage` });
 }
 function liveAppRows(machines = liveRows()) {
   const apps = new Map();
@@ -1102,6 +1144,29 @@ function liveAppRows(machines = liveRows()) {
     apps.set(name, total);
   }
   return [...apps].map(([name, values]) => ({ id: name, label: appLabel(name), href: name === "_system" ? null : appHref(name), values }));
+}
+function appMetricPanel(parent, metric, rows, columns, target) {
+  const info = METRICS[metric];
+  const value = (row) => metricValue(row.values, false, metric);
+  const ranked = descending(rows.filter((row) => isNum(value(row))), value, (row) => row.id);
+  const top = ranked.slice(0, 5), max = top.length ? value(top[0]) : 0;
+  const panel = document.createElement("div");
+  panel.className = "ccard metric-panel";
+  panel.dataset.metric = metric;
+  panel.innerHTML = `<div class="row"><h3 class="grow">${info.label}</h3><button type="button" class="small" data-rank-all="${metric}" data-usage-target="${target}">All apps ↓</button></div>
+    <div class="desc">Top apps now · highest first · ${metric === "cpu" ? "CPU cores" : metric === "mem" ? "bytes used" : metric === "disk" ? "read + write / second" : "in + out / second"}</div>
+    ${top.length ? `<ol class="metric-rank">${top.map((row, i) => `<li><div class="row"><span class="rank-number">${i + 1}</span>
+      ${row.href ? `<a class="rank-name" href="${esc(row.href)}">${esc(row.label)}</a>` : `<span class="rank-name">${esc(row.label)}</span>`}
+      <span class="rank-value">${esc(F[info.unit](value(row)))}</span></div><div class="rank-track" aria-hidden="true"><i style="width:${max > 0 ? (100 * value(row)) / max : 0}%;background:${appColor(row.id)}"></i></div></li>`).join("")}</ol>`
+      : '<div class="nodata">No current readings for this metric</div>'}
+    ${ranked.length && max === 0 ? '<p class="meta">All current readings are zero.</p>' : ""}
+    <div class="desc">App usage trend · ${esc(M().range)} · ${metric === "net" ? "host-networked containers excluded" : "selected time range"}</div>`;
+  const chart = document.createElement("div");
+  chart.className = "chart";
+  chart.dataset.title = `${info.label} by app`;
+  panel.append(chart);
+  parent.append(panel);
+  lineChart(chart, appStack(columns), { unit: info.unit, stacked: true, height: 140 });
 }
 function usageHeatmap(parent, machines, columns, { host = false } = {}) {
   const rows = machines.map((m) => ({ id: m, name: `server ${m}`, href: machineHref(m), values: columns(m) }));
@@ -1115,12 +1180,14 @@ function usageHeatmap(parent, machines, columns, { host = false } = {}) {
 }
 function fleetTiles() {
   const live = liveRows();
-  const memTotal = sumLive((r) => r.h.memTotal), memUsed = sumLive((r) => r.h.memUsed);
+  const sum = (key) => sumNumbers(live.map((r) => r.h?.[key]));
+  const cpus = live.map((r) => r.h?.cpu).filter(isNum);
+  const memTotal = sum("memTotal"), memUsed = sum("memUsed");
   return tiles([
-    { label: "CPU, fleet average", value: F.pct(live.length ? sumLive((r) => r.h.cpu) / live.length : null), sub: S.status && runsBy().size !== live.length ? `${live.length} of ${plural(runsBy().size, "server")} reporting` : `${plural(live.length, "server")} reporting` },
-    { label: "Memory used", value: memTotal ? F.pct((100 * memUsed) / memTotal) : "–", sub: `${bytes(memUsed)} of ${bytes(memTotal)}` },
-    { label: "Disk read", value: F.rate(sumLive((r) => r.h.diskRead)), sub: `write ${F.rate(sumLive((r) => r.h.diskWrite))}` },
-    { label: "Network in", value: F.rate(sumLive((r) => r.h.netRx)), sub: `out ${F.rate(sumLive((r) => r.h.netTx))}` },
+    { label: "Host CPU, average", value: F.pct(cpus.length ? sumNumbers(cpus) / cpus.length : null), sub: `${plural(cpus.length, "server")} reporting` },
+    { label: "Memory used", value: bytes(memUsed), sub: `${F.pct(pctOf(memUsed, memTotal))} of ${bytes(memTotal)}` },
+    { label: "Disk I/O", value: F.rate(sumNumbers([sum("diskRead"), sum("diskWrite")])), sub: `read ${F.rate(sum("diskRead"))} · write ${F.rate(sum("diskWrite"))}` },
+    { label: "Network", value: F.rate(sumNumbers([sum("netRx"), sum("netTx")])), sub: `in ${F.rate(sum("netRx"))} · out ${F.rate(sum("netTx"))}` },
   ]);
 }
 
@@ -1707,7 +1774,7 @@ function vApp(name, q = new URLSearchParams()) {
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
       <h2>Replicas</h2><div id="ad-replicas"></div>
       <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2>${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
       <h2>Versions</h2><div id="ad-versions"></div>`,
     status() {
@@ -2107,7 +2174,7 @@ function vMachine(n) {
     title: `Server ${n}`, wantsMetrics: true,
     html: `<a class="back" href="#/machines">← Servers</a><div id="md-head"></div>
       <h2>Apps here</h2><div id="md-apps"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2>${metricControls()}<div id="md-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${metricControls()}<div id="md-charts"><div class="meta">Loading…</div></div>
       <h2>Fleet actions</h2><div id="md-actions"></div>`,
     status() {
       const st = S.status, runs = runsBy(), r = runs.get(n), ms = machineState(n, r);
@@ -2147,13 +2214,11 @@ function vMachine(n) {
       lineChart(ccard(g, "Memory used"), [{ name: "used", values: H("memUsed") }], { unit: "bytes", ref: { name: "installed", value: x.memTotal ?? Math.max(0, ...(H("memTotal") ?? []).filter(isNum)) } });
       lineChart(ccard(g, "Disk I/O"), [{ name: "read", values: H("diskRead") }, { name: "write", values: H("diskWrite") }], { unit: "rate" });
       lineChart(ccard(g, "Network I/O"), [{ name: "in", values: H("netRx") }, { name: "out", values: H("netTx") }], { unit: "rate" });
-      box.insertAdjacentHTML("beforeend", `<h2>Apps now</h2>${usageTable("App", liveAppRows(live ? [live] : []))}`);
+      box.insertAdjacentHTML("beforeend", `<div id="md-usage" class="metric-target"><h2>Apps now</h2>${usageTable("App", liveAppRows(live ? [live] : []))}</div>`);
       const apps = section(box, "Apps on this server");
-      const A = (k) => (a) => acol(n, a, k);
-      lineChart(ccard(apps, "CPU by app"), appStack(A("cpu")), { unit: "cores", stacked: true });
-      lineChart(ccard(apps, "Memory by app"), appStack(A("mem")), { unit: "bytes", stacked: true });
-      lineChart(ccard(apps, "Disk I/O by app", "read + write"), appStack((a) => combine([acol(n, a, "diskRead"), acol(n, a, "diskWrite")], "sum")), { unit: "rate", stacked: true });
-      lineChart(ccard(apps, "Network by app", "in + out; apps on host networking aren't counted"), appStack((a) => combine([acol(n, a, "netRx"), acol(n, a, "netTx")], "sum")), { unit: "rate", stacked: true });
+      for (const [key, metric] of Object.entries(METRICS)) {
+        appMetricPanel(apps, key, liveAppRows(live ? [live] : []), (a) => combine(metric.fields.map((field) => acol(n, a, field)), "sum"), "md-usage");
+      }
       });
     },
     click(e) {
@@ -2169,31 +2234,30 @@ function vMachine(n) {
 function vMetrics() {
   return {
     title: "Metrics", wantsMetrics: true,
-    html: `<div class="row"><h1 class="grow">Metrics</h1>${rangeSeg()}</div><div class="sub" id="mx-sub">Loading…</div>${metricControls()}
-      <p class="meta">Tables rank current usage. Memory is bytes used; disk is read + write per second; network is in + out per second.</p><div id="mx"></div>`,
+    html: `<div class="row"><h1 class="grow">Metrics</h1>${rangeSeg()}</div><div class="metric-state meta" id="mx-sub" data-metrics-status></div>
+      <p class="meta">Rankings use current samples. The time range changes the trends. App CPU is in cores; server CPU is a percentage of all cores.</p><div id="mx"></div>`,
     charts() {
       const box = $("#mx");
       if (!box) return;
       rebuild(box, () => {
-      $("#mx-sub").textContent = `${S.metrics.step / 60000}-minute points · updated ${ago(Date.now() - S.metricsAt)} ago`;
-      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}
-        <h2>Apps now <span class="meta">summed across reporting servers</span></h2>${usageTable("App", liveAppRows())}
+      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}`);
+      const ms = machineNums(), currentApps = liveAppRows();
+      const apps = section(box, "App usage");
+      for (const [key, metric] of Object.entries(METRICS)) {
+        appMetricPanel(apps, key, currentApps, (a) => combine(ms.flatMap((m) => metric.fields.map((field) => acol(m, a, field))), "sum"), "mx-apps");
+      }
+      box.insertAdjacentHTML("beforeend", `<div id="mx-apps" class="metric-target"><h2>All apps now <span class="meta">summed across reporting servers</span></h2>${metricControls()}${usageTable("App", currentApps)}</div>
         <p class="meta">Per-app network usage excludes containers using host networking.</p>
+        <p class="meta">Memory is bytes used; disk is read + write per second; network is in + out per second. Click a column to sort highest first.</p>
         <h2>Servers now</h2>${usageTable("Server", liveRows().map((r) => ({
           id: r.m, label: `Server ${r.m}`, href: machineHref(r.m), values: r.h, starting: !r.ready,
         })), { host: true })}`);
-      const ms = machineNums();
       usageHeatmap(section(box, "Per server"), ms, (m) => metricColumns((key) => hcol(m, key), true), { host: true });
       const g = section(box, "Whole fleet");
       lineChart(ccard(g, "CPU", "average across servers, and the busiest server"), [{ name: "average", values: fleetH("cpu", "avg") }, { name: "busiest server", values: fleetH("cpu", "max") }], { unit: "pct" });
       lineChart(ccard(g, "Memory used", "all servers"), [{ name: "used", values: fleetH("memUsed") }], { unit: "bytes", ref: { name: "installed", value: Math.max(0, ...fleetH("memTotal").filter(isNum)) } });
       lineChart(ccard(g, "Disk I/O", "all servers"), [{ name: "read", values: fleetH("diskRead") }, { name: "write", values: fleetH("diskWrite") }], { unit: "rate" });
       lineChart(ccard(g, "Network I/O", "all servers"), [{ name: "in", values: fleetH("netRx") }, { name: "out", values: fleetH("netTx") }], { unit: "rate" });
-      const apps = section(box, "Usage by app");
-      for (const metric of Object.values(METRICS)) {
-        lineChart(ccard(apps, `${metric.label} by app`, "Largest consumers in the selected range · summed across servers"),
-          appStack((a) => combine(ms.flatMap((m) => metric.fields.map((key) => acol(m, a, key))), "sum")), { unit: metric.unit, stacked: true });
-      }
       });
     },
   };
@@ -2366,8 +2430,10 @@ function draw() {
   hideTip();
   if (S.status) view.status?.();
   if (S.metrics && view.charts) view.charts();
+  renderMetricsStatus();
 }
 function renderChrome() {
+  renderMetricsStatus();
   const banner = $("#banner");
   banner.hidden = !S.statusErr;
   if (S.statusErr) banner.textContent = `${S.statusErr}. ${S.status ? `Showing what it said ${ago(Date.now() - S.statusAt)} ago.` : ""}`;
@@ -2392,12 +2458,16 @@ document.addEventListener("click", async (e) => {
     $$("[data-range]").forEach((b) => b.setAttribute("aria-pressed", b.dataset.range === S.range));
     loadMetrics();
   }
-  const metric = e.target.closest("[data-metric-sort]");
-  if (metric && Object.hasOwn(METRICS, metric.dataset.metricSort)) {
-    S.metric = metric.dataset.metricSort;
+  const retry = e.target.closest("[data-metrics-retry]");
+  if (retry) loadMetrics();
+  const metric = e.target.closest("[data-metric-sort],[data-rank-all]");
+  const metricKey = metric?.dataset.metricSort || metric?.dataset.rankAll;
+  if (metric && Object.hasOwn(METRICS, metricKey)) {
+    S.metric = metricKey;
     localStorage.setItem("metrics-sort", S.metric);
     $$("[data-metric-sort]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.metricSort === S.metric));
     if (S.metrics) view?.charts?.();
+    if (metric.dataset.usageTarget) document.getElementById(metric.dataset.usageTarget)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 });
 
