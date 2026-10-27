@@ -38,6 +38,7 @@ node control/test/sim/regions.test.mjs  # regional placement, shortages, moves, 
 node control/test/sim/hybrid.test.mjs   # D1 encryption/write suppression, receipts, witnesses and cold recovery
 node control/test/agent-link.mjs        # large reports, fragmented WebSocket replies, ping and wake
 node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero runtime writes, migration and cold recovery
+node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure holds, DNS, lazy tokens and zero durable writes
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
 ```
 

@@ -14,10 +14,24 @@ const logPath = join(directory, "server.log");
 const logFd = openSync(logPath, "a", 0o600);
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let child, socket, seq = 0;
+const tunnels = new Map();
+let tokenRequests = 0, createdTunnels = 0;
 const mock = http.createServer((req, res) => {
-  const result = req.url.endsWith("/token") ? "test-tunnel-token" : req.method === "POST" ? { id: "test-tunnel" } : [];
-  res.setHeader("content-type", "application/json");
-  res.end(JSON.stringify({ success: true, result, result_info: { total_pages: 1 } }));
+  let body = "";
+  req.on("data", (chunk) => { body += chunk; });
+  req.on("end", () => {
+    const url = new URL(req.url, "http://mock");
+    let result = [];
+    if (url.pathname.endsWith("/cfd_tunnel")) {
+      if (req.method === "POST") {
+        const { name } = JSON.parse(body);
+        result = { id: `test-tunnel-${++createdTunnels}`, name };
+        tunnels.set(name, result);
+      } else result = [...tunnels.values()].filter((t) => !url.searchParams.has("name") || t.name === url.searchParams.get("name"));
+    } else if (url.pathname.endsWith("/token")) { tokenRequests++; result = "test-tunnel-token"; }
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ success: true, result, result_info: { total_pages: 1 } }));
+  });
 });
 mock.listen(0, "127.0.0.1");
 await once(mock, "listening");
@@ -99,7 +113,7 @@ try {
   const disk = new DatabaseSync(join(directory, "control.db"), { readOnly: true });
   assert.equal(disk.prepare("SELECT value FROM app_env WHERE name='web' AND key='TOKEN'").get().value, "updated-durable-secret");
   assert.equal(disk.prepare("SELECT count(*) AS n FROM projects WHERE name='removed'").get().n, 0);
-  assert.equal(disk.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('runs','copies','events','metrics_1m')").get().n, 0);
+  assert.equal(disk.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name IN ('runs','copies','events','metrics_1m','slots')").get().n, 0);
   disk.close();
   console.log("ok SIGKILL preserves acknowledged configuration and no runtime tables");
 
@@ -113,6 +127,13 @@ try {
   assert.equal(plan.desired, undefined);
   console.log("ok a cold controller holds workloads while recovering agent inventory");
   await pause(1100);
+  const ready = await request("/status");
+  assert.equal(ready.controlPlane.tunnelStorage, "memory");
+  assert.equal(ready.controlPlane.tunnelsReady, true);
+  assert.equal(ready.controlPlane.tunnelsDiscovered, 1);
+  assert.equal(createdTunnels, 1);
+  assert.equal(tokenRequests, 1);
+  console.log("ok restart discovers the existing tunnel without recreating it or fetching its token");
   plan = await sync(body);
   assert.equal(plan.hold, undefined);
   assert.equal(plan.retire, false);
@@ -128,7 +149,7 @@ try {
     invalid.on("open", () => { invalid.terminate(); reject(new Error("unauthenticated agent accepted")); });
   });
   console.log("ok agent authentication remains enforced");
-  console.log("5 local server checks passed");
+  console.log("6 local server checks passed");
 } finally {
   await stop();
   mock.closeAllConnections();

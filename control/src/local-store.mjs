@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { CONFIG_TABLES, durableSetting } from "./state-policy.js";
 
-const RUNTIME_TABLES = new Set(["runs", "copies", "starts", "agents", "events", "geo", "metrics_1m", "metrics_10m", "metrics_1h"]);
+const RUNTIME_TABLES = new Set(["runs", "copies", "starts", "agents", "events", "geo", "metrics_1m", "metrics_10m", "metrics_1h", "slots"]);
 
 // One SQLite connection, two storage lifetimes. Only configuration lives in main
 // (control.db). TEMP tables and their indexes live entirely in RAM. SQL used by

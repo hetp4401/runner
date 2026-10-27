@@ -716,6 +716,9 @@ export class Control {
     this.agents = new Map(this.all("SELECT * FROM agents").map((a) => [a.id, a])); // agent -> the slot it last had
     this.holds = new Map(); // slot -> { agent, at }: just given out at /join, not checked in yet
     this.tunnelJobs = new Map(); // slot -> promise, while its tunnel is being looked up or created
+    this.tunnelsReady = this.env.RECOVER_TUNNELS !== "1";
+    this.tunnelRecoveryJob = null;
+    this.tunnelRecoveryError = null;
     this.lastCleanup = 0;
     this.liveMetrics = new Map(); // machine -> { run, t, h, a }, the newest sample from the run that speaks for it
     this.pendingMetrics = new Map(); // minute -> { machine: { h, a } }, not yet written
@@ -724,6 +727,7 @@ export class Control {
     this.dnsError = null;
     this.dnsTargetsSeen = "";
     this.scheduleDns(); // DNS may have drifted while this wasn't running
+    if (!this.tunnelsReady) this.setAlarm(this.bootAt); // discover before agents can join or scheduling resumes
   }
 
   all(query, ...args) {
@@ -2696,7 +2700,7 @@ export class Control {
   sync(body, ip = null, edgeLocation = null) {
     const now = Date.now();
     const receipt = this.readRecovery(body, now);
-    if (this.recoveringUntil && (now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
+    if (this.recoveringUntil && (!this.tunnelsReady || now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
     // Every machine silent for longer than the liveness window: this was unreachable, so give the fleet time to show
     // up again before anything counts as gone or gets placed (see SETTLE_MS).
     if (now - this.lastCheckin > this.liveMs) {
@@ -2830,6 +2834,7 @@ export class Control {
   // contains no credentials or app source. Persisted configuration remains
   // authoritative for desired apps; a receipt only reconstructs runtime state.
   recoveryActive(now = Date.now()) {
+    if (!this.tunnelsReady) return true;
     if (now < this.recoveringUntil) return true;
     for (const run of this.recoveryMissing) {
       const r = this.runs.get(run);
@@ -3385,6 +3390,7 @@ export class Control {
     const auth = this.env.CF_API_TOKEN ? { authorization: `Bearer ${this.env.CF_API_TOKEN}` }
       : { "x-auth-email": this.env.CF_API_EMAIL, "x-auth-key": this.env.CF_API_KEY };
     const res = await fetch(`${this.env.CF_API_BASE ?? "https://api.cloudflare.com/client/v4"}${path}`, {
+      signal: AbortSignal.timeout(30_000),
       ...init,
       headers: { ...auth, "content-type": "application/json" },
     });
@@ -3393,14 +3399,61 @@ export class Control {
     return data;
   }
 
-  // Tunnel runner-<n>: found by name (so tunnels made earlier are reused) or created, and kept with its token.
+  // The VPS has no durable tunnel cache. Rebuild every runner slot in one paged
+  // listing, including unused slots whose DNS records may still need cleanup.
+  // Publish nothing until every page is valid. No tokens are fetched at startup.
+  recoverTunnels() {
+    if (this.tunnelsReady) return Promise.resolve();
+    if (!this.tunnelRecoveryJob) {
+      this.tunnelRecoveryJob = (async () => {
+        const found = new Map();
+        for (let page = 1; ; page++) {
+          const data = await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
+          if (!Array.isArray(data.result)) throw new Error("Cloudflare returned an invalid tunnel listing");
+          for (const tunnel of data.result) {
+            const match = /^runner-([1-9]\d*)$/.exec(tunnel?.name);
+            if (!match || tunnel.deleted_at) continue;
+            const n = Number(match[1]);
+            if (!Number.isSafeInteger(n) || typeof tunnel.id !== "string" || !tunnel.id) throw new Error("Cloudflare returned an invalid runner tunnel");
+            if (found.has(n) && found.get(n).tunnel !== tunnel.id) throw new Error(`multiple Cloudflare tunnels are named runner-${n}`);
+            found.set(n, { n, tunnel: tunnel.id, token: "" });
+          }
+          const info = data.result_info ?? {};
+          const perPage = Number(info.per_page) || 1000;
+          const pages = Number(info.total_pages) || Math.ceil(Number(info.total_count) / perPage);
+          if (pages ? page >= pages : data.result.length < perPage) break;
+          if (!data.result.length) throw new Error("Cloudflare returned an incomplete tunnel listing");
+        }
+        this.sql.exec("DELETE FROM slots");
+        for (const slot of found.values()) this.sql.exec("INSERT INTO slots (n,tunnel,token,created) VALUES (?,?,?,?)", slot.n, slot.tunnel, "", Date.now());
+        this.slots = found;
+        this.tunnelsReady = true;
+        this.tunnelRecoveryError = null;
+        this.scheduleDns();
+      })().catch((error) => {
+        this.tunnelRecoveryError = error.message;
+        throw error;
+      }).finally(() => { this.tunnelRecoveryJob = null; });
+    }
+    return this.tunnelRecoveryJob;
+  }
+
+  // Tunnel runner-<n>: reuse a discovered ID; fetch its token only when a machine
+  // joins. Unknown slots are looked up by exact name before creating a tunnel.
+  // LocalStore keeps these rows in RAM, including tokens, until the CP restarts.
   tunnelFor(n) {
-    if (this.slots.has(n)) return Promise.resolve(this.slots.get(n));
+    if (!this.tunnelsReady) return Promise.reject(new HttpError(503, "recovering Cloudflare tunnels; retry shortly"));
+    if (this.slots.get(n)?.token) return Promise.resolve(this.slots.get(n));
     if (!this.tunnelJobs.has(n)) {
       const job = (async () => {
         const account = this.env.ACCOUNT_ID;
         const name = `runner-${n}`;
-        let t = (await this.cf(`/accounts/${account}/cfd_tunnel?name=${name}&is_deleted=false`)).result[0];
+        let t = this.slots.has(n) ? { id: this.slots.get(n).tunnel } : null;
+        if (!t) {
+          const matches = (await this.cf(`/accounts/${account}/cfd_tunnel?name=${name}&is_deleted=false`)).result.filter((x) => x.name === name && !x.deleted_at);
+          if (matches.length > 1) throw new Error(`multiple Cloudflare tunnels are named ${name}`);
+          t = matches[0];
+        }
         if (!t) {
           const secret = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
           t = (await this.cf(`/accounts/${account}/cfd_tunnel`, {
@@ -3409,6 +3462,7 @@ export class Control {
           })).result;
         }
         const token = (await this.cf(`/accounts/${account}/cfd_tunnel/${t.id}/token`)).result;
+        if (typeof token !== "string" || !token) throw new Error(`Cloudflare returned no token for ${name}`);
         const slot = { n, tunnel: t.id, token };
         this.sql.exec("INSERT OR REPLACE INTO slots (n, tunnel, token, created) VALUES (?, ?, ?, ?)", n, t.id, token, Date.now());
         this.slots.set(n, slot);
@@ -3423,6 +3477,7 @@ export class Control {
   // Retire a slot nothing runs in any more: delete its tunnel, forget its runs and agents, and drop its DNS names.
   // (A pool that's short of machines takes the lowest free slot, so it may come back as a fresh slot.)
   async retireSlot(n) {
+    if (this.recoveryActive()) throw new HttpError(503, "recovering fleet inventory and tunnels; retry shortly");
     const now = Date.now();
     if (!Number.isInteger(n) || n < 1) throw new HttpError(400, "slot must be a server number");
     if (this.liveRuns(now).some((r) => r.machine === n)) throw new HttpError(409, `server ${n} is still up; stop it first`);
@@ -3755,6 +3810,16 @@ export class Control {
 
   // The alarm keeps DNS in line: hourly, or 2s after a change.
   async alarm() {
+    if (!this.tunnelsReady) {
+      try { await this.recoverTunnels(); }
+      catch (error) {
+        this.dnsError = `Tunnel discovery failed: ${error.message}`;
+        console.log(this.dnsError);
+        this.dnsDue = Date.now() + 60_000;
+        this.setAlarm(this.dnsDue);
+        return;
+      }
+    }
     const now = Date.now();
     if (this.recoveryActive(now)) {
       this.dnsDue = Math.max(now + 30_000, this.recoveringUntil);
@@ -3779,6 +3844,7 @@ export class Control {
   }
 
   async syncDns() {
+    if (!this.tunnelsReady) throw new HttpError(503, "recovering Cloudflare tunnels; DNS changes are on hold");
     const domain = this.env.DOMAIN;
     const zone = this.env.ZONE;
     const now = Date.now();

@@ -1,7 +1,10 @@
 // SQLite is a disposable working copy. Only the explicitly selected configuration
 // rows below are written to D1; runs, health, placements and metrics never are.
-import { CONFIG_TABLES, durableSetting } from "../state-policy.js";
-export { CONFIG_TABLES, durableSetting } from "../state-policy.js";
+import { CONFIG_TABLES as VPS_CONFIG_TABLES, durableSetting } from "../state-policy.js";
+export { durableSetting } from "../state-policy.js";
+// Preserve the retired hybrid controller's snapshot format. The active VPS
+// discovers tunnels from Cloudflare and does not persist this legacy bucket.
+export const CONFIG_TABLES = [...VPS_CONFIG_TABLES, "slots"];
 const KEYS = {
   projects: ["name"], versions: ["name", "version"], settings: ["key"],
   app_passwords: ["name"], app_env: ["name", "key"], slots: ["n"],

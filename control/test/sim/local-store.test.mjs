@@ -69,11 +69,12 @@ try {
     assert.equal(statSync(store.backupPath).mode & 0o777, 0o600);
     const backup = new DatabaseSync(store.backupPath, { readOnly: true });
     assert.equal(backup.prepare("SELECT count(*) AS n FROM runs").get().n, legacyRuns);
+    assert.deepEqual(backup.prepare("SELECT * FROM slots").all(), originalCredentials);
     backup.close();
   });
   check("only configuration tables remain on disk", () => assert.deepEqual(schema(store.db), [...CONFIG_TABLES].sort()));
   check("all observation tables are in the in-memory TEMP database", () => {
-    for (const table of ["runs", "copies", "starts", "agents", "events", "geo", "metrics_1m", "metrics_10m", "metrics_1h", "settings"]) assert.ok(schema(store.db, "temp").includes(table));
+    for (const table of ["runs", "copies", "starts", "agents", "events", "geo", "metrics_1m", "metrics_10m", "metrics_1h", "settings", "slots"]) assert.ok(schema(store.db, "temp").includes(table));
     assert.equal(store.db.prepare("PRAGMA temp_store").get().temp_store, 2);
     assert.equal(store.db.prepare("PRAGMA synchronous").get().synchronous, 2);
   });
@@ -82,11 +83,12 @@ try {
     assert.equal(control.copies.size, 0);
     assert.equal(control.settings.has("last_hot_move"), false);
   });
-  check("specs, secrets and tunnel credentials survived migration", () => {
+  check("specs and secrets survive migration; tunnel credentials must be rediscovered", () => {
     assert.equal(control.projects.get("web").version, desiredVersion);
     assert.equal(control.appEnv.get("web").get("TOKEN"), "test-app-secret");
     assert.equal(control.appPasswords.get("web").hash, "test-hash");
-    assert.deepEqual(control.all("SELECT * FROM slots"), originalCredentials);
+    assert.deepEqual(control.all("SELECT * FROM slots"), []);
+    assert.equal(control.slots.size, 0);
     assert.equal(control.settings.get("roll_99"), String(T));
   });
   const observer = new DatabaseSync(filename, { readOnly: true });
@@ -160,6 +162,7 @@ try {
     assert.equal(control.runs.size, 0);
     assert.equal(control.copies.size, 0);
     assert.equal(control.settings.has("rolled10"), false);
+    assert.equal(control.slots.size, 0);
     assert.equal(control.appEnv.get("web").get("TOKEN"), "updated-secret");
   });
   const beforeFailedEdit = snapshot(store.db);

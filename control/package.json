@@ -13,7 +13,7 @@
     "mac": "node mac.mjs",
     "dev": "node --watch server.mjs",
     "test:hybrid": "node test/sim/hybrid.test.mjs && node test/agent-link.mjs",
-    "test:local": "node test/sim/local-store.test.mjs && node test/local-server.mjs",
+    "test:local": "node test/sim/local-store.test.mjs && node test/sim/tunnels.test.mjs && node test/local-server.mjs",
     "dev:cloudflare": "wrangler dev",
     "deploy:cloudflare-archive": "wrangler deploy"
   },

@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 import { Control } from "./src/index.js";
 import { LocalStore } from "./src/local-store.mjs";
 
-const env = { ...process.env, RECOVER_RUNTIME: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
+const env = { ...process.env, RECOVER_RUNTIME: "1", RECOVER_TUNNELS: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
 const port = Number(env.PORT) || 8920;
 const dataDir = env.DATA_DIR || ".";
 const MAX_BODY = 1_000_000; // bytes; a spec is at most 250 KB, plus JSON quoting
@@ -86,6 +86,8 @@ control.status = () => ({ ...status(), controlPlane: {
   mode: "vps-v1", owner: "vps", name: env.CONTROLLER_NAME || "VPS",
   configStorage: "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
   runtimeStorage: "memory", metricsHistoryMinutes: Number(env.MEMORY_HISTORY_MIN),
+  tunnelStorage: "memory", tunnelsReady: control.tunnelsReady, tunnelsDiscovered: control.slots.size,
+  tunnelRecoveryError: control.tunnelRecoveryError,
   recoveryUntil: control.recoveringUntil, recoveryMissing: [...control.recoveryMissing],
 } });
 const originalWake = control.wake.bind(control);
