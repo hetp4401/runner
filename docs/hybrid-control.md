@@ -1,4 +1,6 @@
-# Cloudflare control plane
+# Archived Cloudflare control plane
+
+Production has returned to the [Billy Bishop VPS](vps-control.md). This document describes the retired Cloudflare deployment, not the active architecture. Do not deploy its configuration or enable a second scheduler against the live fleet.
 
 The production controller runs entirely on Cloudflare. A Worker provides the stable endpoint and one SQLite-backed Durable Object (DO) authenticates agents and runs all placement and region rules. D1 holds essential configuration. The working SQLite database stays in memory; neither a Mac nor a VPS is needed.
 

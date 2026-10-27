@@ -1,3 +1,5 @@
+// Archived configuration. Production runs only on Billy Bishop; see docs/vps-control.md.
+// Do not deploy this against the active fleet.
 {
   "name": "runner-control-hybrid",
   "main": "src/worker.js",

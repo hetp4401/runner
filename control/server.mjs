@@ -81,6 +81,12 @@ server.keepAliveTimeout = 65_000;
 // to the other and keeps nothing (see openLogSession).
 const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
 const agentSockets = new Map();
+const status = control.status.bind(control);
+control.status = () => ({ ...status(), controlPlane: {
+  mode: "vps-v1", owner: "vps", name: env.CONTROLLER_NAME || "VPS",
+  configStorage: "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
+  recoveryUntil: control.recoveringUntil, recoveryMissing: [...control.recoveryMissing],
+} });
 const originalWake = control.wake.bind(control);
 control.wake = (run) => {
   const ws = agentSockets.get(run);
