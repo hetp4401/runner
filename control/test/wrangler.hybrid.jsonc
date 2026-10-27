@@ -9,6 +9,7 @@
   "migrations": [{"tag":"v1","new_sqlite_classes":["FleetCoordinator"]}],
   "d1_databases": [{"binding":"CONFIG","database_name":"runner-config-test","database_id":"00000000-0000-0000-0000-000000000000"}],
   "vars": {
+    "SCHEDULER":"hybrid",
     "DOMAIN":"sim.example", "CONTROL_HOST":"localhost", "ACCOUNT_ID":"test-account", "ZONE":"test-zone", "POOLS":"{}",
     "MAC_TOKEN":"test-mac", "JOIN_TOKEN":"test-node", "ADMIN_PASSWORD":"test-admin", "STATE_SIGNING_KEY":"test-signing-key",
     "CONFIG_KEY":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "DNS":"off", "CF_API_BASE":"http://127.0.0.1:8790",

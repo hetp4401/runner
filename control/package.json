@@ -15,7 +15,7 @@
     "deploy": "wrangler deploy",
     "test:hybrid": "node test/sim/hybrid.test.mjs && node test/agent-link.mjs"
   },
-  "description": "Runner control plane with a Mac scheduler, Durable Object fallback and encrypted D1 configuration",
+  "description": "Runner control plane on Cloudflare Workers, one Durable Object and encrypted D1 configuration",
   "devDependencies": {
     "wrangler": "^4.153.0"
   }

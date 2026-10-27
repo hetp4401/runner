@@ -2347,7 +2347,7 @@ function renderChrome() {
   if (!S.status) { $("#summary").textContent = S.statusErr ? "" : "Loading…"; return; }
   const n = problems().filter((x) => x.kind === "failed" || x.kind === "gone").length;
   const cp = S.status.controlPlane;
-  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "mac" ? "Mac controller" : "Cloudflare fallback"} · </span>` : "";
+  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "mac" ? "Mac controller" : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
   setHtml($("#summary"), `${controller}${pill(n ? "failed" : "healthy", `${runsBy().size} up${n ? ` · ${n} problem${n === 1 ? "" : "s"}` : ""}`)}`);
 }
 

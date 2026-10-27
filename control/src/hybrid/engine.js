@@ -47,7 +47,7 @@ export class Engine {
     this.baseline = capture(this.control);
     this.alarmAt = alarmAt;
   }
-  async execute(operation) {
+  async execute(operation, { mirror = true } = {}) {
     let result;
     if (operation.kind === "alarm") {
       await this.control.alarm();
@@ -58,8 +58,10 @@ export class Engine {
       const response = await this.control.fetch(request);
       result = { status: response.status, headers: [...response.headers], body: await response.text() };
     }
-    const memory = capture(this.control);
-    const changes = difference(this.baseline, memory);
+    // Cloudflare-only scheduling has no external replica to mirror. Avoid
+    // cloning/comparing the whole fleet on every report in that mode.
+    const memory = mirror ? capture(this.control) : null;
+    const changes = mirror ? difference(this.baseline, memory) : null;
     this.baseline = memory;
     return { result, journal: this.store.takeJournal(), changes, alarmAt: this.alarmAt };
   }

@@ -22,6 +22,7 @@ const LEASE_MS = 90_000;
 
 export default {
   fetch(request, env) {
+    if (new URL(request.url).pathname === "/internal/mac" && env.SCHEDULER !== "hybrid") return json({ error: "external schedulers are disabled" }, 403);
     const forwarded = new Request(request);
     forwarded.headers.delete("x-runner-location");
     const cf = request.cf;
@@ -106,6 +107,7 @@ export class FleetCoordinator extends DurableObject {
     console.log(`fallback active: ${reason}`);
   }
   async grantMac() {
+    if (this.env.SCHEDULER !== "hybrid") return;
     const mac = this.mac;
     if (!mac || !mac.readyAt || mac.ws.readyState !== WebSocket.OPEN) return;
     if (mac.ack < this.sequence) {
@@ -155,7 +157,7 @@ export class FleetCoordinator extends DurableObject {
         await this.takeover(error.message);
         transaction = await this.engine.execute(operation);
       }
-    } else transaction = await this.engine.execute(operation);
+    } else transaction = await this.engine.execute(operation, { mirror: this.env.SCHEDULER === "hybrid" });
     await this.config.flush(this.engine.store);
     this.engine.store.takeJournal();
     this.sequence++;
@@ -172,7 +174,7 @@ export class FleetCoordinator extends DurableObject {
       enabled: this.leadership.enabled, macConnected: Boolean(this.mac), macReady: Boolean(this.mac?.readyAt),
       agentsConnected: this.agents.size, sequence: this.sequence, recoveryUntil: this.engine.control.recoveringUntil,
       recoveryMissing: [...this.engine.control.recoveryMissing], d1RowsRead: this.config.reads, d1RowsWritten: this.config.writes,
-      requests: this.requests, lastError: this.lastError, mode: "hybrid-v2",
+      requests: this.requests, lastError: this.lastError, mode: this.env.SCHEDULER === "hybrid" ? "hybrid-v2" : "cloudflare-v1",
       configuredApps: this.engine.control.projects.size, tunnelCredentials: this.engine.control.slots.size };
   }
   socketPair() { const pair = new WebSocketPair(); pair[1].accept(); return pair; }
@@ -193,6 +195,7 @@ export class FleetCoordinator extends DurableObject {
         });
       }
       if (url.pathname === "/internal/mac" && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+        if (this.env.SCHEDULER !== "hybrid") return json({ error: "external schedulers are disabled" }, 403);
         if (!this.authorized(request, this.env.MAC_TOKEN)) return json({ error: "unauthorized" }, 401);
         return await this.enqueue(() => this.connectMac());
       }
@@ -237,7 +240,7 @@ export class FleetCoordinator extends DurableObject {
         // Log sockets belong to the gateway even when the Mac schedules work.
         const logs = /\/(?:admin\/)?api\/projects\/[^/]+\/logs$/.test(url.pathname);
         let result;
-        if (logs) { const tx = await this.engine.execute(operation); result = tx.result; }
+        if (logs) { const tx = await this.engine.execute(operation, { mirror: this.env.SCHEDULER === "hybrid" }); result = tx.result; }
         else result = await this.execute(operation);
         if (/\/(?:admin\/)?api\/status$/.test(url.pathname) && result.status === 200) {
           const body = JSON.parse(result.body); body.controlPlane = this.info(); result.body = JSON.stringify(body);

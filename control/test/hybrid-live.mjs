@@ -4,8 +4,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ControlLink } from "../../agent/control-link.mjs";
+import WebSocket from "ws";
 
 const base = "http://127.0.0.1:8787";
+const cloudflareOnly = process.argv.includes("--cloudflare");
 const request = async (path, method = "GET", body, token = "test-admin") => {
   const response = await fetch(base + path, { method, headers: { "content-type": "application/json", "x-admin-password": token === "test-admin" ? token : "", authorization: `Bearer ${token}` }, body: body === undefined ? undefined : JSON.stringify(body) });
   const answer = await response.json();
@@ -31,10 +33,23 @@ function startMac() {
 try {
   await request("/internal/enable", "POST", { enabled: true }, "test-mac");
   await until(async () => !(await info()).macConnected, "previous Mac disconnected");
-  startMac();
-  await until(async () => (await info()).owner === "mac", "Mac becomes primary");
+  if (cloudflareOnly) {
+    const rejected = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(base.replace("http:", "ws:") + "/internal/mac", { headers: { authorization: "Bearer test-mac" }, handshakeTimeout: 5000 });
+      ws.on("unexpected-response", (_, response) => { response.resume(); resolve(response.statusCode); ws.terminate(); });
+      ws.on("open", () => { ws.close(); reject(new Error("external scheduler was accepted")); });
+      ws.on("error", reject);
+    });
+    assert.equal(rejected, 403);
+    assert.equal((await info()).mode, "cloudflare-v1");
+    assert.equal((await info()).owner, "do");
+    console.log("ok Cloudflare schedules directly and refuses an authenticated external scheduler");
+  } else {
+    startMac();
+    await until(async () => (await info()).owner === "mac", "Mac becomes primary");
+  }
   await until(async () => Date.now() >= (await info()).recoveryUntil, "initial recovery window");
-  console.log("ok Mac acquires leadership after state transfer");
+  if (!cloudflareOnly) console.log("ok Mac acquires leadership after state transfer");
   const name = "hybrid-canary";
   const compose = "services:\n  app:\n    image: nginx:alpine\n    ports: ['8080:80']\n";
   await request(`/api/projects/${name}`, "PUT", { compose, port: 8080, replicas: 2 });
@@ -63,23 +78,30 @@ try {
   assert.equal(later.d1RowsWritten, steady.d1RowsWritten);
   assert.equal(later.d1RowsRead, steady.d1RowsRead);
   console.log("ok routine reports perform zero D1 reads and writes");
-  const oldEpoch = later.epoch;
-  mac.kill("SIGSTOP");
-  await until(async () => (await info()).owner === "do", "DO lease takeover");
-  assert.notEqual((await info()).epoch, oldEpoch);
-  const fallbackPlan = await agents[0].link.report(agents[0].body);
-  assert.ok(fallbackPlan.recovery?.signature);
-  assert.equal((await request(`/api/projects/${name}`)).name, name);
-  console.log("ok a sleeping Mac is fenced and DO continues serving the same configuration");
-  mac.kill("SIGCONT");
-  await until(async () => (await info()).owner === "mac", "returning Mac synchronizes and resumes", 20_000);
-  assert.notEqual((await info()).epoch, oldEpoch);
-  const resumed = await agents[1].link.report(agents[1].body);
-  assert.ok(resumed.recovery?.signature);
-  console.log("ok returning Mac reloads current state before getting a new generation");
-  mac.kill("SIGTERM");
-  await until(async () => (await info()).owner === "do", "disconnect takeover");
-  console.log("ok clean Mac disconnect activates fallback immediately");
+  if (!cloudflareOnly) {
+    const oldEpoch = later.epoch;
+    mac.kill("SIGSTOP");
+    await until(async () => (await info()).owner === "do", "DO lease takeover");
+    assert.notEqual((await info()).epoch, oldEpoch);
+    const fallbackPlan = await agents[0].link.report(agents[0].body);
+    assert.ok(fallbackPlan.recovery?.signature);
+    assert.equal((await request(`/api/projects/${name}`)).name, name);
+    console.log("ok a sleeping Mac is fenced and DO continues serving the same configuration");
+    mac.kill("SIGCONT");
+    await until(async () => (await info()).owner === "mac", "returning Mac synchronizes and resumes", 20_000);
+    assert.notEqual((await info()).epoch, oldEpoch);
+    const resumed = await agents[1].link.report(agents[1].body);
+    assert.ok(resumed.recovery?.signature);
+    console.log("ok returning Mac reloads current state before getting a new generation");
+    mac.kill("SIGTERM");
+    await until(async () => (await info()).owner === "do", "disconnect takeover");
+    console.log("ok clean Mac disconnect activates fallback immediately");
+  } else {
+    assert.equal(later.owner, "do");
+    assert.equal(later.macConnected, false);
+    assert.equal((await request(`/api/projects/${name}`)).name, name);
+    console.log("ok configuration and agent plans are served entirely by Cloudflare");
+  }
   const bad = new ControlLink(base, "wrong-token", () => {});
   await assert.rejects(bad.report(agents[0].body), /401/);
   console.log("ok unauthenticated agents are refused");

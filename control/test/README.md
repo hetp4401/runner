@@ -48,3 +48,5 @@ npx wrangler d1 execute CONFIG --local --file migrations/0001_configuration.sql 
 ```
 
 In separate terminals, run `node test/cloudflare-mock.mjs` (port 8790) and `npx wrangler dev --config test/wrangler.hybrid.jsonc --persist-to /tmp/runner-hybrid-test --port 8787`. Then run `node test/hybrid-live.mjs`. The test starts its own Mac process, pauses/resumes it to simulate sleep, checks takeover and handback, verifies authentication and zero D1 traffic for reports, and forces a cold DO restart to recover from agent witnesses. All credentials in the test config are fake; the Cloudflare API target is local.
+
+For the production Cloudflare-only mode, substitute `test/wrangler.cloudflare.jsonc` and a fresh `/tmp/runner-cloudflare-test` state directory in both Wrangler commands, then run `node test/hybrid-live.mjs --cloudflare`. This verifies that authenticated external schedulers are refused, the DO handles plans and configuration directly, and cold recovery preserves the encrypted configuration without persisting agent health.
