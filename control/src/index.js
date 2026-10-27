@@ -1,40 +1,23 @@
-// Control plane for the runner fleet: one Node process with a SQLite file (see ../server.mjs), reached through its own
-// Cloudflare tunnel at runners.<domain>. Cloudflare provides nothing else: the machines' tunnels and the DNS names.
-// It knows nothing about where machines come from; see the agent's settings for what a machine tells it.
-// Holds the project specs (a docker compose file plus any Dockerfiles and build files) and sends every change to all
-// machines. Machines find it, not the other way round: any agent joins at /api/join, gets the lowest free slot n and
-// the token for tunnel runner-<n> (created through the Cloudflare API the first time a slot is used), then checks in
-// at /api/sync. The agent describes its machine; this never knows what's behind it:
-//   pool     the name of a replaceable set it belongs to (the control plane keeps each pool at its size), or none
-//            for a standalone host that keeps its slot across restarts
-//   starts   whether it can start machines: pool members that can are asked to start missing peers and their own
-//            replacements; for the rest, whatever watches the pool asks /api/claim
-//   label    a name for it, shown on the pages
-//   leaving  on its last check-in, when it's going for good (its replicas are placed elsewhere at once)
-// and whatever runs the machine pings POST /api/drain when it's going down soon (a timer, a cron before
-// maintenance, a cloud termination notice): the control plane then hands the machine over, one at a time, the same
-// way as for a requested roll. Nothing here predicts lifetimes.
-// It also keeps DNS in line: the public URL of replica k, <project>-<k>.<domain>, is a CNAME to the tunnel of the
-// machine running that copy, moved when the copy moves (replicas are numbered 1 to N and keep their number, so these
-// URLs only change with the replica count). There's no shared URL in front of a project's replicas, and nothing in
-// between: the machine's router answers the replica's name itself.
-//   /            the UI (everything public)  /api/*        API: apps are open to everyone (deploying, changing, removing),
-//                                                          unless an app was locked with its app password, which its
-//                                                          changes then need (x-app-password) or the admin password
-//                                                          (x-admin-password); fleet changes need the admin password;
-//                                                          machines send the join token (Bearer): join/sync/claim/drain/roll
-//   PUT /api/projects/<name>/env  the app's env: {KEY: "value"} sets, {KEY: null} removes. Every copy gets it as its
-//                                 .env (compose reads ${VAR} from it; env_file: .env passes it into containers), along
-//                                 with FLEET_APP, FLEET_REPLICA, FLEET_MACHINE, FLEET_HOST and FLEET_DOMAIN (nothing that
-//                                 changes with the replica count). Values are never sent out again (GET gives the keys), so secrets go
-//                                 here rather than in the compose file, which everyone can read. A change is a new version.
-//                                            /admin/api/*  the same, for the UI (changes from other sites are refused)
-//   /admin, /metrics  redirect to the app      /api/metrics  machine and app metrics (no token needed)
+// Control plane: owns desired app configuration, placement, rollouts and Cloudflare DNS/tunnel management.
+// Agents report inventory and health, then execute this controller's plans on their own Docker hosts.
+// ../server.mjs provides HTTP/WebSockets and timers; local-store.mjs keeps configuration on disk and runtime SQL
+// tables in RAM. A call to sql.exec/saveRun/saveCopy therefore does not imply a persistent write.
+// state-policy.js defines what survives a CP restart; agent reports and signed receipts rebuild the runtime view.
+//
+// Identities: project = app definition; replica = numbered desired instance; copy = its placement on a machine.
+// A machine number is a stable slot, with a tunnel named <TUNNEL_PREFIX>-<n>. A run is one incarnation of an agent;
+// predecessor and successor runs can briefly share a slot during a handover. See README's "How it works".
+//
+// Agents join at /api/join, then use the outgoing /api/agent WebSocket (HTTP /api/sync remains compatible).
+// Their pool, region, lifetime and ability to start machines are reported capabilities; GitHub is optional.
+// Public status/source are separate from authenticated app changes, fleet administration, secrets and diagnostics.
+// New Docker fleets require deployment authentication; REQUIRE_DEPLOY_AUTH=0 explicitly permits public deployments.
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import YAML from "yaml";
 import { REGIONS, regionOf, regionForReplica, machineRegion, validRegion } from "./regions.js";
 import { agentPlan, relativeBinds } from "./agent-plan.mjs";
 import { installScript } from "./install-script.mjs";
+import { durableSetting } from "./state-policy.js";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
 // grows with the number of machines (20 machines: every 20 s; 50: every 43 s). Never under MIN_POLL_S or over
@@ -2906,7 +2889,7 @@ export class Control {
   }
 
   recoveryFor(r, now = Date.now()) {
-    const runtime = this.all("SELECT * FROM settings").filter((x) => !["pools", "rebalance", "roll"].includes(x.key) && !/^roll_\d+$/.test(x.key));
+    const runtime = this.all("SELECT * FROM settings").filter((x) => !durableSetting(x.key));
     const payload = JSON.stringify({ v: 1, at: now, agent: r.agent, run: r.id, machine: r.machine,
       runRow: this.all("SELECT * FROM runs WHERE id = ?", r.id)[0],
       copies: this.all("SELECT * FROM copies WHERE machine = ?", r.machine),
@@ -3003,7 +2986,7 @@ export class Control {
       this.recoverySettingsAt = saved.at;
       for (const setting of saved.runtime ?? []) {
         // An older receipt must never replace the operator's current settings.
-        if (["pools", "rebalance", "roll"].includes(setting.key) || /^roll_\d+$/.test(setting.key)) continue;
+        if (durableSetting(setting.key)) continue;
         this.setSetting(setting.key, setting.value);
       }
       this.poolAsks = new Map(Object.entries(JSON.parse(this.settings.get("pool_asks") ?? "{}")));

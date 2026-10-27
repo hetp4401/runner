@@ -58,7 +58,9 @@ For the Docker package, build from the repository root with `docker build -t run
 
 Run `python3 control/test/agent-docker.py runner-agent:local` on a Linux Docker host for real Compose/build/bind-mount integration. It creates a unique test namespace and fake CP/router/tunnel, verifies nonroot build-source permissions, stable app data, colocated CP isolation and background-worker repair, and removes only its labeled test resources. The Linux-only FD-anchored filesystem checks in `agent-runtime.mjs` must also run in the agent image; the macOS invocation skips those checks.
 
-## Hybrid integration
+## Archived hybrid integration
+
+These tests cover the inactive Mac/Cloudflare implementation kept for reference. The current Docker control plane uses `server.mjs` and `local-store.mjs`; it needs none of the services below.
 
 Use Node 24. From `control/`, initialize a disposable local D1 database:
 
@@ -68,4 +70,4 @@ npx wrangler d1 execute CONFIG --local --file migrations/0001_configuration.sql 
 
 In separate terminals, run `node test/cloudflare-mock.mjs` (port 8790) and `npx wrangler dev --config test/wrangler.hybrid.jsonc --persist-to /tmp/runner-hybrid-test --port 8787`. Then run `node test/hybrid-live.mjs`. The test starts its own Mac process, pauses/resumes it to simulate sleep, checks takeover and handback, verifies authentication and zero D1 traffic for reports, and forces a cold DO restart to recover from agent witnesses. All credentials in the test config are fake; the Cloudflare API target is local.
 
-For the production Cloudflare-only mode, substitute `test/wrangler.cloudflare.jsonc` and a fresh `/tmp/runner-cloudflare-test` state directory in both Wrangler commands, then run `node test/hybrid-live.mjs --cloudflare`. This verifies that authenticated external schedulers are refused, the DO handles plans and configuration directly, and cold recovery preserves the encrypted configuration without persisting agent health.
+For the archived Cloudflare-only mode, substitute `test/wrangler.cloudflare.jsonc` and a fresh `/tmp/runner-cloudflare-test` state directory in both Wrangler commands, then run `node test/hybrid-live.mjs --cloudflare`. This verifies that authenticated external schedulers are refused, the DO handles plans and configuration directly, and cold recovery preserves the encrypted configuration without persisting agent health.

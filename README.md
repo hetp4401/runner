@@ -2,7 +2,7 @@
 
 A self-hosted control plane schedules Docker apps across your own Linux machines and optional GitHub Actions agents. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
-Neither the control plane nor the agent knows what a machine is, where it comes from, or how long it lives; they're told. An agent describes its machine with a **pool** (the name of a replaceable set it belongs to, which the control plane keeps at its size; or none, for a standalone host that keeps its slot across restarts), whether it **starts** machines (it has a `START_CMD`), an optional label (a name for the pages; `install.sh` uses the host's hostname), and sends **leaving** on its last check-in when it's going for good. An agent that knows how long its machine lives (`LIFETIME_MIN`) reports its deadline, and the control plane schedules its departure (see Departures); whatever runs the machine can also ping **`POST /api/drain`** when it's going down soon. Everything about GitHub Actions lives in [`machine.yml`](.github/workflows/machine.yml): the job's lifetime (355 minutes, under GitHub's 6-hour limit), a backstop drain at 330 minutes, and the command that starts another machine.
+Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Optional **pools** group replaceable machines with a target count; agents with a `START_CMD` can start replacements when the CP asks. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. GitHub-specific setup lives in [`machine.yml`](.github/workflows/machine.yml), including its 355-minute lifetime, 330-minute backstop drain and replacement command. See [How it works](#how-it-works) for the entities and their responsibilities.
 
 - **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
   - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.
@@ -152,28 +152,59 @@ Containers managed by the agent have a fleet-specific `io.runners.owner` label; 
 
 ## How it works
 
-- **Control plane** ([`control/`](control)): a Docker container serves `runners.<domain>` through Cloudflare Tunnel, with local SQLite for desired configuration, temporary in-memory tables for runtime state and private configuration for controller credentials. It:
-  - holds every project's versions
-  - places each project's replicas on the machines with the most room, and moves them when a machine goes
-  - runs the rollouts
-  - tracks machines and hands out restarts
-  - keeps the DNS in line: `<project>-<k>` is a CNAME to the tunnel of the machine running replica *k*, moved when the copy moves
-- **Agent** ([`agent/agent.mjs`](agent/agent.mjs)), on every machine (run by [`machine.yml`](.github/workflows/machine.yml) on GitHub Actions, by `install.sh` on a host). It's configured by environment variables (listed at the top of the file) and:
-  - reports every 60 seconds over one outgoing WebSocket, describing its machine and metrics; the controller can request a report immediately over that connection
-  - checks health locally every 10 seconds and can repair already-authorized containers during a controller outage
-  - privately retains its identity, approved plan, signed recovery receipt and recent metrics; three healthy agents also retain the fleet scheduling snapshot
-  - streams a copy's logs to the control plane while someone watches them (`agent/ws.mjs` is its WebSocket client)
-  - writes each project's files and runs `docker compose up -d --build --wait` (with `--force-recreate` when the files changed since its containers were last brought up there: compose has been seen to keep an old container running after its image was rebuilt); a project that fails is tried again (every 30 seconds while the machine is starting up, every 3 minutes once it's online), and a project that stops answering is recreated
-  - opens its tunnel only once every project it was given is up and answering (or after 10 minutes), so a fresh machine never takes traffic it can't serve
-  - removes what's no longer wanted
-  - routes each replica's name, `<project>-<k>`, through a local Caddy router behind the tunnel (the visitor's address and the https scheme reach the app as `X-Forwarded-*`)
-  - keeps going through the ordinary mishaps: a tunnel that won't connect or a router image that won't pull is tried again, a slow `START_CMD` runs in the background, and files a container left behind as root are deleted from a container
-- **Self-healing**:
-  - A departing machine hands over to a replacement on its own slot, without downtime: with a `START_CMD` it starts one for its own slot; without, it restarts its agent.
-  - If a pool member dies, members that can start machines start a replacement within about 2 minutes; for a pool whose members can't, whatever watches it starts the slots `POST /api/claim?pool=<name>` returns.
-  - On GitHub Actions, the control plane schedules each machine's departure from its reported deadline (a backstop drain at 330 minutes covers a control plane that didn't), and the workflow stops the agent before the 6-hour limit. A run that ends on its own then asks the control plane what's missing and starts it. If the control plane cannot be reached, the watchdog retries when it returns; a sufficiently long CP outage can therefore exhaust short-lived runners. A cancelled run doesn't request replacements: cancelling the runs is how a pool is stopped by hand.
-  - [`watchdog.yml`](.github/workflows/watchdog.yml) is scheduled every 10 minutes and starts machines if none are left. GitHub runs scheduled workflows late or skips them when it's busy (hours apart has been seen), so it's the backstop, not the mechanism.
-  - [`roll.yml`](.github/workflows/roll.yml) restarts the fleet one machine at a time when the agent changes.
+The **control plane decides what should run and where**. Each **agent makes that plan happen on its own host**. Only the CP chooses placements, manages Cloudflare DNS/tunnels and accepts desired configuration changes. Agents build, run, check and repair containers; they can keep an approved workload running while the CP is unavailable.
+
+```mermaid
+flowchart LR
+  Operator -->|app specs and secrets| CP[Control plane]
+  CP -->|desired plan and signed receipt| Agent[Agent on each host]
+  Agent -->|inventory and health| CP
+  Agent -->|build, run, repair| Docker[Local Docker containers]
+  CP -->|DNS and tunnel management| CF[Cloudflare]
+```
+
+### Entities
+
+| Term | Meaning |
+| --- | --- |
+| App / project | One desired definition: Compose, source files, secrets, replica count and region constraints. |
+| Replica | A numbered instance of an app, such as `gdrive-2`. Its number and public URL survive moves. |
+| Copy | A replica's placement on a machine. During a move, old and new copies can overlap until the new one is healthy. |
+| Machine / slot | The CP's numbered fleet position, with a stable tunnel identity. A replacement host can take the same slot. |
+| Agent | The host's Docker manager. Its private local state keeps its identity across restarts. |
+| Run | One incarnation of an agent. A process crash resumes it; a reboot or deliberate upgrade creates a new run. Old and new runs can overlap on a slot during handover. |
+| Pool / region | Optional labels: a pool manages a target number of replaceable machines; a region constrains app placement. |
+
+An app can contain several Compose services. For example, one GDrive replica includes both its app container and WARP container; those services move together.
+
+### Reports, plans and recovery
+
+The agent opens one outgoing WebSocket to the CP. It reports inventory, health and metrics, and receives a desired plan. Reports normally run every 20–300 seconds according to fleet size (`POLL_S` overrides this); the CP can request a fresh report immediately. The agent checks health every 10 seconds and repairs approved workloads locally. Viewing logs opens a separate temporary stream; the CP does not store the log contents.
+
+On a CP restart, agents keep serving while it loads desired configuration, rediscovers tunnels from Cloudflare and collects agent reports and signed receipts. Up to three healthy agents also retain a signed fleet snapshot to recover interrupted moves or missing peers. These agents are recovery witnesses; they do not make scheduling decisions. The CP then reconciles the recovered inventory with its current specs: deleted apps are removed, existing apps converge to the current version and missing replicas are placed. A late receipt cannot overwrite a placement already decided by the running CP.
+
+### What survives a restart
+
+| Location | State |
+| --- | --- |
+| CP SQLite on disk | App specs/source versions, app secrets/password hashes, desired fleet settings and app rollout decisions. |
+| CP private configuration | Management credentials, join token, signing key and stable fleet namespace. |
+| CP RAM, including SQLite TEMP tables | Health, placements, runs, metrics, events, diagnostics and discovered tunnel IDs/tokens. |
+| Agent's disk | Identity, approved plan, receipt, local connector token, recent metrics, verified agent code and app data. App data is not replicated between hosts. |
+
+Normal reports, health checks and placements make **no persistent CP writes**. Configuration changes and committed app rollout decisions can write SQLite. [`state-policy.js`](control/src/state-policy.js) defines the durable tables/settings and is shared by storage and receipt recovery; a receipt cannot replace those authoritative settings.
+
+### Reading the code
+
+Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then [`Control.sync()` in index.js](control/src/index.js) for report → reconcile → plan. [`local-store.mjs`](control/src/local-store.mjs) enforces the persistence boundary. On the host, [`agent.mjs`](agent/agent.mjs) contains `main()` and `reconcile()`; [`runtime.mjs`](agent/runtime.mjs) handles ownership, safe files and recovery helpers. [`control-link.mjs`](agent/control-link.mjs) carries reports and plans. The archived Mac/Worker implementations are outside this path.
+
+### Self-healing
+
+- A departing machine hands over to a replacement on its own slot, without downtime: with a `START_CMD` it starts one for its own slot; without, it restarts its agent.
+- If a pool member dies, members that can start machines start a replacement within about 2 minutes; for a pool whose members can't, whatever watches it starts the slots `POST /api/claim?pool=<name>` returns.
+- On GitHub Actions, the control plane schedules each machine's departure from its reported deadline (a backstop drain at 330 minutes covers a control plane that didn't), and the workflow stops the agent before the 6-hour limit. A run that ends on its own then asks the control plane what's missing and starts it. If the control plane cannot be reached, the watchdog retries when it returns; a sufficiently long CP outage can therefore exhaust short-lived runners. A cancelled run doesn't request replacements: cancelling the runs is how a pool is stopped by hand.
+- [`watchdog.yml`](.github/workflows/watchdog.yml) is scheduled every 10 minutes and starts machines if none are left. GitHub runs scheduled workflows late or skips them when it's busy (hours apart has been seen), so it's the backstop, not the mechanism.
+- [`roll.yml`](.github/workflows/roll.yml) restarts the fleet one machine at a time when the agent changes.
 
 ## Running the control plane
 
