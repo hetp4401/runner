@@ -44,7 +44,7 @@ ok("unknown and non-US locations aren't guessed", [null, "", "London, England, G
 
 {
   const { c, f } = await setup();
-  for (const invalid of ["phoenix", "westus3", "eu-west", "true", "[]", "42"] ) {
+  for (const invalid of ["US-West", "eu_west", "region/other", "true", "[]", "42"] ) {
     let rejected = false;
     try { deploy(c, "invalid", app(invalid)); } catch (e) { rejected = e.status === 400 && /x-runner.region/.test(e.message); }
     ok(`invalid region ${invalid} is rejected before deployment`, rejected);
@@ -161,7 +161,7 @@ const assignmentsMatch = (c) => staying(c).every((x) => regionFor(c, x.machine) 
 
 {
   const { c, f } = await setup(["west", "central", "east", "west2", "central", "east"]);
-  for (const invalid of [[], ["unknown"], ["us-west", 42], Array(51).fill("us-west")]) {
+  for (const invalid of [[], ["not a slug"], ["us-west", 42], Array(51).fill("us-west")]) {
     let rejected = false;
     try { deploy(c, "invalid", app(invalid, 3)); } catch (e) { rejected = e.status === 400 && /x-runner.regions/.test(e.message); }
     ok(`invalid region list (${invalid.length} entries) is rejected`, rejected);

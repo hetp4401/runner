@@ -32,7 +32,9 @@
 //   /admin, /metrics  redirect to the app      /api/metrics  machine and app metrics (no token needed)
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import YAML from "yaml";
-import { REGIONS, regionOf, regionForReplica } from "./regions.js";
+import { REGIONS, regionOf, regionForReplica, machineRegion, validRegion } from "./regions.js";
+import { agentPlan, relativeBinds } from "./agent-plan.mjs";
+import { installScript } from "./install-script.mjs";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
 // grows with the number of machines (20 machines: every 20 s; 50: every 43 s). Never under MIN_POLL_S or over
@@ -191,7 +193,7 @@ const SAFE_SERVICE = new Set(["image", "build", "command", "entrypoint", "enviro
   "extra_hosts", "platform", "pull_policy", "logging", "deploy", "network_mode", "cap_drop", "links", "profiles", "scale"]);
 const SAFE_BUILD = new Set(["context", "dockerfile", "dockerfile_inline", "args", "target", "labels", "no_cache", "pull",
   "shm_size", "tags", "platforms"]);
-const RESERVED_PORTS = new Set([2019, 19080]); // the machine's router and its admin API
+const RESERVED_PORTS = new Set([2019, 19080, 19081, 19082]); // legacy/new router admin, router and tunnel metrics
 
 // What an untrusted compose file asks for that it may not have (empty if nothing).
 function sandboxProblems(doc) {
@@ -214,6 +216,9 @@ function sandboxProblems(doc) {
     }
   }
   const services = Object.keys(doc.services);
+  const binds = relativeBinds(doc);
+  for (const parent of binds) if (!parent.readOnly && binds.some((child) => child.path !== parent.path &&
+    (parent.path === "." || child.path.startsWith(`${parent.path}/`)))) no("volumes", "a writable bind must not contain another bind source");
   for (const [name, s] of Object.entries(doc.services)) {
     if (!isMap(s)) continue;
     const at = `services.${name}`;
@@ -467,12 +472,12 @@ function buildSpec(body, { trusted = false } = {}) {
   replicas ??= parseReplicas(doc["x-runner"]?.replicas, "x-runner.replicas") ?? 1;
   const xr = isMap(doc["x-runner"]) ? doc["x-runner"] : {};
   if (xr.ready != null && !(typeof xr.ready === "string" && /^\/[\x21-\x7e]{0,199}$/.test(xr.ready))) throw new HttpError(400, "x-runner.ready is a path, like /healthz");
-  if (xr.region != null && !(typeof xr.region === "string" && Object.hasOwn(REGIONS, xr.region))) {
-    throw new HttpError(400, `x-runner.region must be one of: ${Object.keys(REGIONS).join(", ")}`);
+  if (xr.region != null && !validRegion(xr.region)) {
+    throw new HttpError(400, "x-runner.region must be a region label: 1-32 lowercase letters, digits or hyphens, starting with a letter");
   }
   if (xr.regions != null && !(Array.isArray(xr.regions) && xr.regions.length > 0 && xr.regions.length <= MAX_REPLICAS &&
-    xr.regions.every((r) => typeof r === "string" && Object.hasOwn(REGIONS, r)))) {
-    throw new HttpError(400, `x-runner.regions must be a nonempty list of up to ${MAX_REPLICAS} regions: ${Object.keys(REGIONS).join(", ")}`);
+    xr.regions.every(validRegion))) {
+    throw new HttpError(400, `x-runner.regions must be a nonempty list of up to ${MAX_REPLICAS} region labels`);
   }
   if (xr.region != null && xr.regions != null) throw new HttpError(400, "set x-runner.region or x-runner.regions, not both");
   if (!trusted) {
@@ -498,41 +503,6 @@ function buildSpec(body, { trusted = false } = {}) {
   }
   const sorted = Object.fromEntries(Object.keys(files).sort().map((k) => [k, files[k]]));
   return { compose, port, replicas, files: sorted };
-}
-
-// Served at /install.sh: runs the agent in a container on any machine with Docker. The token isn't in it; the agent's
-// code comes from this controller's bundled agent unless AGENT_URL overrides it.
-function installScript(origin, agentUrl) {
-  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
-  return `#!/bin/sh
-# Adds this server to the fleet at ${origin}. Needs Docker.
-#   curl -fsSL ${origin}/install.sh | sudo JOIN_TOKEN=<token> sh
-# Optional: LABEL=<name> names it on the status pages (default: its hostname).
-# The agent runs in the container runner-agent, takes a free slot n, and runs the replicas placed on this
-# server. It fetches the latest agent code each time it starts.
-# Remove the server:  docker rm -f runner-agent tunnel router
-set -eu
-: "\${JOIN_TOKEN:?set JOIN_TOKEN; the fleet's owner gets it from the Contribute page or with: runnerctl join-token}"
-DATA=\${RUNNER_DATA:-/var/lib/runner}
-command -v docker >/dev/null 2>&1 || { echo "Install Docker first: https://docs.docker.com/engine/install/" >&2; exit 1; }
-[ "$(docker info --format '{{.OSType}}')" = linux ] || { echo "Agents need a Linux Docker host." >&2; exit 1; }
-case "$DATA" in /*) ;; *) echo "RUNNER_DATA must be an absolute host path." >&2; exit 1;; esac
-export JOIN_TOKEN
-mkdir -p "$DATA"
-docker rm -f runner-agent >/dev/null 2>&1 || true
-docker run -d --name runner-agent --restart unless-stopped --stop-timeout 180 --network host --hostname "$(hostname)" \\
-  -v /var/run/docker.sock:/var/run/docker.sock -v "$DATA:$DATA" \\
-  -e CONTROL_URL=${quote(origin)} -e AGENT_URL=${quote(agentUrl)} -e JOIN_TOKEN -e RUNNER_DATA="$DATA" \\
-  -e POOL -e POOL_SIZE -e MACHINE -e ROUTER_PORT \\
-  -e LABEL="\${LABEL:-$(hostname)}" \\
-  docker:28-cli sh -c '
-    set -e
-    apk add --no-cache nodejs >/dev/null
-    mkdir -p /agent && cd /agent
-    for f in agent.mjs metrics.mjs ws.mjs control-link.mjs; do wget -qO "$f" "$AGENT_URL/$f"; done
-    exec node agent.mjs'
-echo "Joined. Follow it with: docker logs -f runner-agent"
-`;
 }
 
 const EXPORT_TABLES = ["projects", "versions", "copies", "runs", "starts", "settings", "slots", "agents", "app_passwords", "app_env", "events", "metrics_1m", "metrics_10m", "metrics_1h"];
@@ -567,13 +537,16 @@ function eventText(e) {
 export class Control {
   // sql: { exec(query, ...args) -> { toArray() } } over SQLite; env: settings and secrets; alarm(at): call this.alarm()
   // at that time (replacing any earlier call); page: the web app's HTML; restart(): exit so the process is started again.
-  constructor({ sql, env, alarm, page, restart, agentFile = () => null }) {
+  constructor({ sql, env, alarm, page, restart, agentFile = () => null, agentBundle = () => null }) {
     this.sql = sql;
-    this.env = env;
+    const auth = String(env.REQUIRE_DEPLOY_AUTH ?? "0").toLowerCase();
+    if (!["0", "1", "false", "true"].includes(auth)) throw new Error("REQUIRE_DEPLOY_AUTH must be 1/true or 0/false");
+    this.env = { ...env, REQUIRE_DEPLOY_AUTH: ["1", "true"].includes(auth) ? "1" : "0" };
     this.setAlarm = alarm;
     this.page = page;
     this.restart = restart;
     this.agentFile = agentFile;
+    this.agentBundle = agentBundle;
     this.tunnelPrefix = env.TUNNEL_PREFIX || "runner";
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(this.tunnelPrefix)) throw new Error("TUNNEL_PREFIX must contain 1-63 lowercase letters, digits or hyphens");
     for (const query of [
@@ -670,9 +643,12 @@ export class Control {
     this.pulled = new Set(); // runs made due early to spread a pool's departures (see flatten)
     this.bootAt = Date.now();
     this.recoveringUntil = this.env.RECOVER_RUNTIME === "1" ? this.bootAt + Number(this.env.RECOVERY_MS ?? 180_000) : 0;
+    this.coldRecoveryComplete = false;
+    this.observedRuns = new Set(); // direct reports this boot; a witness alone does not count
     this.recoverySeen = new Map();
     this.recoveryMissing = new Set();
     this.recoverySettingsAt = 0;
+    this.diagnostics = new Map(); // authenticated troubleshooting only; never public events/status/receipts
     this.settleAt = this.bootAt; // the (re)start, or the end of the last gap in check-ins: SETTLE_MS and ARRIVAL_MS count from here
     // The last check-in before the (re)start or gap: the runs live then are the ones settling() waits for.
     this.quietSince = Math.max(0, ...[...this.runs.values()].map((r) => r.seen));
@@ -798,7 +774,7 @@ export class Control {
   // One row per change the control plane makes or sees, with its cause: what the pages show as activity and churn.
   logEvent(kind, f = {}) {
     const e = { t: f.t ?? Date.now(), kind, app: f.app ?? null, replica: f.replica ?? null, machine: f.machine ?? null,
-      other: f.other ?? null, run: f.run ?? null, cause: f.cause ?? null, detail: f.detail != null ? String(f.detail).slice(0, 500) : null };
+      other: f.other ?? null, run: f.run ?? null, cause: f.cause ?? null, detail: f.detail != null ? this.redact(String(f.detail)).slice(0, 500) : null };
     const row = this.all(`INSERT INTO events (t, kind, app, replica, machine, other, run, cause, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       RETURNING id`, e.t, e.kind, e.app, e.replica, e.machine, e.other, e.run, e.cause, e.detail)[0];
     this.recentEvents.push({ id: row?.id, ...e });
@@ -818,7 +794,9 @@ export class Control {
       args.push(...kinds);
     }
     if (q.get("machine")) { where.push("(machine = ? OR other = ?)"); args.push(Number(q.get("machine")), Number(q.get("machine"))); }
-    const limit = Math.min(1000, Math.max(1, Number(q.get("limit") ?? 200) || 200));
+    const requested = Number(q.get("limit") ?? 200);
+    if (!Number.isSafeInteger(requested) || requested < 1) throw new HttpError(400, "limit must be a positive whole number");
+    const limit = Math.min(1000, requested);
     return { events: this.all(`SELECT * FROM events WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...args, limit).map((e) => ({ ...e, text: eventText(e) })) };
   }
 
@@ -908,7 +886,15 @@ export class Control {
         const origin = this.env.PUBLIC_URL || url.origin;
         return new Response(installScript(origin, this.env.AGENT_URL || `${origin}/agent`), { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
       }
-      const agentAsset = /^\/agent\/(agent|metrics|ws|control-link)\.mjs$/.exec(path);
+      if (request.method === "GET" && ["/agent/bundle.json", "/agent/manifest.json", "/agent/bundle.tar", "/agent/bundle.sha256"].includes(path)) {
+        const bundle = this.agentBundle();
+        if (!bundle) throw new HttpError(404, "agent bundle is unavailable");
+        if (path.endsWith("bundle.json")) return json({ revision: bundle.revision, hashes: bundle.hashes, files: bundle.files });
+        if (path.endsWith("manifest.json")) return json({ revision: bundle.revision, hashes: bundle.hashes, archiveHash: bundle.archiveHash });
+        return new Response(path.endsWith(".tar") ? bundle.archive : `${bundle.archiveHash}\n`, { headers: {
+          "content-type": path.endsWith(".tar") ? "application/x-tar" : "text/plain", "cache-control": "no-cache" } });
+      }
+      const agentAsset = /^\/agent\/([a-z][a-z0-9-]*)\.mjs$/.exec(path);
       if (request.method === "GET" && agentAsset) {
         const source = this.agentFile(`${agentAsset[1]}.mjs`);
         if (source == null) throw new HttpError(404, "agent source is not bundled with this controller");
@@ -921,7 +907,7 @@ export class Control {
         const origin = request.headers.get("origin");
         if (request.method !== "GET" && origin && origin !== url.origin) throw new HttpError(403, "cross-site request refused");
         const route = path.slice("/admin/api".length);
-        const ip = request.headers.get("cf-connecting-ip") ?? "";
+        const ip = request.headers.get("x-runner-client-ip") ?? request.headers.get("cf-connecting-ip") ?? "unknown";
         // Passwords are only looked at where they count (fleet changes, changes to apps), so an address refused for
         // wrong guesses can still see everything.
         const fleet = /^\/(unlock|settings|roll|join-token|machines\/\d+\/evict|slots\/\d+)$/.test(route);
@@ -940,7 +926,7 @@ export class Control {
         // Scripts: the same as the UI (apps are open; the admin password for fleet changes and locked apps); machines
         // send the join token.
         const password = adminPassword(request);
-        const ip = request.headers.get("cf-connecting-ip") ?? "";
+        const ip = request.headers.get("x-runner-client-ip") ?? request.headers.get("cf-connecting-ip") ?? "unknown";
         const admin = password != null && await this.checkPassword(password, ip);
         const node = admin || (Boolean(this.env.JOIN_TOKEN) && request.headers.get("authorization") === `Bearer ${this.env.JOIN_TOKEN}`);
         return await this.api(request, url, path.slice("/api".length), {
@@ -1006,6 +992,35 @@ export class Control {
     );
   }
 
+  redact(text) {
+    const values = [...this.appEnv.values()].flatMap((values) => [...values.values()]);
+    values.push(...Object.entries(this.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|KEY/.test(key)).map(([, value]) => value));
+    const secrets = [...new Set(values.filter((v) => typeof v === "string").flatMap((v) => [v, ...v.split("\n")]))]
+      .filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
+    return secrets.reduce((out, secret) => out.split(secret).join("[hidden]"), String(text));
+  }
+
+  reportedStatus(value, run = null, machine = null) {
+    if (!isMap(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter(([key, state]) => /^[a-z0-9][a-z0-9-]{0,63}$/.test(key) && isMap(state)).map(([key, state]) => {
+      const out = {};
+      for (const field of ["v", "t0", "n"]) if (Number.isFinite(state[field])) out[field] = state[field];
+      out.s = typeof state.s === "string" && /^[a-z-]{1,24}$/.test(state.s) ? state.s : "unknown";
+      if (typeof state.r === "boolean") out.r = state.r;
+      if (/^[a-f0-9]{64}$/.test(state.revision ?? "")) out.revision = state.revision;
+      const id = `${run}|${key}`;
+      if (state.e) {
+        out.e = "Workload failed; authenticated diagnostics contain details";
+        if (run) {
+          const app = [...this.copies].find(([, list]) => list.some((copy) => copy.machine === machine && copy.key === key))?.[0]
+            ?? (this.projects.has(key) ? key : key.replace(/-r\d+$/, ""));
+          this.diagnostics.set(id, { app, key, run, machine, at: Date.now(), error: String(state.e).slice(-4000) });
+        }
+      } else if (run) this.diagnostics.delete(id);
+      return [key, out];
+    }));
+  }
+
   // admin: fleet changes (pools, rebalancing, restarts, evictions, slots, the join token), and any app, locked or not;
   // node: machines. Apps are open to everyone otherwise, unless locked with a password (appPassword then).
   async api(request, url, route, { admin, node, ip = "", adminWrong = false, appPassword = null }) {
@@ -1065,7 +1080,7 @@ export class Control {
     // Apps are open: anyone can look, deploy a new one, change or remove one. Unless it's locked: a "password" sent
     // with a new app (or set later at /password) locks it, and changing it then needs that password (x-app-password)
     // or the admin password.
-    const m = route.match(/^\/projects\/([^/]+)(?:\/(enable|disable|move|unlock|password|env|logs))?$/);
+    const m = route.match(/^\/projects\/([^/]+)(?:\/(enable|disable|move|unlock|password|env|logs|diagnostics))?$/);
     if (m) {
       const [, name, action] = m;
       if (!action && method === "GET") return json(this.getProject(name, url.searchParams.get("version")));
@@ -1103,6 +1118,10 @@ export class Control {
       if (action === "logs" && method === "POST") {
         if (!admin && !this.appPasswords.has(name)) throw new HttpError(401, `${name} has no app password, so its logs need the admin password`);
         return json(this.openLogSession(name, Number(url.searchParams.get("replica") ?? 1), Date.now()));
+      }
+      if (action === "diagnostics" && method === "POST") {
+        if (!admin && !this.appPasswords.has(name)) need(false);
+        return json({ errors: [...this.diagnostics.values()].filter((x) => x.app === name).map((x) => ({ ...x, error: this.redact(x.error) })) });
       }
       if (action === "password" && method === "PUT") {
         this.project(name);
@@ -1153,7 +1172,7 @@ export class Control {
       hasPassword: this.appPasswords.has(p.name), // locked: changing it needs that password (or the fleet's); else anyone can
       env: [...(this.appEnv.get(p.name)?.keys() ?? [])], // its env's variable names (the values stay here)
       state: !p.enabled ? "disabled" : p.halted ? "halted" : p.stable === p.version ? "live" : "deploying",
-      halted: p.halted,
+      halted: p.halted ? this.redact(p.halted) : p.halted,
       updated: p.updated,
     };
   }
@@ -1314,6 +1333,7 @@ export class Control {
     this.blocked.delete(name);
     this.appPasswords.delete(name);
     this.appEnv.delete(name);
+    for (const [key, value] of this.diagnostics) if (value.app === name) this.diagnostics.delete(key);
     for (const key of this.versions.keys()) if (key.startsWith(`${name}@`)) this.versions.delete(key);
     this.scheduleDns();
     return { deleted: name };
@@ -1383,9 +1403,9 @@ export class Control {
         // starts elsewhere. A fresh VM must establish its own location before
         // inheriting a constrained app, even when it reuses the same slot.
         const region = regionForReplica(spec.policy, x.replica);
-        if (region && regionOf(run?.location) !== region && run?.status?.[x.key]?.s !== "healthy") continue;
-        out[x.key] = { v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica,
-          ...(spec.policy.ready ? { ready: spec.policy.ready } : {}) };
+        if (region && machineRegion(run) !== region && run?.status?.[x.key]?.s !== "healthy") continue;
+        out[x.key] = agentPlan({ v, ...this.composeFor(p.name, v, spec, x), files: { ...spec.files, ".env": this.envFile(p.name, spec, x, v) }, app: p.name, replica: x.replica,
+          ports: x.ports ?? null, ...(spec.policy.ready ? { ready: spec.policy.ready } : {}) });
       }
     }
     return out;
@@ -1519,6 +1539,7 @@ export class Control {
 
   place(now) {
     if (this.recoveryActive(now)) return;
+    this.coldRecoveryComplete = true; // API updates can schedule before the first normal agent report
     const up = this.liveMachines(now); // machine -> its newest live run
     let changed = false;
     // After a (re)start the first machine to check in would get every replica, because it's the only one with
@@ -1584,7 +1605,7 @@ export class Control {
           const run = up.get(x.machine);
           const region = regionForReplica(spec.policy, x.replica);
           // Unknown locations wait for the lookup; they aren't a different region.
-          if (x.leaving || !regionOf(run?.location) || regionOf(run.location) === region) continue;
+          if (x.leaving || !machineRegion(run) || machineRegion(run) === region) continue;
           const serving = this.liveRuns(now).some((r) => r.machine === x.machine && r.ready &&
             r.status?.[x.key]?.s === "healthy" && r.status[x.key].r !== false);
           // Copies that already have no serving VM are missing capacity, not
@@ -1786,7 +1807,7 @@ export class Control {
     const policy = this.version(name, this.projects.get(name)?.version)?.policy;
     const requiredRegion = regionForReplica(policy, x.replica);
     if (requiredRegion && run) {
-      const region = regionOf(run.location);
+      const region = machineRegion(run);
       if (!region) return null; // a process restart may still be looking up this run
       if (region !== requiredRegion) return { cancel: `server ${lv.to} is outside the required region ${requiredRegion}`, failed: false };
     }
@@ -1833,7 +1854,7 @@ export class Control {
     const region = regionForReplica(spec?.policy, replica);
     const scope = region ? `${region}: ` : "";
     if (region) {
-      const regional = new Map([...up].filter(([, r]) => regionOf(r.location) === region));
+      const regional = new Map([...up].filter(([, r]) => machineRegion(r) === region));
       if (!regional.size) return `replica ${replica} is waiting for a server in ${region}; no live server has a known matching region`;
       up = regional;
     }
@@ -1912,7 +1933,7 @@ export class Control {
     for (const r of this.liveRuns(now)) runsOnSlot.set(r.machine, (runsOnSlot.get(r.machine) ?? 0) + 1);
     const cands = [];
     for (const r of up.values()) {
-      if (region && regionOf(r.location) !== region) continue;
+      if (region && machineRegion(r) !== region) continue;
       const doubling = mine.get(r.machine) ?? 0;
       if (this.clash(name, r.machine) || (doubling && spec?.nodup)) continue;
       if (r.drain || r.handover || r.retire || r.evict || (runsOnSlot.get(r.machine) ?? 0) > 1) continue;
@@ -1952,6 +1973,8 @@ export class Control {
   move(name, from, to, replica = null, { cause = "hand", why = null } = {}) {
     const p = this.project(name);
     const now = Date.now();
+    if (this.recoveryActive(now)) throw new HttpError(503, "recovering fleet inventory and tunnels; retry moving shortly");
+    this.coldRecoveryComplete = true;
     const onFrom = this.copiesOn(name, from);
     const x = replica != null ? onFrom.find((y) => y.replica === Number(replica)) : onFrom.find((y) => !y.leaving) ?? onFrom[0];
     if (!x) throw new HttpError(400, replica != null ? `replica ${replica} of ${name} isn't on server ${from}` : `${name} isn't placed on server ${from}`);
@@ -1962,8 +1985,8 @@ export class Control {
     const spec = this.version(name, p.version);
     const up = this.liveMachines(now);
     const region = regionForReplica(spec?.policy, x.replica);
-    if (to && up.has(Number(to)) && region && regionOf(up.get(Number(to)).location) !== region) {
-      throw new HttpError(409, `${name} replica ${x.replica} requires ${region}; server ${to} is in ${regionOf(up.get(Number(to)).location) ?? "an unknown region"}`);
+    if (to && up.has(Number(to)) && region && machineRegion(up.get(Number(to))) !== region) {
+      throw new HttpError(409, `${name} replica ${x.replica} requires ${region}; server ${to} is in ${machineRegion(up.get(Number(to))) ?? "an unknown region"}`);
     }
     let dest;
     if (origin && to && Number(to) === origin.machine) { // back where it came from: the move is called off
@@ -2715,8 +2738,23 @@ export class Control {
 
   sync(body, ip = null, edgeLocation = null) {
     const now = Date.now();
+    const machine = Number(body?.machine);
+    const started = Number(body?.started);
+    const run = String(body?.run ?? "");
+    if (!Number.isSafeInteger(machine) || machine < 1 || !run || run.length > 200 || !Number.isFinite(started)) {
+      throw new HttpError(400, "machine, run and started are required");
+    }
+    if (body.region != null && body.region !== "" && !validRegion(body.region)) throw new HttpError(400, "region must be a lowercase region label");
+    const observed = this.observedRuns.has(run);
     const receipt = this.readRecovery(body, now);
-    if (this.recoveringUntil && (!this.tunnelsReady || now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
+    if (!this.coldRecoveryComplete && this.recoveringUntil && (!this.tunnelsReady || now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
+    else {
+      // A timer expiring does not make a late agent's running inventory empty.
+      // Recover only its own observations here; never replay a late fleet-wide
+      // snapshot over decisions made since this process began scheduling.
+      if (!observed || this.recoveryMissing.has(run)) this.recoverLateAgent(body, receipt, now);
+      if (this.coldRecoveryComplete) this.recoverLateWitness(receipt, now);
+    }
     // Every machine silent for longer than the liveness window: this was unreachable, so give the fleet time to show
     // up again before anything counts as gone or gets placed (see SETTLE_MS).
     if (now - this.lastCheckin > this.liveMs) {
@@ -2727,13 +2765,7 @@ export class Control {
       this.logEvent("gap", { cause: "unreachable", detail: text });
     }
     this.lastCheckin = now;
-    const machine = Number(body?.machine);
-    const started = Number(body?.started);
-    const run = String(body?.run ?? "");
-    if (!Number.isInteger(machine) || machine < 1 || !run || !Number.isFinite(started)) {
-      throw new HttpError(400, "machine, run and started are required");
-    }
-    const status = isMap(body.status) ? body.status : {};
+    const status = this.reportedStatus(body.status, run, machine);
     const ready = body.ready ? 1 : 0;
     // How the agent describes its machine (see the top of this file).
     const pool = typeof body.pool === "string" && /^[a-z0-9-]{1,30}$/.test(body.pool) ? body.pool : null;
@@ -2757,6 +2789,16 @@ export class Control {
       if (changed) this.saveRun(r);
       else this.sql.exec("UPDATE runs SET seen = ? WHERE id = ?", now, r.id);
     }
+    r.region = Object.hasOwn(body, "region") ? (validRegion(body.region) ? body.region : null) : r.region ?? null;
+    if (receipt && receipt.run !== run && receipt.run === body.previousRun) {
+      const previous = this.runs.get(receipt.run);
+      if (previous && previous.agent === r.agent && previous.machine === machine && previous.started < started && !previous.retire) {
+        previous.retire = 1;
+        this.saveRun(previous);
+      }
+      this.recoveryMissing.delete(receipt.run);
+      this.recoveryMissing.delete(run);
+    }
     const cpus = Number(body.cpus);
     if (Number.isInteger(cpus) && cpus > 0 && cpus <= 1024) r.cpus = cpus;
     this.takeMetrics(r, body.metrics, now);
@@ -2777,6 +2819,7 @@ export class Control {
       this.logEvent("left", { machine: r.machine, run: r.id, cause: "leaving", detail: "the server said it's going away" });
     }
     r.protocol = Number(body.protocol) || 1;
+    this.observedRuns.add(run);
     if (receipt) {
       r.recoveryAt = Math.max(r.recoveryAt ?? 0, receipt.at);
       if (receipt.fleet) r.witnessAt = Math.max(r.witnessAt ?? 0, receipt.at);
@@ -2787,6 +2830,9 @@ export class Control {
       if (r.protocol < 2) throw new HttpError(503, "reconstructing fleet state; keep current workloads");
       return { hold: true, domain: this.env.DOMAIN, poll: 5, message: "reconstructing fleet state; keep current workloads" };
     }
+    // A later legacy report may hold plans until its inventory is identified,
+    // but must never reopen fleet-wide replay over newer scheduling decisions.
+    this.coldRecoveryComplete = true;
     this.checkMassLoss(now);
     this.place(now);
     this.settle(now);
@@ -2826,7 +2872,7 @@ export class Control {
       if (!p.enabled || !spec) return [];
       return this.copiesOn(p.name, r.machine).filter((x) => {
         const region = regionForReplica(spec.policy, x.replica);
-        return region && regionOf(r.location) !== region && older.status?.[x.key]?.s === "healthy" && older.status[x.key].r !== false;
+        return region && machineRegion(r) !== region && older.status?.[x.key]?.s === "healthy" && older.status[x.key].r !== false;
       }).map((x) => x.key);
     }) : [];
     // Logs someone's waiting to watch, of copies this run has: the agent streams them (see openLogSession).
@@ -2865,13 +2911,13 @@ export class Control {
       runRow: this.all("SELECT * FROM runs WHERE id = ?", r.id)[0],
       copies: this.all("SELECT * FROM copies WHERE machine = ?", r.machine),
       starts: this.all("SELECT * FROM starts WHERE by = ?", r.id), runtime,
-      location: r.location ?? null,
+      location: r.location ?? null, region: r.region ?? null,
       events: this.recentEvents.filter((x) => x.machine === r.machine || x.other === r.machine).slice(-40),
       // Three healthy agents also retain the small fleet-wide scheduling view.
       // It bridges older agents during upgrades and preserves moves whose source
       // disappears at the same time as the controller. No metrics or secrets.
       ...(this.recoveryWitnesses(now).includes(r.id) ? { fleet: {
-        runs: this.all("SELECT * FROM runs WHERE seen > ?", now - 15 * MIN),
+        runs: this.all("SELECT * FROM runs WHERE seen > ?", now - 15 * MIN).map((row) => ({ ...row, region: this.runs.get(row.id)?.region ?? null })),
         copies: this.all("SELECT * FROM copies"), starts: this.all("SELECT * FROM starts"),
         startPools: [...this.startPools], events: this.recentEvents.slice(-200),
       } } : {}),
@@ -2884,7 +2930,7 @@ export class Control {
       .sort((a, b) => (b.deadline ?? b.started + 86400_000) - (a.deadline ?? a.started + 86400_000) || a.id.localeCompare(b.id));
     const chosen = [], regions = new Set();
     for (const r of candidates) {
-      const region = regionOf(r.location) || r.pool || "unknown";
+      const region = machineRegion(r) || r.pool || "unknown";
       if (regions.has(region)) continue;
       chosen.push(r.id); regions.add(region);
       if (chosen.length === 3) return chosen;
@@ -2898,12 +2944,12 @@ export class Control {
   recoverRun(row, at, location = null) {
     if (!row?.id || at <= (this.recoverySeen.get(`run:${row.id}`) ?? 0)) return;
     const current = this.runs.get(row.id);
-    const observed = current && current.seen >= this.bootAt ? Object.fromEntries(
-      ["status", "seen", "ready", "protocol", "recoveryAt", "witnessAt", "cpus", "disk", "edges", "rtt", "location", "starts", "ip"].filter((key) => current[key] !== undefined).map((key) => [key, current[key]])
+    const observed = current && this.observedRuns.has(row.id) ? Object.fromEntries(
+      ["status", "seen", "ready", "protocol", "recoveryAt", "witnessAt", "cpus", "disk", "edges", "rtt", "location", "region", "starts", "ip"].filter((key) => current[key] !== undefined).map((key) => [key, current[key]])
     ) : {};
     this.recoverySeen.set(`run:${row.id}`, at);
     this.recoveryMissing.delete(row.id);
-    this.saveRun({ ...row, status: JSON.parse(row.status), savedSeen: row.seen, location, ...observed });
+    this.saveRun({ ...row, status: this.reportedStatus(JSON.parse(row.status)), savedSeen: row.seen, location, ...observed });
     this.agents.set(row.agent, { id: row.agent, slot: row.machine, pool: row.pool ?? null, label: row.label ?? null, joined: row.started });
   }
 
@@ -2927,7 +2973,10 @@ export class Control {
     const expected = createHmac("sha256", this.env.STATE_SIGNING_KEY).update(String(receipt.payload)).digest("hex");
     if (!/^[a-f0-9]{64}$/.test(receipt.signature ?? "") || !sameHex(expected, receipt.signature)) throw new HttpError(400, "invalid recovery receipt");
     const saved = JSON.parse(receipt.payload);
-    if (saved.v !== 1 || saved.run !== body.run || saved.agent !== body.agent || saved.machine !== Number(body.machine) || saved.at > now + 60_000 || now - saved.at > 86400_000) {
+    const previous = Number(body.protocol) >= 3 && saved.run === body.previousRun && saved.run !== body.run && Number(body.started) > Number(saved.runRow?.started);
+    // A signed old receipt is useful inventory, not proof of current health.
+    // Expiry must not permanently reject a healthy agent after a long outage.
+    if (saved.v !== 1 || (saved.run !== body.run && !previous) || saved.agent !== body.agent || saved.machine !== Number(body.machine) || !Number.isFinite(saved.at) || saved.at > now + 60_000) {
       throw new HttpError(400, "recovery receipt does not identify this agent");
     }
     return saved;
@@ -2935,8 +2984,7 @@ export class Control {
 
   recoverAgent(body, now, saved = this.readRecovery(body, now)) {
     if (!saved) {
-      const hasWork = body?.status && Object.keys(body.status).length > 0;
-      if (hasWork && !this.recoverySeen.has(`run:${body?.run}`)) this.recoveryMissing.add(String(body?.run));
+      this.recoverLateAgent(body, null, now);
       return;
     }
     this.recoveryMissing.delete(saved.run);
@@ -2948,7 +2996,7 @@ export class Control {
       const pools = new Map(saved.fleet.startPools ?? []);
       for (const start of saved.fleet.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, pools.get(start.machine));
     }
-    if (rr) this.recoverRun(rr, saved.at, saved.location);
+    if (rr) this.recoverRun({ ...rr, region: saved.region ?? rr.region ?? null }, saved.at, saved.location);
     this.recoverCopies(saved.machine, saved.copies ?? [], saved.at);
     for (const start of saved.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, rr?.pool);
     if (saved.at > (this.recoverySettingsAt ?? 0)) {
@@ -2966,12 +3014,60 @@ export class Control {
     }
     for (const event of [...(saved.fleet?.events ?? []), ...(saved.events ?? [])]) {
       if (now - event.t > EVENTS_KEEP_MS || this.recentEvents.some((x) => x.t === event.t && x.kind === event.kind && x.run === event.run && x.detail === event.detail)) continue;
+      const recovered = { ...event, detail: this.redact(event.detail ?? "") };
       this.sql.exec("INSERT INTO events(t,kind,app,replica,machine,other,run,cause,detail) VALUES(?,?,?,?,?,?,?,?,?)",
-        event.t, event.kind, event.app ?? null, event.replica ?? null, event.machine ?? null, event.other ?? null, event.run ?? null, event.cause ?? null, event.detail ?? "");
-      this.recentEvents.push(event);
+        recovered.t, recovered.kind, recovered.app ?? null, recovered.replica ?? null, recovered.machine ?? null, recovered.other ?? null, recovered.run ?? null, recovered.cause ?? null, recovered.detail);
+      this.recentEvents.push(recovered);
     }
     this.recentEvents.sort((a, b) => a.t - b.t);
     this.recentEvents = this.recentEvents.slice(-200);
+  }
+
+  recoverLateAgent(body, saved, now) {
+    const machine = Number(body.machine);
+    const inventory = isMap(body.inventory) ? body.inventory : null;
+    const rows = saved?.copies ?? (inventory ? Object.entries(inventory).map(([key, value]) => ({ ...value,
+      name: value?.app, machine, key, replica: Number(value?.replica), since: now, reason: "reported running inventory", leaving: null })) : []);
+    if (saved?.runRow && !this.runs.has(saved.run)) {
+      this.recoverRun({ ...saved.runRow, region: saved.region ?? null }, saved.at, saved.location);
+    }
+    for (const row of rows) {
+      const p = this.projects.get(row.name);
+      const spec = p && this.version(p.name, p.version);
+      if (!p?.enabled || row.machine !== machine || !Number.isInteger(row.replica) || row.replica < 1 || row.replica > spec.replicas ||
+        typeof row.key !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.key)) continue;
+      const assigned = this.copiesOf(row.name).filter((copy) => copy.replica === row.replica);
+      if (assigned.length) continue; // the live controller's current assignment wins
+      let ports = row.ports;
+      if (typeof ports === "string") { try { ports = JSON.parse(ports); } catch { continue; } }
+      if (ports && (!isMap(ports) || Object.entries(ports).some(([from, to]) => !/^\d+$/.test(from) || !Number.isInteger(to) || to < 1 || to > 65535))) continue;
+      this.saveCopy(row.name, { machine, replica: row.replica, key: row.key, since: Number(row.since) || now,
+        reason: "recovered from agent inventory", leaving: null, ports: ports ?? null, cause: "recovery" });
+    }
+    // Older agents without receipts cannot identify their copies safely. Hold
+    // that inventory until a witness arrives; unknown/deleted apps can be removed.
+    const unresolved = Object.keys(isMap(body.status) ? body.status : {}).some((key) => {
+      const name = this.projects.has(key) ? key : key.replace(/-r\d+$/, "");
+      return this.projects.get(name)?.enabled && !saved && !inventory && !this.recoverySeen.has(`run:${body.run}`);
+    });
+    if (unresolved) this.recoveryMissing.add(String(body.run));
+    else this.recoveryMissing.delete(String(body.run));
+  }
+
+  recoverLateWitness(saved, now) {
+    if (!saved?.fleet || !this.recoveryMissing.size) return;
+    for (const row of saved.fleet.runs ?? []) {
+      if (!this.recoveryMissing.has(row.id)) continue;
+      const current = this.runs.get(row.id);
+      if (!current || !this.observedRuns.has(row.id) || current.agent !== row.agent || current.machine !== row.machine || current.started !== row.started) continue;
+      // A signed witness can identify a legacy agent's copies, but only missing
+      // replica assignments are adopted. Its old runs, moves and settings never
+      // replace the warm controller's current view.
+      this.recoverLateAgent({ run: current.id, machine: current.machine, status: current.status }, {
+        at: saved.at, run: row.id, runRow: row,
+        copies: (saved.fleet.copies ?? []).filter((copy) => copy.machine === current.machine),
+      }, now);
+    }
   }
 
   // Many servers going silent together is the control plane's view of the network failing, not that many deaths: treat
@@ -3509,7 +3605,10 @@ export class Control {
     }
     for (const [id, a] of this.agents) if (a.slot === n) this.agents.delete(id);
     this.sql.exec("DELETE FROM agents WHERE slot = ?", n);
-    for (const r of [...this.runs.values()]) if (r.machine === n) this.runs.delete(r.id);
+    for (const r of [...this.runs.values()]) if (r.machine === n) {
+      this.runs.delete(r.id);
+      this.observedRuns.delete(r.id);
+    }
     this.sql.exec("DELETE FROM runs WHERE machine = ?", n);
     this.starts.delete(n);
     this.sql.exec("DELETE FROM starts WHERE machine = ?", n);
@@ -3571,9 +3670,11 @@ export class Control {
     for (const r of this.runs.values()) {
       if (now - r.seen > 2 * 3600_000) {
         this.runs.delete(r.id);
+        this.observedRuns.delete(r.id);
         this.sql.exec("DELETE FROM runs WHERE id = ?", r.id);
       }
     }
+    for (const [key, value] of this.diagnostics) if (!this.runs.has(value.run)) this.diagnostics.delete(key);
     for (const map of [this.lastHealthy, this.firstSeen, this.lastV]) {
       for (const key of map.keys()) if (!this.runs.has(key.slice(0, key.lastIndexOf("|")))) map.delete(key);
     }
@@ -3742,8 +3843,9 @@ export class Control {
       now,
       domain: this.env.DOMAIN,
       requireDeployAuth: this.env.REQUIRE_DEPLOY_AUTH === "1",
-      regions: Object.entries(REGIONS).map(([name, label]) => ({ name, label,
-        machines: [...this.liveMachines(now).values()].filter((r) => regionOf(r.location) === name).length,
+      regions: [...new Set([...Object.keys(REGIONS), ...[...this.runs.values()].map(machineRegion).filter(Boolean),
+        ...[...this.projects.values()].flatMap((p) => { const policy = this.version(p.name, p.version)?.policy; return [policy?.region, ...(policy?.regions ?? [])].filter(Boolean); })])].sort().map((name) => ({ name, label: REGIONS[name] ?? name,
+        machines: [...this.liveMachines(now).values()].filter((r) => machineRegion(r) === name).length,
       })),
       pools: Object.entries(this.pools()).map(([name, size]) => ({ name, size, live: new Set(this.liveRuns(now).filter((r) => r.pool === name).map((r) => r.machine)).size })),
       expected: this.expectedMachines(),
@@ -3809,8 +3911,8 @@ export class Control {
           disk: r.disk ?? null,
           strikes: (this.strikes.get(r.id) ?? []).filter((x) => now - x.t < STRIKE_WINDOW_MS).map((x) => x.why),
           location: r.location ?? null,
-          region: regionOf(r.location),
-          projects: r.status,
+          region: machineRegion(r),
+          projects: this.reportedStatus(r.status),
         })),
     };
   }

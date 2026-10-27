@@ -7,8 +7,11 @@
 import http from "node:http";
 import { mkdirSync, readFileSync } from "node:fs";
 import { WebSocketServer } from "ws";
+import { fileURLToPath } from "node:url";
 import { Control } from "./src/index.js";
 import { LocalStore } from "./src/local-store.mjs";
+import { loadAgentBundle } from "./src/agent-bundle.mjs";
+import { clientAddress, validateProxyConfig } from "./src/client-ip.mjs";
 
 const env = { ...process.env, RECOVER_RUNTIME: "1", RECOVER_TUNNELS: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
 const port = Number(env.PORT) || 8920;
@@ -16,6 +19,7 @@ const host = env.BIND_HOST || "127.0.0.1";
 const dataDir = env.DATA_DIR || ".";
 const MAX_BODY = 1_000_000; // bytes; a spec is at most 250 KB, plus JSON quoting
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
+validateProxyConfig(env);
 
 if (!env.STATE_SIGNING_KEY || !env.JOIN_TOKEN) throw new Error("STATE_SIGNING_KEY and JOIN_TOKEN are required for agent recovery");
 process.umask(0o077);
@@ -27,12 +31,13 @@ const sql = new LocalStore(`${dataDir}/control.db`, { initialize: env.INIT_CONTR
 if (sql.backupPath) log(`configuration-only storage migration complete; previous database backed up at ${sql.backupPath}`);
 
 let timer = null;
-const agentFiles = new Map(["agent.mjs", "metrics.mjs", "ws.mjs", "control-link.mjs"].map((name) => [name, readFileSync(new URL(`../agent/${name}`, import.meta.url), "utf8")]));
+const bundle = loadAgentBundle(fileURLToPath(new URL("..", import.meta.url)));
 const control = new Control({
   sql,
   env,
   page: readFileSync(new URL("./src/app.html", import.meta.url), "utf8"),
-  agentFile: (name) => agentFiles.get(name),
+  agentFile: (name) => name === "agent.mjs" ? bundle.legacyAgent : bundle.files[name],
+  agentBundle: () => bundle,
   alarm(at) {
     clearTimeout(timer);
     timer = setTimeout(() => control.alarm().catch((e) => log(`alarm failed: ${e.message}`)), Math.max(0, at - Date.now()));
@@ -66,6 +71,10 @@ const server = http.createServer(async (req, res) => {
     const proto = req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
     const headers = {};
     for (const [k, v] of Object.entries(req.headers)) if (v != null) headers[k] = Array.isArray(v) ? v.join(", ") : v;
+    // Only this adapter supplies the identity used for rate limits/geolocation.
+    delete headers["x-runner-client-ip"];
+    delete headers["cf-connecting-ip"];
+    headers["x-runner-client-ip"] = clientAddress(req, env) || "unknown";
     const request = new Request(`${proto}://${host}${req.url}`, {
       method: req.method,
       headers,
@@ -122,7 +131,7 @@ server.on("upgrade", (req, socket, head) => {
             run = message.body?.run;
             if (run) agentSockets.set(run, ws);
             control.setPace(Date.now());
-            const plan = control.sync(message.body, req.headers["cf-connecting-ip"] || null);
+            const plan = control.sync(message.body, clientAddress(req, env));
             ws.send(JSON.stringify({ type: "plan", id: message.id, plan }));
           } catch (error) { ws.send(JSON.stringify({ type: "error", id: message?.id, error: error.message })); }
         });

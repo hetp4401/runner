@@ -41,11 +41,22 @@ node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero run
 node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure holds, DNS, lazy tokens and zero durable writes
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
 node control/test/self-hosting.mjs      # initialization, Cloudflare setup, namespace isolation, auth and bundled agents
+node control/test/api-ui-cli-regressions.mjs # request-local SQL errors, browser creation/auth, CLI HTTP failures
+node control/test/client-ip.mjs          # trusted proxy chains, spoofing rejection and socket address fallback
+node control/test/cp-robustness.mjs       # late/old receipts, restart identities, redacted errors, custom regions
+node control/test/agent-plan.mjs          # private source, stable bind paths and safe delegated bind layouts
+node control/test/agent-runtime.mjs       # safe filesystem writes, ownership, health, content identity, offline releases
+node control/test/agent-lifecycle.mjs     # actual agent restarts, preserved inventory and background worker repair
+node control/test/agent-launcher.mjs      # verified offline code and tamper rejection
+node control/test/install-script.mjs      # installer preflights, concurrent ownership and rollback after failures
+node control/test/legacy-agent-compat.mjs # existing four-file installers still load the current agent
 ```
 
 ## Docker integration
 
-For the Docker package, build from the repository root with `docker build -t runner-control:local .`, then run `python3 control/test/docker-smoke.py runner-control:local`. This uses disposable containers, a private Docker network, fake Cloudflare credentials and a temporary volume. It verifies first initialization, HTTP authorization, bundled agent assets, SIGKILL recovery, five-table persistence, missing-volume refusal and graceful shutdown, and removes its test resources afterward.
+For the Docker package, build from the repository root with `docker build -t runner-control:local .` and `docker build -f control/agent.Dockerfile -t runner-agent:local .`, then run `python3 control/test/docker-smoke.py runner-control:local runner-agent:local`. This uses disposable containers, a private Docker network, fake Cloudflare credentials and a temporary volume. It verifies initialization, HTTP authorization, bundles, SIGKILL recovery, five-table persistence, volume locking, missing-volume refusal, the automatic-tunnel supervisor and offline agent startup. The connector is simulated; this test makes no real Cloudflare changes.
+
+Run `python3 control/test/agent-docker.py runner-agent:local` on a Linux Docker host for real Compose/build/bind-mount integration. It creates a unique test namespace and fake CP/router/tunnel, verifies nonroot build-source permissions, stable app data, colocated CP isolation and background-worker repair, and removes only its labeled test resources. The Linux-only FD-anchored filesystem checks in `agent-runtime.mjs` must also run in the agent image; the macOS invocation skips those checks.
 
 ## Hybrid integration
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -33,14 +33,45 @@ const api = async (_env, path, options = {}) => {
 try {
   let env = settings({ DOMAIN: "example.test", DATA_DIR: directory });
   check("each controller gets its own tunnel prefix and an owner-controlled deployment policy", () => {
-    assert.notEqual(env.TUNNEL_PREFIX, settings({ DOMAIN: "another.test" }).TUNNEL_PREFIX);
+    assert.notEqual(identity(env, { required: false }).TUNNEL_PREFIX, identity(settings({ DOMAIN: "another.test", DATA_DIR: directory }), { required: false }).TUNNEL_PREFIX);
     assert.equal(env.REQUIRE_DEPLOY_AUTH, "1");
     assert.equal(settings({ DOMAIN: "example.test", TUNNEL_PREFIX: "runner", REQUIRE_DEPLOY_AUTH: "0", INIT_CONTROL_DB: "1" }).INIT_CONTROL_DB, undefined);
     for (const domain of ["https://example.test", "bad.test/", "x;touch.test", ""]) assert.throws(() => settings({ DOMAIN: domain }));
     assert.throws(() => settings({ DOMAIN: "example.test", CONTROL_HOST: "outside.test" }));
+    assert.throws(() => settings({ DOMAIN: "example.test", TUNNEL_PREFIX: "runner", CONTROLLER_TUNNEL_NAME: "runner-1" }));
+  });
+  check("security flags normalize valid booleans and reject empty or mistyped settings", () => {
+    assert.equal(settings({ DOMAIN: "example.test", REQUIRE_DEPLOY_AUTH: "true" }).REQUIRE_DEPLOY_AUTH, "1");
+    assert.equal(settings({ DOMAIN: "example.test", REQUIRE_DEPLOY_AUTH: "false" }).REQUIRE_DEPLOY_AUTH, "0");
+    for (const key of ["REQUIRE_DEPLOY_AUTH", "AUTO_TUNNEL"]) for (const value of ["", "yes", "TRUE", "typo"]) assert.throws(() => settings({ DOMAIN: "example.test", [key]: value }), new RegExp(key));
   });
   initialize(env);
   env = identity(env);
+  check("the saved tunnel namespace survives hostname changes and rejects conflicting overrides", () => {
+    const renamed = identity(settings({ DOMAIN: "example.test", CONTROL_HOST: "control.example.test", DATA_DIR: directory }));
+    assert.equal(renamed.TUNNEL_PREFIX, env.TUNNEL_PREFIX);
+    assert.equal(renamed.CONTROLLER_TUNNEL_NAME, env.CONTROLLER_TUNNEL_NAME);
+    assert.throws(() => identity(settings({ DOMAIN: "example.test", DATA_DIR: directory, TUNNEL_PREFIX: "another-fleet" })), /conflicts with the saved fleet identity/);
+  });
+  check("upgrading environment-only identity persists its namespace without copying secrets", () => {
+    const legacyDirectory = mkdtempSync(join(tmpdir(), "runner-legacy-identity-"));
+    try {
+      const legacy = settings({ DOMAIN: "legacy.test", DATA_DIR: legacyDirectory, TUNNEL_PREFIX: "runner", ADMIN_PASSWORD: "admin", JOIN_TOKEN: "join", STATE_SIGNING_KEY: "sign" });
+      identity(legacy, { persistNamespace: true });
+      const file = join(legacyDirectory, "identity.json");
+      const saved = JSON.parse(readFileSync(file, "utf8"));
+      assert.deepEqual(Object.keys(saved).sort(), ["CONTROLLER_TUNNEL_NAME", "TUNNEL_PREFIX"]);
+      assert.equal(saved.TUNNEL_PREFIX, "runner");
+      assert.equal(statSync(file).mode & 0o777, 0o600);
+      const before = statSync(file).mtimeMs;
+      identity(legacy, { persistNamespace: true });
+      assert.equal(statSync(file).mtimeMs, before);
+      for (const invalid of [123, ""]) {
+        writeFileSync(file, JSON.stringify({ ...saved, TUNNEL_PREFIX: invalid }));
+        assert.throws(() => identity({ ...legacy, TUNNEL_PREFIX: undefined }), /invalid TUNNEL_PREFIX/);
+      }
+    } finally { rmSync(legacyDirectory, { recursive: true, force: true }); }
+  });
   check("initialization creates private, stable fleet credentials and refuses to overwrite data", () => {
     assert.equal(statSync(join(directory, "identity.json")).mode & 0o777, 0o600);
     assert.ok(env.ADMIN_PASSWORD.length >= 32 && env.JOIN_TOKEN.length >= 32 && env.STATE_SIGNING_KEY.length >= 32);
@@ -71,7 +102,7 @@ try {
   check("an existing unrelated DNS record is never replaced and no orphan tunnel is created", () => assert.ok(calls.slice(beforeCollision).every((c) => c.method === "GET")));
 
   store = new LocalStore(join(directory, "control.db"));
-  const files = new Map(["agent.mjs", "metrics.mjs", "ws.mjs", "control-link.mjs"].map((f) => [f, readFileSync(new URL(`../../agent/${f}`, import.meta.url), "utf8")]));
+  const files = new Map(["agent.mjs", "metrics.mjs", "ws.mjs", "control-link.mjs", "runtime.mjs"].map((f) => [f, readFileSync(new URL(`../../agent/${f}`, import.meta.url), "utf8")]));
   const control = new Control({ sql: store, env: { ...env, RECOVER_TUNNELS: "1", RECOVERY_MS: "0" }, page: "", alarm() {}, restart() {}, agentFile: (name) => files.get(name) });
   store.protect(control);
   control.cf = async () => ({ result: [{ name: `${env.TUNNEL_PREFIX}-1`, id: "ours" }, { name: "runner-other-1", id: "theirs" }, { name: env.CONTROLLER_TUNNEL_NAME, id: "controller-id" }], result_info: { total_count: 3 } });

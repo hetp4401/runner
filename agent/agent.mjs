@@ -17,34 +17,42 @@
 //   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then: the control plane plans
 //                 its departure before that. Without it, the machine has no deadline.
 import { execFile, spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as fsp from "node:fs/promises";
 import http from "node:http";
 import { availableParallelism } from "node:os";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
+import { namespace, projectName, fingerprint, resumeState, ownsCompose, ownsInfrastructure, containerHealth,
+  privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
+if (env.REGION && !/^[a-z][a-z0-9-]{0,31}$/.test(env.REGION)) throw new Error("REGION must start with a letter and contain up to 32 lowercase letters, digits or dashes");
 const pool = env.POOL || null;
 const base = resolve(env.RUNNER_DATA || "/var/lib/runner");
 const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => "")).trim();
 let saved = null;
-try { saved = JSON.parse(await readFile(`${base}/agent-state.json`, "utf8")); } catch {}
-if (!bootId || saved?.bootId !== bootId || saved?.control !== env.CONTROL_URL) saved = null;
-const started = saved?.started || Date.now();
+try { saved = JSON.parse(await readFile(`${base}/agent-state.json`, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw new Error("cannot read the saved agent inventory; restore it before restarting"); }
+const resumed = resumeState(saved, bootId, env.CONTROL_URL, Date.now(), env.RUNNER_INSTALL_REVISION);
+const started = resumed.started;
+const owner = namespace(env.CONTROL_URL);
 const settleBy = started + 10 * 60_000; // open the tunnel by then even if a project is still struggling
 const ROUTER_PORT = Number(env.ROUTER_PORT) || 19080; // the tunnel sends everything here, and the router (Caddy) picks the project by hostname
 const METRICS_PORT = ROUTER_PORT + 1; // the tunnel's own metrics (its live edge connections)
+const ADMIN_PORT = ROUTER_PORT + 2;
 const dir = `${base}/projects`;
 const routerDir = `${base}/router`;
-const MANIFEST = ".runner-files"; // in each project's folder: the files the agent wrote there last time
-const BUILT = ".runner-built"; // and a hash of the files its containers were last brought up from
+const deploymentsDir = `${base}/deployments`;
+let routerName = `${owner}-router`, tunnelName = `${owner}-tunnel`;
 let machine = saved?.machine || 0; // the slot, from the control plane
 let tunnelToken = saved?.tunnelToken || "";
 let agent = saved?.agent || "";
-let run = saved?.run || ""; // stable across an agent restart on this VM
+let run = resumed.run; // crash resumes the run; host reboot or deliberate upgrade starts a new incarnation
+let previousRun = resumed.previousRun;
+let restartRequested = false;
+let wasReady = saved?.wasReady === true;
 let recovery = saved?.recovery || null;
 let cachedDesired = saved?.desired || {};
 // What this agent tells the control plane about its machine.
@@ -53,6 +61,7 @@ const describe = () => ({
   pool,
   poolSize: pool && env.POOL_SIZE ? Number(env.POOL_SIZE) : undefined, // how many machines the pool should have
   label: env.LABEL || null,
+  region: env.REGION || undefined,
   starts: Boolean(env.START_CMD),
   deadline, // when this machine will be stopped, if it knows (LIFETIME_MIN)
   cpus: availableParallelism(), // its cores: how much of it an app's CPU use is
@@ -114,75 +123,137 @@ async function isReady(p) {
 
 // Keyed by what the control plane calls each copy: a project's name for the lowest-numbered replica of it here (the
 // usual, only copy), <name>-r<k> for any further copy of it on this machine.
-const projects = new Map((saved?.projects || []).map(([key, value]) => [key, { ...value, busy: false, s: value.busy ? "failed" : value.s }]));
+const projects = new Map((saved?.projects || []).map(([key, value]) => [key, { ...value,
+  fingerprint: value.fingerprint || (saved?.desired?.[key] ? fingerprint(saved.desired[key]) : null),
+  busy: false, s: value.busy ? "failed" : value.s }]));
 let domain = saved?.domain || "";
 let stateWrites = Promise.resolve();
 function saveState() {
-  const data = JSON.stringify({ v: 1, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, domain,
+  const data = JSON.stringify({ v: 2, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, previousRun, restartRequested, wasReady,
+    installedRevision: env.RUNNER_INSTALL_REVISION || saved?.installedRevision, domain,
     recovery, desired: cachedDesired, projects: [...projects], metrics: metrics.history() });
   stateWrites = stateWrites.catch(() => {}).then(async () => {
     const path = `${base}/agent-state.json`;
-    await writeFile(`${path}.tmp`, data, { mode: 0o600 });
-    await fsp.rename(`${path}.tmp`, path);
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    const file = await fsp.open(temporary, "wx", 0o600);
+    try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+    await fsp.rename(temporary, path);
+    const directory = await fsp.open(base, "r");
+    try { await directory.sync(); } finally { await directory.close(); }
   });
   return stateWrites;
 }
 
-// Writes the project's files and brings it up. `recreate` is for trying the same version again after a failure: compose
-// only recreates the containers whose config changed, so a container that's running but hung would be left as it is.
+// Inspect by immutable container IDs. Never run an app-writable Compose file to
+// discover or stop containers; its author can alter relative bind-mounted files.
+async function inspectContainers(ids) {
+  if (!ids.length) return [];
+  const result = await sh("docker", ["inspect", ...ids], { timeout: 30_000 });
+  if (!result.ok) throw new Error("could not inspect Docker containers");
+  return JSON.parse(result.out);
+}
+async function projectContainers(project) {
+  const result = await sh("docker", ["ps", "-aq", "--filter", `label=com.docker.compose.project=${project}`], { timeout: 30_000 });
+  if (!result.ok) throw new Error("could not list Docker containers");
+  return inspectContainers(result.out.split(/\s+/).filter(Boolean));
+}
+const ownedCopy = (container, name) => ownsCompose(container, { owner, key: name, legacyDir: `${dir}/${name}` });
+async function selectProject(name, previous) {
+  const named = projectName(owner, name);
+  if (previous?.composeProject) {
+    if (![name, named].includes(previous.composeProject)) throw new Error("saved Compose identity does not belong to this fleet");
+    const containers = await projectContainers(previous.composeProject);
+    if (containers.some((c) => !ownedCopy(c, name))) throw new Error("refusing to change a Compose project with unrelated containers");
+    return previous.composeProject;
+  }
+  const current = await projectContainers(named);
+  if (current.some((c) => !ownedCopy(c, name))) throw new Error("the fleet's Compose name is already owned by another application");
+  if (current.length) return named;
+  const legacy = await projectContainers(name);
+  // Preserve legacy project names only for existing, proven-owned containers.
+  // This preserves their named volumes and lets applications migrate on updates.
+  return legacy.length && legacy.every((c) => ownedCopy(c, name)) ? name : named;
+}
+async function ownedContainers(name, p) {
+  p.composeProject ||= await selectProject(name, p);
+  const containers = await projectContainers(p.composeProject);
+  if (containers.some((c) => !ownedCopy(c, name))) throw new Error("refusing to change unrelated Docker containers");
+  return containers;
+}
+async function pruneDeploymentFiles(name, p, previousSource) {
+  const root = `${deploymentsDir}/${name}/`;
+  const keep = new Set([p.sourceDir, previousSource].filter(Boolean));
+  for (const container of await ownedContainers(name, p)) {
+    const labels = container.Config?.Labels ?? {};
+    for (const path of [labels["com.docker.compose.project.working_dir"], ...(container.Mounts ?? []).map((m) => m.Source)]) {
+      if (typeof path === "string" && path.startsWith(root)) keep.add(`${root}${path.slice(root.length).split("/")[0]}`);
+    }
+  }
+  for (const release of await readdir(root).catch(() => [])) {
+    if (release.startsWith("release-") && !keep.has(`${root}${release}`)) await rm(`${root}${release}`, { recursive: true, force: true });
+  }
+}
+
+// Source and Compose definitions live in fresh, private release directories.
+// App-writable bind mounts stay in projects/<key>, preserving existing data.
 async function apply(name, want, { recreate = false } = {}) {
   const before = projects.get(name);
   const same = before && before.replica === (want.replica ?? 1) && before.app === (want.app ?? name);
   const p = { app: want.app ?? name, replica: want.replica ?? 1, v: want.v, port: want.port, readyPath: want.ready ?? null, s: "applying", e: "",
-    busy: true, at: Date.now(), misses: 0,
-    t0: same ? before.t0 : Date.now(), // when this copy was first started on this machine (for the control plane's clocks)
-    n: (same ? before.n ?? 0 : 0) + (recreate ? 1 : 0) }; // restarts of it here
+    fingerprint: fingerprint(want), revision: want.revision ?? null, busy: true, at: Date.now(), misses: 0,
+    oneshotServices: want.oneshotServices ?? [],
+    composeProject: before?.composeProject, sourceDir: before?.sourceDir,
+    t0: same ? before.t0 : Date.now(), n: (same ? before.n ?? 0 : 0) + (recreate ? 1 : 0) };
   projects.set(name, p);
   updateRouter();
   log(`${name}: starting v${want.v}${recreate ? " again" : ""}`);
-  let s = "healthy";
-  let e = "";
+  let s = "healthy", e = "";
   try {
-    const projectDir = `${dir}/${name}`;
-    const file = `${projectDir}/compose.yaml`;
-    await mkdir(projectDir, { recursive: true });
-    // Dockerfiles and anything else the build needs sit next to the compose file, so `build: .` finds them.
-    // The folder isn't cleared first: relative bind mounts (./data) may live in it. Files written for an earlier
-    // version that this one doesn't have are removed, so every machine builds from the same files.
-    const paths = Object.keys(want.files ?? {});
-    const inside = (path) => {
-      const target = resolve(projectDir, path);
-      if (!target.startsWith(`${projectDir}/`)) throw new Error(`file path ${path} points outside the project`);
-      return target;
-    };
-    const before = JSON.parse(await readFile(`${projectDir}/${MANIFEST}`, "utf8").catch(() => "[]"));
-    for (const path of before) if (!paths.includes(path)) await unlink(inside(path)).catch(() => {});
-    for (const [path, content] of Object.entries(want.files ?? {})) {
-      const target = inside(path);
-      await mkdir(dirname(target), { recursive: true });
-      await writeFile(target, content);
+    p.composeProject = await selectProject(name, before);
+    if (typeof want.managedCompose !== "string") throw new Error("update the control plane to provide safe deployment files before changing this app");
+    const compose = JSON.parse(want.managedCompose);
+    for (const [service, config] of Object.entries(compose.services ?? {})) {
+      const labels = Array.isArray(config.labels) ? Object.fromEntries(config.labels.map((x) => { const at = x.indexOf("="); return at < 0 ? [x, ""] : [x.slice(0, at), x.slice(at + 1)]; })) : config.labels ?? {};
+      config.labels = { ...labels, [OWNER_LABEL]: owner, [COPY_LABEL]: name,
+        "io.runners.oneshot": want.oneshotServices?.includes(service) ? "true" : "false" };
     }
-    await writeFile(`${projectDir}/${MANIFEST}`, JSON.stringify(paths));
-    await writeFile(file, want.compose);
-    // Compose recreates a container whose configuration changed, but an image rebuilt from changed files has been seen
-    // to leave the old container running. So when the files differ from the ones the containers were last brought up
-    // from here, every container is made anew.
-    const built = createHash("sha256").update(JSON.stringify([...paths].sort().map((path) => [path, want.files[path]]))).digest("hex");
-    const builtBefore = await readFile(`${projectDir}/${BUILT}`, "utf8").catch(() => "");
-    const fresh = recreate || (builtBefore !== "" && builtBefore !== built);
-    if (fresh && !recreate) log(`${name}: its files changed, so its containers are made anew`);
-    // --wait fails if a container won't stay up.
-    const up = await sh("docker", ["compose", "-p", name, "-f", file, "up", "-d", "--build", "--remove-orphans",
-      "--wait", "--wait-timeout", "300", ...(fresh ? ["--force-recreate"] : [])]);
-    if (up.ok) await writeFile(`${projectDir}/${BUILT}`, built);
-    if (!up.ok) [s, e] = ["failed", up.out.split("\n").slice(-6).join("\n").slice(-600)];
-    else if (want.port && !(await answers(name, 60))) [s, e] = ["failed", `nothing answers on port ${want.port} through the router`];
-    if (s === "healthy" && paths.length) sh("docker", ["image", "prune", "-f"]); // layers of earlier builds, so the disk doesn't fill up
+    const dataDir = `${dir}/${name}`;
+    await mkdir(dataDir, { recursive: true });
+    if (before?.bindSources === undefined || bindLayout(before.bindSources) !== bindLayout(want.bindSources)) {
+      const containers = await ownedContainers(name, p);
+      if (containers.some((c) => c.State?.Running)) {
+        const stopped = await sh("docker", ["stop", "-t", "10", ...containers.filter((c) => c.State?.Running).map((c) => c.Id)]);
+        if (!stopped.ok) throw new Error("could not safely stop the app before changing its bind mounts");
+      }
+    }
+    await writeDataFiles(dataDir, want.dataFiles ?? {});
+    await validateBindSources(dataDir, want.bindSources ?? []);
+    p.bindSources = want.bindSources ?? [];
+    const sourceDir = await stageDeployment(deploymentsDir, name, want.files ?? {}, JSON.stringify(compose));
+    const file = `${sourceDir}/compose.yaml`;
+    const fresh = recreate || Boolean(before && before.fingerprint !== p.fingerprint);
+    const up = await sh("docker", ["compose", "-p", p.composeProject, "-f", file, "up", "-d", "--build", "--remove-orphans",
+      "--wait", "--wait-timeout", "300", ...(fresh ? ["--force-recreate"] : [])], { extraEnv: { RUNNER_APP_DATA: dataDir } });
+    p.sourceDir = sourceDir;
+    // The controller keeps .e in authenticated diagnostics only. Preserve the
+    // useful build tail here; stdout/GitHub job logs must never print this text.
+    if (!up.ok) [s, e] = ["failed", up.out.slice(-4000) || "Docker could not start this application's services"];
+    else {
+      const containers = await ownedContainers(name, p);
+      p.services = [...new Set(containers.map((c) => c.Config?.Labels?.["com.docker.compose.service"]).filter(Boolean))];
+      const problem = containerHealth(containers, p.services, p.oneshotServices);
+      if (problem) [s, e] = ["failed", problem];
+      else if (want.port && !(await answers(name, 60))) [s, e] = ["failed", `nothing answers on port ${want.port} through the router`];
+    }
   } catch (err) {
-    [s, e] = ["failed", err.message];
+    [s, e] = ["failed", String(err.message).slice(-4000)];
   }
-  Object.assign(p, { s, e, busy: false, at: Date.now(), r: s === "healthy" ? await isReady(p) : undefined });
-  log(`${name}: v${want.v} ${s}${e ? ` (${e.split("\n").pop()})` : ""}`);
+  Object.assign(p, { s, e, at: Date.now(), r: s === "healthy" ? await isReady(p) : undefined });
+  if (p.sourceDir) await pruneDeploymentFiles(name, p, s === "healthy" ? null : before?.sourceDir).catch(() => {});
+  p.busy = false;
+  await saveState();
+  wake();
+  log(`${name}: v${want.v} ${s}${e ? " (details in authenticated diagnostics)" : ""}`);
 }
 
 // Deletes a project's folder. Files a container wrote through a bind mount belong to root, so if the plain delete is
@@ -203,13 +274,21 @@ async function remove(name) {
   p.busy = true;
   log(`${name}: removing`);
   try {
-    await sh("docker", ["compose", "-p", name, "-f", `${dir}/${name}/compose.yaml`, "down", "--remove-orphans"]);
+    const containers = await ownedContainers(name, p);
+    if (containers.length) {
+      const removed = await sh("docker", ["rm", "-f", ...containers.map((c) => c.Id)]);
+      if (!removed.ok) throw new Error("could not remove this application's Docker containers");
+    }
     await removeDir(`${dir}/${name}`);
-  } finally {
+    await removeDir(`${deploymentsDir}/${name}`);
     // Whatever happened to its files, its route goes: the router then answers "no such project", which tells the
     // Worker to try another machine.
     projects.delete(name);
     updateRouter();
+    await saveState();
+  } catch (error) {
+    p.busy = false;
+    throw error;
   }
 }
 
@@ -225,7 +304,7 @@ function reconcile(desired, { repairOnly = false } = {}) {
   for (const [name, want] of Object.entries(desired)) {
     const p = projects.get(name);
     if (p?.busy || queued.has(name)) continue;
-    if (repairOnly && (!p || p.v !== want.v || p.replica !== (want.replica ?? 1) || p.app !== (want.app ?? name))) continue;
+    if (repairOnly && (!p || p.fingerprint !== fingerprint(want))) continue;
     if (!p) {
       queued.add(name);
       Promise.all(removals).then(() => {
@@ -234,13 +313,19 @@ function reconcile(desired, { repairOnly = false } = {}) {
       }).catch((e) => log(`${name}: ${e.message}`));
       continue;
     }
+    if (p.fingerprint === fingerprint(want)) {
+      if (p.v !== want.v) { p.v = want.v; wake(); }
+      p.revision = want.revision ?? p.revision;
+      p.services = want.services ?? p.services;
+      p.oneshotServices = want.oneshotServices ?? p.oneshotServices;
+    }
     // A failed project is tried again: soon while the machine is still starting up (a hiccup mustn't hold its tunnel
     // back for long), every 3 minutes once it's online.
     const retry = p.s === "failed" && Date.now() - p.at > (ready ? 3 * 60_000 : 30_000);
     // A different replica under the same key (the control plane gave the key to another copy) is a different copy:
     // its .env differs, so it's applied again even at the same version.
     const other = p.replica !== (want.replica ?? 1) || p.app !== (want.app ?? name);
-    if (p.v !== want.v || p.port !== want.port || other || retry) {
+    if (p.fingerprint !== fingerprint(want) || other || retry) {
       apply(name, want, { recreate: retry && p.v === want.v }).catch((e) => log(`${name}: ${e.message}`));
     }
   }
@@ -256,18 +341,48 @@ const settled = (desired) => Object.entries(desired).every(([name, want]) => {
 // Readiness is checked alongside, and only reported.
 async function checkHealth() {
   for (const [name, p] of projects) {
-    if (p.busy || p.s !== "healthy" || !p.port) continue;
-    if (await answers(name, 0)) {
+    if (p.busy || p.s !== "healthy") continue;
+    let problem;
+    try { problem = containerHealth(await ownedContainers(name, p), p.services ?? [], p.oneshotServices ?? []); }
+    catch { problem = "Docker state could not be verified"; }
+    if (!problem && (!p.port || await answers(name, 0))) {
       p.misses = 0;
       if (p.readyPath) p.r = await isReady(p);
     } else if (++p.misses >= 3) {
-      log(`${name}: stopped answering on port ${p.port}; restarting it`);
-      Object.assign(p, { s: "failed", e: `stopped answering on port ${p.port}`, at: 0, misses: 0 });
+      const reason = problem || `stopped answering on port ${p.port}`;
+      log(`${name}: ${reason}; restarting it`);
+      Object.assign(p, { s: "failed", e: reason, at: 0, misses: 0 });
     }
   }
 }
 
 // ---- router (Caddy) and tunnel (cloudflared) ----
+
+async function namedContainer(name) {
+  const result = await sh("docker", ["inspect", name], { timeout: 30_000 });
+  if (result.ok) return JSON.parse(result.out)[0] ?? null;
+  if (/No such (object|container)/i.test(result.out)) return null;
+  throw new Error("could not inspect Docker infrastructure");
+}
+const infrastructureOwner = (kind) => ({ owner, kind,
+  legacySource: kind === "router" ? routerDir : `${base}/tunnel.yml`,
+  destination: kind === "router" ? "/etc/router" : "/etc/cloudflared/config.yml" });
+async function selectInfrastructure(kind) {
+  const name = `${owner}-${kind}`;
+  const current = await namedContainer(name);
+  if (current && !ownsInfrastructure(current, infrastructureOwner(kind))) throw new Error(`the fleet's ${kind} container name is already in use`);
+  if (current) return name;
+  const legacy = await namedContainer(kind);
+  return legacy && ownsInfrastructure(legacy, infrastructureOwner(kind)) ? kind : name;
+}
+async function removeInfrastructure(kind) {
+  const name = kind === "router" ? routerName : tunnelName;
+  const container = await namedContainer(name);
+  if (!container) return;
+  if (!ownsInfrastructure(container, infrastructureOwner(kind))) throw new Error(`refusing to remove an unrelated ${kind} container`);
+  const result = await sh("docker", ["rm", "-f", container.Id]);
+  if (!result.ok) throw new Error(`could not replace the ${kind} container`);
+}
 
 let routerChain = Promise.resolve();
 let routerConfig = "";
@@ -290,6 +405,7 @@ function routerJson() {
     }],
   });
   return JSON.stringify({
+    admin: { listen: `127.0.0.1:${ADMIN_PORT}` },
     apps: {
       http: {
         servers: {
@@ -313,39 +429,42 @@ async function loadRouter() {
   const body = routerJson();
   if (body === routerConfig) return;
   await writeFile(`${routerDir}/caddy.json`, body);
-  const r = await sh("docker", ["exec", "router", "caddy", "reload", "--config", "/etc/router/caddy.json"]);
+  let r = await sh("docker", ["exec", routerName, "caddy", "reload", "--address", `127.0.0.1:${ADMIN_PORT}`, "--config", "/etc/router/caddy.json"]);
+  if (!r.ok && routerName === "router") r = await sh("docker", ["exec", routerName, "caddy", "reload", "--address", "127.0.0.1:2019", "--config", "/etc/router/caddy.json"]);
   if (r.ok) routerConfig = body;
   else log(`router update failed: ${r.out.split("\n").slice(-3).join(" ")}`);
 }
 
 async function startRouter() {
-  await mkdir(routerDir, { recursive: true });
+  await privateDirectory(routerDir);
   routerConfig = routerJson();
   await writeFile(`${routerDir}/caddy.json`, routerConfig);
-  await sh("docker", ["rm", "-f", "router"]); // left from before a restart, or from a start that failed
-  const r = await sh("docker", ["run", "-d", "--name", "router", "--network", "host", "--restart", "unless-stopped",
+  await removeInfrastructure("router");
+  const r = await sh("docker", ["run", "-d", "--name", routerName, "--network", "host", "--restart", "unless-stopped",
+    "--label", `${OWNER_LABEL}=${owner}`, "--label", "io.runners.component=router",
     "-v", `${routerDir}:/etc/router:ro`, "caddy:2", "caddy", "run", "--config", "/etc/router/caddy.json"]);
   if (!r.ok) throw new Error(`router didn't start: ${r.out}`);
   for (let i = 0; i < 30; i++) {
     if ((await probe("check")).code) return;
     await sleep(1000);
   }
-  throw new Error(`router isn't answering: ${(await sh("docker", ["logs", "--tail", "20", "router"])).out}`);
+  throw new Error("router is not answering");
 }
 
 async function startTunnel() {
   await writeFile(`${base}/tunnel.yml`, `ingress:\n  - service: http://127.0.0.1:${ROUTER_PORT}\n`);
-  await sh("docker", ["rm", "-f", "tunnel"]); // from a start that didn't connect
-  const r = await sh("docker", ["run", "-d", "--name", "tunnel", "--network", "host", "--restart", "unless-stopped",
+  await removeInfrastructure("tunnel");
+  const r = await sh("docker", ["run", "-d", "--name", tunnelName, "--network", "host", "--restart", "unless-stopped",
+    "--label", `${OWNER_LABEL}=${owner}`, "--label", "io.runners.component=tunnel",
     "-e", "TUNNEL_TOKEN", "-v", `${base}/tunnel.yml:/etc/cloudflared/config.yml:ro`,
     "cloudflare/cloudflared:latest", "tunnel", "--no-autoupdate", "--metrics", `127.0.0.1:${METRICS_PORT}`, "--config", "/etc/cloudflared/config.yml", "run"],
   { extraEnv: { TUNNEL_TOKEN: tunnelToken } });
   if (!r.ok) throw new Error(`tunnel didn't start: ${r.out}`);
   for (let i = 0; i < 45; i++) {
-    if ((await sh("docker", ["logs", "tunnel"])).out.includes("Registered tunnel connection")) return log("tunnel online");
+    if ((await sh("docker", ["logs", tunnelName])).out.includes("Registered tunnel connection")) return log("tunnel online");
     await sleep(2000);
   }
-  throw new Error(`tunnel didn't connect: ${(await sh("docker", ["logs", "--tail", "20", "tunnel"])).out}`);
+  throw new Error("tunnel did not connect");
 }
 
 // How many edge connections the tunnel has (0: the machine is up but unreachable from outside), or undefined.
@@ -381,7 +500,9 @@ let ready = false;
 
 // Only this machine's own projects (and the agent's own containers) go into the metrics, under their project's name
 // (a second copy of a project here is compose project <name>-r<k>, but the same app).
-const metrics = startMetrics({ appOf: (project) => projects.get(project)?.app ?? null, history: saved?.metrics ?? [] });
+const metricsSystem = new Set(["runner-agent", `${owner}-agent`]);
+const metrics = startMetrics({ appOf: (project) => [...projects].find(([key, p]) => (p.composeProject || key) === project)?.[1].app ?? null,
+  systemContainers: metricsSystem, history: saved?.metrics ?? [] });
 
 // Get a slot and its tunnel token. Keeps trying while the control plane is unreachable or every slot is taken; gives up
 // (so whatever runs this machine can start another) if the token is refused, or, for a pool member, after 10 minutes.
@@ -396,7 +517,7 @@ async function join() {
       await writeFile(idFile, agent);
     }
   }
-  run = `${agent}-${started}`;
+  run ||= `${agent}-${started}`;
   let want = env.MACHINE ? Number(env.MACHINE) : undefined;
   const giveUpAt = Date.now() + 10 * 60_000;
   for (let wait = 5;; wait = Math.min(wait * 2, 60)) {
@@ -437,8 +558,12 @@ async function removeLeftovers(desired) {
     if (name in desired || projects.has(name)) continue;
     log(`${name}: left over from before; removing`);
     try {
-      await sh("docker", ["compose", "-p", name, "-f", `${dir}/${name}/compose.yaml`, "down", "--remove-orphans"]);
+      const composeProject = await selectProject(name, null);
+      const containers = await projectContainers(composeProject);
+      if (containers.some((c) => !ownedCopy(c, name))) throw new Error("leftover Docker containers have another owner");
+      if (containers.length && !(await sh("docker", ["rm", "-f", ...containers.map((c) => c.Id)])).ok) throw new Error("could not remove leftover Docker containers");
       await removeDir(`${dir}/${name}`);
+      await removeDir(`${deploymentsDir}/${name}`);
     } catch (e) {
       log(`${name}: ${e.message}`);
     }
@@ -447,12 +572,14 @@ async function removeLeftovers(desired) {
 
 let rtt = null; // how long the last check-in took, machine to control plane and back: sent with the next one, shown as the machine's latency
 async function sync() {
-  const status = Object.fromEntries([...projects].map(([name, p]) => [name, { v: p.v, s: p.s, e: p.e || undefined, r: p.r, t0: p.t0, n: p.n }]));
+  const status = Object.fromEntries([...projects].map(([name, p]) => [name, { v: p.v, revision: p.revision, s: p.s, e: p.e || undefined, r: p.r, t0: p.t0, n: p.n }]));
+  const inventory = Object.fromEntries([...projects].map(([name, p]) => [name, { app: p.app, replica: p.replica, v: p.v,
+    revision: p.revision ?? undefined, ports: cachedDesired[name]?.ports ?? undefined }]));
   const sent = metrics.payload();
   const t0 = Date.now();
   const edges = ready ? await tunnelEdges() : undefined;
   const disk = await diskSpace();
-  const body = { machine, run, agent, ...describe(), started, ready, status, leaving, metrics: sent, rtt, edges, disk, protocol: 2, recovery };
+  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 3, recovery };
   const linked = await controlLink.report(body);
   if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); return linked; }
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
@@ -481,13 +608,16 @@ function startMachine(m) {
 
 let stopping = false;
 let leaving = false; // telling the control plane this run is going away for good (its replicas can be placed elsewhere now)
-async function shutdown(reason, code = 0) {
+async function shutdown(reason, code = 0, { keepTunnel = false } = {}) {
   if (stopping) return;
   stopping = true;
   for (const stop of streams.values()) stop(); // (live logs: their docker processes end with them)
-  log(`${reason}; stopping the tunnel`);
+  log(reason);
   // Under a supervisor (Docker's restart policy, say) the agent comes back with the same slot.
-  await sh("docker", ["stop", "-t", "10", "tunnel"]);
+  if (!keepTunnel) {
+    const container = await namedContainer(tunnelName).catch(() => null);
+    if (container && ownsInfrastructure(container, infrastructureOwner("tunnel"))) await sh("docker", ["stop", "-t", "10", container.Id]);
+  }
   process.exit(code);
 }
 // Stopped from outside. A pool member is interchangeable, so that means it's going away for good: say so in one last
@@ -497,7 +627,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     if (stopping || leaving) return;
     leaving = Boolean(pool);
-    (leaving ? sync().catch(() => {}) : Promise.resolve()).finally(() => shutdown("cancelled"));
+    (leaving ? sync().catch(() => {}) : Promise.resolve()).finally(() => shutdown("cancelled", 0, { keepTunnel: !pool }));
   });
 }
 
@@ -539,8 +669,10 @@ function streamLogs(wanted) {
       if (!ws) throw new Error("this install has no ws.mjs");
       const conn = await ws.connect(`${env.CONTROL_URL}/api/logs/stream?session=${session}&run=${encodeURIComponent(run)}`, { authorization: `Bearer ${env.JOIN_TOKEN}` });
       const tail = Math.max(0, Math.min(1000, Number(w.tail) || 200));
-      const child = spawn("docker", ["compose", "-p", key, "-f", `${dir}/${key}/compose.yaml`, "logs", "--follow", "--no-color", "--timestamps", "--tail", String(tail)],
-        { env: cleanEnv, stdio: ["ignore", "pipe", "pipe"] });
+      const containers = await ownedContainers(key, projects.get(key));
+      const children = containers.map((container) => spawn("docker", ["logs", "--follow", "--timestamps", "--tail", String(tail), container.Id],
+        { env: cleanEnv, stdio: ["ignore", "pipe", "pipe"] }));
+      if (!children.length) throw new Error("the application's containers are no longer present");
       let pending = "";
       let timer = null;
       const flush = (all = false) => {
@@ -551,9 +683,8 @@ function streamLogs(wanted) {
         const out = pending.slice(0, cut);
         pending = pending.slice(cut);
         if (!conn.send(out)) { // backed up: wait for the socket before reading more
-          child.stdout.pause();
-          child.stderr.pause();
-          conn.socket.once("drain", () => { child.stdout.resume(); child.stderr.resume(); });
+          for (const child of children) { child.stdout.pause(); child.stderr.pause(); }
+          conn.socket.once("drain", () => { for (const child of children) { child.stdout.resume(); child.stderr.resume(); } });
         }
       };
       const take = (d) => {
@@ -561,16 +692,16 @@ function streamLogs(wanted) {
         if (pending.length > 64_000) flush(true);
         else timer ??= setTimeout(flush, 250);
       };
-      child.stdout.setEncoding("utf8").on("data", take);
-      child.stderr.setEncoding("utf8").on("data", take);
-      child.on("error", () => conn.close());
-      child.on("close", () => {
-        flush(true);
-        conn.close();
-      });
+      let remaining = children.length;
+      for (const child of children) {
+        child.stdout.setEncoding("utf8").on("data", take);
+        child.stderr.setEncoding("utf8").on("data", take);
+        child.on("error", () => conn.close());
+        child.on("close", () => { if (!--remaining) { flush(true); conn.close(); } });
+      }
       streams.set(session, () => conn.close());
       await new Promise((resolve) => conn.onEnd(() => {
-        child.kill();
+        for (const child of children) child.kill();
         resolve();
       }));
     })().catch((e) => log(`live logs of ${key}: ${e.message}`)).finally(() => streams.delete(session));
@@ -578,20 +709,22 @@ function streamLogs(wanted) {
 }
 
 async function main() {
-  await mkdir(dir, { recursive: true });
+  await privateDirectory(dir);
+  await privateDirectory(deploymentsDir);
   await join();
   log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}${pool ? `, pool ${pool}` : ""}`);
-  // Left from before a restart, maybe.
-  if (saved) {
-    const running = await sh("docker", ["inspect", "--format", "{{.State.Running}}", "router", "tunnel"]);
-    ready = running.ok && running.out.split("\n").every((line) => line === "true");
-  }
-  if (!ready) await sh("docker", ["rm", "-f", "router", "tunnel"]);
-  // Nothing can be served or checked without the router, so keep trying (its image pull may have failed).
+  routerName = await selectInfrastructure("router");
+  tunnelName = await selectInfrastructure("tunnel");
+  metricsSystem.add(routerName); metricsSystem.add(tunnelName);
+  // Existing owned infrastructure and containers keep serving through an agent
+  // restart or host reboot. Recreate only infrastructure that is actually down.
   for (;;) {
     try {
-      if (!ready) await startRouter();
-      else await updateRouter();
+      const router = await namedContainer(routerName);
+      if (!router?.State?.Running) await startRouter();
+      else { await privateDirectory(routerDir); await updateRouter(); }
+      ready = Boolean((await namedContainer(tunnelName))?.State?.Running);
+      if (ready) wasReady = true;
       break;
     } catch (e) {
       log(`${e.message.split("\n")[0]}; trying again in 30s`);
@@ -603,13 +736,21 @@ async function main() {
   let lastReport = 0;
   let tunnelRetryAt = 0;
   let checking = false;
+  let lastUpgradeAttempt = 0;
   setInterval(async () => {
     if (checking || stopping || leaving) return;
     checking = true;
     try {
       const before = JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
+      if (!(await namedContainer(routerName))?.State?.Running) await startRouter();
+      if (!(await namedContainer(tunnelName))?.State?.Running && wasReady) {
+        ready = false;
+        await startTunnel();
+        ready = true;
+        wake();
+      }
       await checkHealth();
-      // Repair an already-authorized workload even while both controllers are
+      // Repair an already-authorized workload even while the control plane is
       // unreachable. Placement changes and new workloads still need a plan.
       reconcile(cachedDesired, { repairOnly: true });
       const changed = before !== JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
@@ -632,6 +773,9 @@ async function main() {
     if (plan && !plan.hold) {
       if (!plan.desired || typeof plan.desired !== "object") throw new Error("controller sent no desired state");
       recovery = plan.recovery ?? recovery;
+      if (plan.recovery?.payload) {
+        try { if (JSON.parse(plan.recovery.payload).run === run) previousRun = null; } catch {}
+      }
       cachedDesired = plan.desired;
       await saveState(); // accept the receipt durably before executing commands
       if (plan.domain !== domain) {
@@ -645,8 +789,20 @@ async function main() {
         await removeLeftovers(plan.desired);
       }
       if (env.START_CMD) for (const m of plan.start ?? []) startMachine(m);
-      if (plan.handover && !env.START_CMD) return shutdown("handing over: restarting the agent");
-      if (plan.handover && Date.now() - successorAt > 10 * 60_000) {
+      if (plan.handover && !env.START_CMD && Date.now() - lastUpgradeAttempt >= 60_000) {
+        lastUpgradeAttempt = Date.now();
+        try {
+          if (env.RUNNER_CODE_MANAGED === "1") await cacheAgentBundle(base, await downloadAgentBundle(env.CONTROL_URL));
+          restartRequested = true;
+          await saveState();
+          return shutdown("handing over: restarting the agent", 0, { keepTunnel: true });
+        } catch (error) {
+          restartRequested = false;
+          log(`agent upgrade failed (${error.message}); keeping the current agent and applications`);
+          wake();
+        }
+      }
+      if (plan.handover && env.START_CMD && Date.now() - successorAt > 10 * 60_000) {
         successorAt = Date.now();
         log("handing over: starting a replacement for this machine");
         startMachine(machine);
@@ -665,6 +821,7 @@ async function main() {
       try {
         await startTunnel();
         ready = true;
+        wasReady = true;
         continue; // check in straight away as ready
       } catch (e) {
         log(`${e.message.split("\n")[0]}; trying again in a minute`);
@@ -681,4 +838,4 @@ async function main() {
   }
 }
 
-main().catch((e) => shutdown(`agent failed: ${e.message}`, 1));
+main().catch((e) => shutdown(`agent failed: ${e.message}`, 1, { keepTunnel: true }));

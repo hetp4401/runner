@@ -6,6 +6,11 @@ export const REGIONS = {
   "us-east": "US East",
 };
 
+// Operators may label any region (for example eu-west or home-lab); the US
+// geolocation mapping below is only the backwards-compatible automatic default.
+export const validRegion = (value) => typeof value === "string" && /^[a-z][a-z0-9-]{0,31}$/.test(value);
+export const machineRegion = (run) => validRegion(run?.region) ? run.region : regionOf(run?.location);
+
 const states = {
   "us-west": "Alaska|Arizona|California|Colorado|Hawaii|Idaho|Montana|Nevada|New Mexico|Oregon|Utah|Washington|Wyoming",
   "us-central": "Alabama|Arkansas|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Michigan|Minnesota|Mississippi|Missouri|Nebraska|North Dakota|Ohio|Oklahoma|South Dakota|Tennessee|Texas|Wisconsin",

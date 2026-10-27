@@ -16,6 +16,7 @@ export class LocalStore {
     this.settingsReady = false;
     this.persistedSettings = new Map();
     this.sequence = 0;
+    this.mutationDepth = 0;
     if (!existsSync(filename) && !initialize) {
       throw new Error("control.db is missing; restore the configuration backup (INIT_CONTROL_DB=1 is only for a new fleet)");
     }
@@ -107,6 +108,7 @@ export class LocalStore {
   mutate(fn) {
     if (this.failed) throw new Error("configuration storage failed; refusing changes");
     const before = this.db.prepare("SELECT total_changes() AS n").get().n;
+    this.mutationDepth++;
     try { return this.atomic(fn); }
     catch (error) {
       // SQL rolls back, but the scheduler also holds Maps. Restart if a failed
@@ -116,6 +118,8 @@ export class LocalStore {
         this.onFailure(error);
       }
       throw error;
+    } finally {
+      this.mutationDepth--;
     }
   }
 
@@ -145,9 +149,14 @@ export class LocalStore {
       };
       return changesSettings ? this.atomic(run) : run();
     } catch (error) {
-      // No subsequent report may publish a plan based on an uncommitted change.
-      this.failed = true;
-      this.onFailure(error);
+      // A bad read (for example, a fractional LIMIT) cannot leave desired state
+      // ahead of disk. Fail only that request. Writes and configuration edits
+      // still fail closed because their in-memory Maps may already have changed.
+      const readOnly = /^\s*SELECT\b/i.test(query) || /^\s*PRAGMA\s+(?:(?:main|temp)\.)?table_info\s*\(/i.test(query);
+      if ((!readOnly || this.mutationDepth) && !this.failed) {
+        this.failed = true;
+        this.onFailure(error);
+      }
       throw error;
     }
   }

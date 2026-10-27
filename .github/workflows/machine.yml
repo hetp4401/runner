@@ -40,6 +40,7 @@ jobs:
           POOL: ${{ vars.POOL || 'github' }} # this repo's pool on the control plane (set the POOL variable in a second account's copy)
           POOL_SIZE: ${{ vars.POOL_SIZE }} # how many machines this pool keeps running (empty: the control plane's default)
           MACHINE: ${{ inputs.machine }}
+          REGION: ${{ vars.REGION }} # optional custom placement label; otherwise use automatic US grouping when available
           # This job's lifetime: the agent reports its deadline, and the control plane schedules its departure from it
           # (a successor takes over between 4 h and 5 h 10 min in, spread across the pool). Matches the timeout below.
           LIFETIME_MIN: 355
@@ -96,11 +97,20 @@ jobs:
       # The agent's own containers only: what the apps log is theirs, and these run logs are public.
       - name: Router and tunnel logs
         if: always()
+        env:
+          CONTROL_URL: ${{ vars.CONTROL_URL }}
         run: |
-          docker stop -t 10 tunnel > /dev/null 2>&1 || true
-          docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
-          for c in router tunnel; do
-            echo "::group::$c"
-            docker logs --tail 100 "$c" 2>&1 || true
-            echo "::endgroup::"
+          [ -f agent/runtime.mjs ] || { echo "No ownership-aware agent checkout; skipping infrastructure logs."; exit 0; }
+          owner=$(node --input-type=module -e 'import {namespace} from "./agent/runtime.mjs"; console.log(namespace(process.env.CONTROL_URL))')
+          for component in tunnel router; do
+            docker ps -a --filter "label=io.runners.owner=$owner" --filter "label=io.runners.component=$component" \
+              --format '{{.ID}} {{.Label "io.runners.copy"}}' | while read -r container copy; do
+              [ -n "$container" ] && [ -z "$copy" ] || continue
+              # App-provided component labels must never expose app logs here.
+              if [ "$component" = tunnel ]; then docker stop -t 10 "$container" >/dev/null 2>&1 || true; fi
+              echo "::group::$component ($container)"
+              docker inspect --format '{{.Name}} {{.State.Status}} {{.Config.Image}}' "$container"
+              docker logs --tail 100 "$container" 2>&1 || true
+              echo "::endgroup::"
+            done
           done

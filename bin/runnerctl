@@ -25,7 +25,7 @@
 #                                    kinds narrows them, e.g. move-start,depart,alert
 #   runnerctl rebalance on|off       automatic moves (hot servers, failing copies, doubled-up copies)
 #   runnerctl retire <machine>       retire an empty slot: delete its tunnel and <app>-n names
-# The admin password (the fleet owner's: locked apps and fleet changes need it, nothing else does) comes from
+# The admin password (new fleets require it for deployment and fleet changes) comes from
 # $ADMIN_PASSWORD or ~/.config/runnerctl/admin-password.
 # Set RUNNER_URL to your controller's public URL, or save it in ~/.config/runnerctl/url.
 set -euo pipefail
@@ -33,7 +33,18 @@ URL=${RUNNER_URL:-$(cat ~/.config/runnerctl/url 2>/dev/null || true)}
 [[ "$URL" =~ ^https?://[^/]+/?$ ]] || { echo "Set RUNNER_URL to your controller, for example https://runners.example.com" >&2; exit 1; }
 URL=${URL%/}
 ADMIN_PASSWORD=${ADMIN_PASSWORD:-$(cat ~/.config/runnerctl/admin-password 2>/dev/null || cat ~/.config/runnerctl/fleet-password 2>/dev/null || true)}
-api() { curl -sS ${ADMIN_PASSWORD:+-H "x-admin-password: $ADMIN_PASSWORD"} -H 'Content-Type: application/json' "$URL/api$1" "${@:2}"; }
+api() {
+  local response result
+  if response=$(curl -sS --fail-with-body ${ADMIN_PASSWORD:+-H "x-admin-password: $ADMIN_PASSWORD"} -H 'Content-Type: application/json' "$URL/api$1" "${@:2}"); then
+    printf '%s\n' "$response"
+  else
+    result=$?
+    # Keep the server's explanation even when the command's jq formatter would
+    # otherwise discard it (for example, move prints only the placed copies).
+    [ -z "$response" ] || printf '%s\n' "$response" >&2
+    return "$result"
+  fi
+}
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print } NR > 1 && !/^#/ { exit }' "$0"; exit 1; }
 
 cmd=${1:-}
@@ -119,7 +130,7 @@ PY
     done
     api "/projects/$name/env" -X PUT -d "$body" | jq -r 'if .error then .error else "\(.name) v\(.version): \(.keys | join(", "))" end' ;;
   status | ls)
-    curl -sS "$URL/api/status" | jq -r '
+    api /status | jq -r '
       "Projects:",
       (.projects[] | "  \(.name)  v\(.version)  \(.state)"
         + (if .state == "rolling out" then " (\(.rollout)/\(.machines))" else "" end)

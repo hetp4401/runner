@@ -112,12 +112,12 @@ function docker(path) {
 
 // Only the agent's own projects (appOf names the app a compose project belongs to, or null) and its own containers are
 // counted; whatever else runs on the machine isn't this fleet's business.
-async function readContainers(appOf) {
+async function readContainers(appOf, systemContainers) {
   const list = (await docker("/containers/json")) ?? []; // running containers
   const out = await Promise.all(list.map(async (c) => {
     const name = (c.Names?.[0] ?? c.Id).replace(/^\//, "");
     const project = c.Labels?.["com.docker.compose.project"];
-    const app = project != null ? appOf(project) : SYSTEM_CONTAINERS.has(name) ? "_system" : null;
+    const app = project != null ? appOf(project) : systemContainers.has(name) ? "_system" : null;
     if (!app) return null;
     const st = await docker(`/containers/${c.Id}/stats?stream=false&one-shot=true`);
     if (!st) return { id: c.Id, app };
@@ -161,7 +161,7 @@ function appSample(a, b) {
 
 // ---- the sampler ----
 
-export function startMetrics({ appOf = (project) => project, history = [] } = {}) {
+export function startMetrics({ appOf = (project) => project, history = [], systemContainers = SYSTEM_CONTAINERS } = {}) {
   let host = null;
   let cont = null;
   let latest = null;
@@ -192,7 +192,7 @@ export function startMetrics({ appOf = (project) => project, history = [] } = {}
     try {
       const now = Date.now();
       const t = now - (now % 60_000);
-      const [h, c] = await Promise.all([readHost(), readContainers(appOf)]);
+      const [h, c] = await Promise.all([readHost(), readContainers(appOf, systemContainers)]);
       if (host && cont) {
         const hs = hostSample(host, h);
         const as = appSample(cont, c);

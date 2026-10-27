@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 
 const directory = mkdtempSync(join(tmpdir(), "runner-local-server-"));
@@ -51,7 +52,7 @@ async function start(initialize) {
   child = spawn(process.execPath, ["server.mjs"], {
     cwd: fileURLToPath(new URL("..", import.meta.url)), stdio: ["ignore", logFd, logFd],
     env: { ...process.env, PORT: String(port), DATA_DIR: directory, DOMAIN: "sim.example", DNS: "off", QUIET_MS: "0", POLL_S: "5", RECOVERY_MS: "1000", POOLS: '{"test":1}',
-      INIT_CONTROL_DB: initialize ? "1" : "0", ADMIN_PASSWORD: "test-admin", JOIN_TOKEN: "test-join", STATE_SIGNING_KEY: "test-signing-secret", CF_API_TOKEN: "test-cf-token", ACCOUNT_ID: "test-account", CF_API_BASE: `http://127.0.0.1:${mock.address().port}` },
+      INIT_CONTROL_DB: initialize ? "1" : "0", TRUSTED_PROXIES: "127.0.0.1/32", CLIENT_IP_HEADER: "x-forwarded-for", ADMIN_PASSWORD: "test-admin", JOIN_TOKEN: "test-join", STATE_SIGNING_KEY: "test-signing-secret", CF_API_TOKEN: "test-cf-token", ACCOUNT_ID: "test-account", CF_API_BASE: `http://127.0.0.1:${mock.address().port}` },
   });
   for (let i = 0; i < 100; i++) {
     if (child.exitCode != null) throw new Error(`server exited: ${readFileSync(logPath, "utf8")}`);
@@ -89,6 +90,20 @@ function sync(body) {
 
 try {
   await start(true);
+  assert.equal((await fetch(`${origin}/api/events?limit=1.5`)).status, 400);
+  assert.equal((await fetch(`${origin}/healthz`)).status, 200);
+  const passwordAttempt = (ip, password, extra = {}) => fetch(`${origin}/api/settings`, { method: "PUT",
+    headers: { "content-type": "application/json", "x-forwarded-for": ip, "x-admin-password": password, ...extra }, body: "{}" });
+  for (let i = 0; i < 5; i++) assert.equal((await passwordAttempt("198.51.100.10", "wrong")).status, 401);
+  assert.equal((await passwordAttempt("198.51.100.11", "test-admin")).status, 200);
+  assert.equal((await passwordAttempt("198.51.100.10", "test-admin", { "x-runner-client-ip": "198.51.100.12", "cf-connecting-ip": "198.51.100.13" })).status, 429);
+  console.log("ok malformed queries stay request-local and trusted proxy clients have separate, unspoofable identities");
+  const bundle = await (await fetch(`${origin}/agent/bundle.json`)).json();
+  for (const [name, hash] of Object.entries(bundle.hashes)) assert.equal(createHash("sha256").update(bundle.files[name]).digest("hex"), hash);
+  assert.equal(bundle.revision, createHash("sha256").update(JSON.stringify(Object.entries(bundle.hashes).sort(([a], [b]) => a.localeCompare(b)))).digest("hex"));
+  const archive = Buffer.from(await (await fetch(`${origin}/agent/bundle.tar`)).arrayBuffer());
+  assert.equal(createHash("sha256").update(archive).digest("hex"), (await (await fetch(`${origin}/agent/bundle.sha256`)).text()).trim());
+  console.log("ok served agent image archive and offline code release match their content digests");
   await pause(1050);
   const agent = await request("/join", { method: "POST", node: true, body: { agent: "test-agent", pool: "test", poolSize: 1 } });
   for (const [name, port] of [["web", 8080], ["removed", 8081]]) {
@@ -149,7 +164,7 @@ try {
     invalid.on("open", () => { invalid.terminate(); reject(new Error("unauthenticated agent accepted")); });
   });
   console.log("ok agent authentication remains enforced");
-  console.log("6 local server checks passed");
+  console.log("8 local server checks passed");
 } finally {
   await stop();
   mock.closeAllConnections();
