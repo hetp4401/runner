@@ -1,0 +1,27 @@
+services:
+  control:
+    build: .
+    image: runner-control:local
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - control-data:/data
+    tmpfs:
+      - /run/runner:uid=1000,gid=1000,mode=0700
+      - /tmp:uid=1000,gid=1000,mode=1777
+    ports:
+      - "127.0.0.1:${CONTROL_PORT:-8920}:8920"
+    stop_grace_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  control-data:

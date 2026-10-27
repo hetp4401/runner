@@ -40,7 +40,12 @@ node control/test/agent-link.mjs        # large reports, fragmented WebSocket re
 node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero runtime writes, migration and cold recovery
 node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure holds, DNS, lazy tokens and zero durable writes
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
+node control/test/self-hosting.mjs      # initialization, Cloudflare setup, namespace isolation, auth and bundled agents
 ```
+
+## Docker integration
+
+For the Docker package, build from the repository root with `docker build -t runner-control:local .`, then run `python3 control/test/docker-smoke.py runner-control:local`. This uses disposable containers, a private Docker network, fake Cloudflare credentials and a temporary volume. It verifies first initialization, HTTP authorization, bundled agent assets, SIGKILL recovery, five-table persistence, missing-volume refusal and graceful shutdown, and removes its test resources afterward.
 
 ## Hybrid integration
 

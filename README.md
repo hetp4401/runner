@@ -1,19 +1,41 @@
 # runner
 
-A self-healing fleet of machines that join a control plane: pools of GitHub Actions machines plus any of your own hosts, each online through its own Cloudflare tunnel. A project says how many replicas it wants, and the control plane places them on the machines with the most room. The [control plane](docs/vps-control.md) runs only on the Billy Bishop VPS. SQLite persists app specs and source versions, app secrets and operator settings; runtime state and tunnel credentials stay in memory. The controller rediscovers tunnel IDs from Cloudflare at startup and fetches connection tokens when machines join. Controller credentials live in private environment files. Agents retain signed recovery receipts; Cloudflare Tunnel exposes the controller hostnames. Each machine claims a free slot *n*, and the control plane creates tunnel `runner-n` the first time that slot is used.
+A self-hosted control plane schedules Docker apps across your own Linux machines and optional GitHub Actions agents. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
 Neither the control plane nor the agent knows what a machine is, where it comes from, or how long it lives; they're told. An agent describes its machine with a **pool** (the name of a replaceable set it belongs to, which the control plane keeps at its size; or none, for a standalone host that keeps its slot across restarts), whether it **starts** machines (it has a `START_CMD`), an optional label (a name for the pages; `install.sh` uses the host's hostname), and sends **leaving** on its last check-in when it's going for good. An agent that knows how long its machine lives (`LIFETIME_MIN`) reports its deadline, and the control plane schedules its departure (see Departures); whatever runs the machine can also ping **`POST /api/drain`** when it's going down soon. Everything about GitHub Actions lives in [`machine.yml`](.github/workflows/machine.yml): the job's lifetime (355 minutes, under GitHub's 6-hour limit), a backstop drain at 330 minutes, and the command that starts another machine.
 
-- **Web app:** https://runners.billybishop4-workers.xyz (the older name, control.billybishop4-workers.xyz, still works), one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
-  - **Open to everyone:** seeing everything (apps, machines, metrics, deployments), deploying an app, and changing or removing any app that isn't locked: editing, rolling back (with a diff of what changes), changing replicas, moving a replica, disabling or deleting it (deleting asks you to type the name). No account, no token.
+- **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
+  - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.
   - **An app's env holds its secrets:** `runnerctl env <name> KEY=value` (or `"env": {...}` in a deploy) keeps variables in the control plane and writes them into every copy's `.env`, so compose fills `${KEY}` from it and `env_file: .env` passes them into containers. Values are never shown again, only the names, while the compose file itself is public. Every copy also gets `FLEET_APP`, `FLEET_REPLICA`, `FLEET_MACHINE`, `FLEET_HOST` (its public hostname) and `FLEET_DOMAIN` there: nothing that changes with the replica count or the version, so a replica change restarts no copy that stays. An env change is a new version (same files), so the copies restart with it.
   - **An app with a password asks for it on every change:** whoever deploys an app can give it an app password (optional), or set one later from its page or with `runnerctl password <name>`. From then on, every change made from the site (deploy, replicas, move, enable, disable, delete, a new password) asks, right then, for that password or the admin password. Nothing is kept in the browser: the next change asks again. Fleet changes ask for the admin password the same way.
   - **Needs the admin password (the fleet owner's):** changing the fleet, which covers automatic rebalancing, restarting machines, moving every app off a machine, retiring slots, and showing the join command for a new machine. Those controls show a lock, and using one asks for the password once per browser session (or remembers it on that device if you tick the box).
-  - **Metrics:** CPU, memory, disk I/O and network I/O for the fleet, machines and apps. The VPS caches six hours in memory (reset on restart), and each agent keeps six hours locally.
+  - **Metrics:** CPU, memory, disk I/O and network I/O for the fleet, machines and apps. The control plane caches six hours in memory (reset on restart), and each agent keeps six hours locally.
+
+## Set up your own control plane
+
+You need Docker Compose, an active domain on Cloudflare and either a scoped Cloudflare API token or a Global API Key plus the account email. The setup discovers the account/zone IDs, generates fleet credentials and creates the control-plane tunnel.
+
+```sh
+cp .env.example .env
+chmod 600 .env
+# Set DOMAIN and your Cloudflare credential in .env.
+docker compose build
+docker compose run --rm control init
+docker compose run --rm control credentials
+docker compose up -d
+```
+
+Join each Linux Docker machine using the generated join token:
+
+```sh
+curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN='your-token' sh
+```
+
+Agents download their release from your CP. They need no Cloudflare management credential. The CP container does not need the Docker socket. See [the complete self-hosting guide](docs/self-hosting.md) for permissions, deployment access, persistence, upgrades and optional GitHub agents.
 
 ## Projects
 
-A project is a docker compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Each replica has its own URL and there's no shared one in front of them: replicas are numbered from 1, and replica *k* is at `https://<project>-<k>.billybishop4-workers.xyz`, a DNS name the control plane points at the tunnel of whichever machine runs that copy (and moves when the copy moves), so these URLs only change when the replica count does. The port comes from the `port` field, or from `x-runner.port` in the compose file.
+A project is a Docker Compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Each replica has its own URL and there's no shared one in front of them: replicas are numbered from 1, and replica *k* is at `https://<project>-<k>.example.com`, a DNS name the control plane points at the tunnel of whichever machine runs that copy (and moves when the copy moves), so these URLs only change when the replica count does. The port comes from the `port` field, or from `x-runner.port` in the compose file.
 
 - **Compose only:** services use published images.
 
@@ -29,7 +51,7 @@ A project is a docker compose file, optionally with Dockerfiles and other files 
   ```
 
 - **Dockerfile only:** a custom image. The control plane wraps it in a one-service compose file (`build: .`) that publishes the port. The app should listen on that port.
-- **WebSockets:** nothing to set: every app's replica URLs take WebSocket connections on the app's port like its HTTP (`wss://<project>-<k>.billybishop4-workers.xyz/...`, any path, through Cloudflare's tunnel and the machine's router). Cloudflare closes a WebSocket that's silent for 100 s, so ping more often than that; a client should reconnect when one closes (a copy moving or handing over ends its connections), and a router reload (another app changing on the machine) keeps open ones for up to an hour.
+- **WebSockets:** nothing to set: every app's replica URLs take WebSocket connections on the app's port like its HTTP (`wss://<project>-<k>.example.com/...`, any path, through Cloudflare's tunnel and the machine's router). Cloudflare closes a WebSocket that's silent for 100 s, so ping more often than that; a client should reconnect when one closes (a copy moving or handing over ends its connections), and a router reload (another app changing on the machine) keeps open ones for up to an hour.
 - **Readiness:** `x-runner.ready: /path` makes the agent ask each copy for that path; a copy counts as healthy (for moves, DNS, handovers) only while it answers 2xx. The agent never restarts a copy for not being ready; one unready for 10 minutes while ready elsewhere is moved like a failing one.
 - **Compose plus files:** files sit next to the compose file, so `build: .` or `build: ./web` (with `web/Dockerfile`) find them. You can also include whatever the Dockerfiles `COPY`, as long as it's text. Every machine builds the image when the version changes.
 
@@ -70,7 +92,7 @@ Each change is a new version, and every machine switches to it at once. Nothing 
 
 ## API
 
-The web app uses `/admin/api/*`; scripts use `/api/*`; they're the same API. Reading and deploying are open: `PUT /projects/<name>` creates or updates an app with no credentials. A `"password"` (6+ characters) in a new app's body locks it; from then on changing it (`PUT`, `/enable`, `/disable`, `/move`, `DELETE`, and `PUT /projects/<name>/password` with `{"password": "new"}`, which also locks an open app) needs the header `x-app-password` or `x-admin-password`. `PUT /projects/<name>/env` with `{"KEY": "value", "OLD": null}` sets and removes the app's env variables (same credentials as any change; `GET` gives the names only; a deploy body may carry `"env"` too). Fleet routes (`/settings`, `/roll`, `/machines/<n>/evict`, `/slots/<n>`, `/join-token`) need `x-admin-password`. App passwords are stored as salted PBKDF2 hashes and never sent out; the status only says `hasPassword`. An address that sends a wrong password 5 times is refused for 15 minutes, counted separately for the fleet and for each app. Deploys without the admin password get an ordinary container only (see Projects). Machines use `/api/*` with the join token (`Authorization: Bearer <join token>`).
+The web app uses `/admin/api/*`; scripts use `/api/*`; they're the same API. Reading is public. New self-hosted fleets require the admin password to deploy or change unlocked apps (`REQUIRE_DEPLOY_AUTH=1`); public deployments are an explicit opt-in with `REQUIRE_DEPLOY_AUTH=0`. With that opt-in, `PUT /projects/<name>` creates or updates an app with no credentials. A `"password"` (6+ characters) in a new app's body locks it; from then on changing it (`PUT`, `/enable`, `/disable`, `/move`, `DELETE`, and `PUT /projects/<name>/password` with `{"password": "new"}`, which also locks an open app) needs the header `x-app-password` or `x-admin-password`. `PUT /projects/<name>/env` with `{"KEY": "value", "OLD": null}` sets and removes the app's env variables (same credentials as any change; `GET` gives the names only; a deploy body may carry `"env"` too). Fleet routes (`/settings`, `/roll`, `/machines/<n>/evict`, `/slots/<n>`, `/join-token`) need `x-admin-password`. App passwords are stored as salted PBKDF2 hashes and never sent out; the status only says `hasPassword`. An address that sends a wrong password 5 times is refused for 15 minutes, counted separately for the fleet and for each app. Deploys without the admin password get an ordinary container only (see Projects). Machines use `/api/*` with the join token (`Authorization: Bearer <join token>`).
 
 ```
 GET    /api/status                              projects and machines (no token needed)
@@ -97,7 +119,7 @@ WS     /api/logs/stream?session=<id>&run=<run>  (agents) a live log stream for a
 ```
 
 ```sh
-curl -X PUT https://runners.billybishop4-workers.xyz/api/projects/hello -H 'Content-Type: application/json' \
+curl -X PUT https://runners.example.com/api/projects/hello -H 'Content-Type: application/json' -H "x-admin-password: $ADMIN_PASSWORD" \
   -d '{"dockerfile": "FROM python:3.12-alpine\nCMD [\"python\", \"-m\", \"http.server\", \"9000\"]", "port": 9000}'
 ```
 
@@ -116,7 +138,7 @@ runnerctl roll [n] | pool <name> <n>
 Any Linux machine with Docker can join. Get the command, token included, from the Fleet page ("Add a machine"), or the token with `runnerctl join-token`, then on the machine:
 
 ```sh
-curl -fsSL https://runners.billybishop4-workers.xyz/install.sh | sudo JOIN_TOKEN=<token> sh
+curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN=<token> sh
 ```
 
 Add `LABEL=<name>` to name it on the status pages. A machine joined this way stands on its own (no pool) and keeps its slot across restarts; the web app doesn't show pools at all, it's just one set of machines.
@@ -125,7 +147,7 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 
 ## How it works
 
-- **Control plane** ([`control/`](control)): one Node process on the Billy Bishop VPS serves `runners.<domain>` through Cloudflare Tunnel, with local SQLite for desired configuration, temporary in-memory tables for runtime state and private environment files for controller credentials. It:
+- **Control plane** ([`control/`](control)): a Docker container serves `runners.<domain>` through Cloudflare Tunnel, with local SQLite for desired configuration, temporary in-memory tables for runtime state and private configuration for controller credentials. It:
   - holds every project's versions
   - places each project's replicas on the machines with the most room, and moves them when a machine goes
   - runs the rollouts
@@ -150,13 +172,13 @@ It runs the agent in the container `runner-agent`, takes the lowest free slot (a
 
 ## Running the control plane
 
-The active deployment and recovery procedure is documented in [VPS control plane](docs/vps-control.md). The Mac and Cloudflare scheduler implementations are inactive historical alternatives; there is no production Worker, Durable Object or D1 dependency for scheduling.
+Use the [self-hosting guide](docs/self-hosting.md) for Docker setup and recovery. [VPS deployment notes](docs/vps-control.md) document the existing Billy Bishop fleet. The Mac and Cloudflare scheduler implementations are inactive historical alternatives; there is no Worker, Durable Object or D1 dependency for scheduling.
 
 The production server also runs locally for development:
 
-`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` is where machines joining with `install.sh` fetch the agent's code (default: this repo's main branch). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. It listens on 127.0.0.1 only; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
+`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` can override the bundled agent download URL (default: the controller's own `/agent/` endpoint). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. `BIND_HOST` defaults to 127.0.0.1 for direct Node execution and 0.0.0.0 in Docker; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
-The VPS uses enabled systemd user units `runner-control.service` and `runner-control-tunnel.service`, with private settings in `~/.config/runner-control/env`. Startup also waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
+The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, backups and migration. [Billy Bishop deployment notes](docs/vps-control.md) describe the existing fleet. Startup also waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
 
 ## Tests
 
@@ -164,12 +186,12 @@ The VPS uses enabled systemd user units `runner-control.service` and `runner-con
 
 ## Setup notes
 
-- **Repo secrets:** `JOIN_TOKEN` (the same value as the control plane's `JOIN_TOKEN`). Tunnel tokens come from the control plane.
+- **Repo settings:** variable `CONTROL_URL` (your public controller URL) and secret `JOIN_TOKEN` (the same value as the control plane's `JOIN_TOKEN`). Tunnel tokens come from the control plane.
 - **Control plane secrets:** two you use, `ADMIN_PASSWORD` (the fleet owner's master password: locked apps and fleet changes need it; the web app asks for it, and `runnerctl` sends it; `FLEET_PASSWORD` and the header `x-fleet-password`, its old names, still work) and `JOIN_TOKEN` (machines join with it: `install.sh` takes it, and the GitHub repos have it as the secret `JOIN_TOKEN`), plus `CF_API_TOKEN`, which only the control plane uses: a Cloudflare token with Tunnel edit on the account and DNS edit on the zone. App passwords are kept by the control plane.
 - **Web app:** changes sent from other sites are refused.
 - **History:** until 2026-10-03 the control plane was a Cloudflare Worker with a Durable Object, and the replica URLs went through the Worker. The Workers free plan's 100,000 requests a day (the machines' check-ins alone were 86,400) is why it moved.
-- **More machines:** raise a pool's size with `runnerctl pool github <n>` (the web app doesn't show pools) (tunnels are made as needed; there's no cap unless `MAX_SLOTS` is set). Change sizes there rather than through the repos' `POOL_SIZE` variable: machines keep re-sending the size they started with, so a change there only takes hold as they're replaced. GitHub Free runs 20 jobs at once, and handovers overlap briefly, so stay at about 18 or fewer. Cloudflare allows 1,000 tunnels per account. Default sizes come from the VPS’s `POOLS` environment setting, with persisted settings taking precedence.
-- **Another GitHub account:** a copy of this repo there (public, so Actions minutes are free) is a pool of its own in the same fleet. Give it the `JOIN_TOKEN` secret and the repo variables `POOL` (the pool's name), `POOL_SIZE` (how many machines it keeps) and `AGENT_REPO=hetp4401/runner`, so its machines run this repo's agent and agent changes need no copying. Disable its `roll` workflow: a roll from here already restarts every pool. `leonardo34554/runner` is set up this way, as pool `leonardo`. Workflow changes do need copying there (merge this repo's main into its main; it isn't a fast-forward).
+- **More machines:** raise a pool's size with `runnerctl pool github <n>` (the web app doesn't show pools) (tunnels are made as needed; there's no cap unless `MAX_SLOTS` is set). Change sizes there rather than through the repos' `POOL_SIZE` variable: machines keep re-sending the size they started with, so a change there only takes hold as they're replaced. GitHub Free runs 20 jobs at once, and handovers overlap briefly, so stay at about 18 or fewer. Cloudflare allows 1,000 tunnels per account. Default sizes come from the controller’s `POOLS` environment setting, with persisted settings taking precedence.
+- **Another GitHub account:** a copy of this repo there (public, so Actions minutes are free) is a pool of its own in the same fleet. Give it the `JOIN_TOKEN` secret and the repo variables `CONTROL_URL` (your controller URL), `POOL` (the pool's name), `POOL_SIZE` (how many machines it keeps) and `AGENT_REPO=your-org/runner`, so its machines run this repo's agent and agent changes need no copying. Disable its `roll` workflow: a roll from here already restarts every pool. Workflow changes do need copying there (merge this repo's main into its main; it isn't a fast-forward).
 - **The machines are pinned to `ubuntu-24.04`**, not `ubuntu-latest`, so a new Ubuntu release doesn't change the machines under the fleet; move the pin on purpose. The run logs show only the router's and tunnel's logs, never the apps' (the repos are public).
 - **The join token only joins.** A machine started for a slot that's live gets that slot only if the control plane asked for a machine there (a handover's replacement, or a claimed start); otherwise it's given a free slot instead, so the token alone can't take over a live machine's tunnel.
 - **Watchdog pausing:** GitHub pauses scheduled workflows in public repos after 60 days without repo activity.

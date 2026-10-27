@@ -1,20 +1,21 @@
 # Billy Bishop control plane
 
-The only active scheduler is `control/server.mjs` on the Billy Bishop VPS. It serves `127.0.0.1:8920`; the existing Cloudflare Tunnel exposes `runners.billybishop4-workers.xyz` and `control.billybishop4-workers.xyz`. Cloudflare continues to provide tunnels and DNS for the fleet, but no Worker, Durable Object, D1 or Mac is required to run the control plane.
+The only active scheduler is the `runner-control` Docker container on the Billy Bishop VPS. Its port is published at `127.0.0.1:8920`; the existing Cloudflare Tunnel exposes `runners.billybishop4-workers.xyz` and `control.billybishop4-workers.xyz`. Cloudflare continues to provide tunnels and DNS for the fleet, but no Worker, Durable Object, D1 or Mac is required to run the control plane. New owners can use the generic [self-hosting setup](self-hosting.md).
 
 ## State and services
 
 - SQLite: `/home/claude/runner-control/control.db`, containing only app specifications, source versions, app secrets/passwords and operator settings (five tables). Existing source history is retained for rollback.
 - Runtime tables (runs, placements, starts, agent inventory, health, metrics, events and geolocation) use SQLite TEMP tables with `temp_store=MEMORY`. Runtime settings such as cooldowns and metric cursors also stay in RAM. They are never copied back to disk at shutdown.
 - Tunnel mappings and tokens also use an in-memory TEMP table. On every startup the controller lists Cloudflare tunnels, selects exact `runner-<slot>` names, and publishes the mappings only after all pages succeed. Unrelated and deleted tunnels are ignored; duplicate slot names prevent recovery. Connection tokens are fetched only when a machine joins and are kept in RAM until restart. Existing agents retain their own connection credentials.
-- Controller credentials and settings: `/home/claude/.config/runner-control/env`, readable only by its owner. The receipt signing key stays consistent with the fleet's existing receipts.
-- Releases: `/home/claude/runner-control/releases/`, selected by the systemd service override at `~/.config/systemd/user/runner-control.service.d/vps-release.conf`. The older working checkout is preserved.
-- Services: `runner-control.service` and `runner-control-tunnel.service` under the `claude` systemd user manager. Both are enabled, with user lingering enabled for boot startup.
+- Controller credentials and settings: `/home/claude/.config/runner-control/docker.env`, readable only by its owner. The existing join token, admin password and receipt signing key are supplied through this private file. No new identity is generated for the migrated fleet. The previous `env` file is retained for rollback.
+- Docker Compose: `/home/claude/runner-control/docker/compose.yaml`, project `runner-control`. It mounts `/home/claude/runner-control` at `/data`, uses an image tagged by its source commit, runs as UID 1000, and restarts unless explicitly stopped. `AUTO_TUNNEL=0` keeps the existing public tunnel; `TUNNEL_PREFIX=runner` retains the fleet's existing tunnel identities. `REQUIRE_DEPLOY_AUTH=0` preserves this fleet's existing public-deployment policy.
+- Services: the old `runner-control.service` is disabled and stopped. `runner-control-tunnel.service` remains enabled under the `claude` systemd user manager, with user lingering enabled. Docker is enabled at boot. Previous source releases and the old service definition are retained for rollback.
 
 From root over SSH, service commands use:
 
 ```sh
-runuser -u claude -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user status runner-control.service runner-control-tunnel.service
+docker compose -p runner-control -f /home/claude/runner-control/docker/compose.yaml ps
+runuser -u claude -- env XDG_RUNTIME_DIR=/run/user/1000 systemctl --user show runner-control-tunnel.service -p ActiveState -p SubState
 ```
 
 `/api/status` identifies `controlPlane.owner` as `vps`, `mode` as `vps-v1`, `runtimeStorage` and `tunnelStorage` as `memory`, and the controller as Billy Bishop. It also reports tunnel discovery readiness/errors, agent WebSocket connections, the recovery gate and the metrics retention window. The dashboard displays Billy Bishop controller.
@@ -31,7 +32,7 @@ Configuration changes use WAL with `synchronous=FULL`; multi-statement app/setti
 
 The Cloudflare controller was disabled before importing its final configuration and live scheduling tables into the VPS database. A private backup of the prior VPS database and exported cloud state is kept under `/home/claude/.config/runner-hybrid/vps-return/`. The existing proxy DNS names continue to point to the VPS tunnel; their intercepting Worker routes are removed after the VPS is ready.
 
-Back up SQLite with its online backup API, and back up the private controller and tunnel environment files separately. Preserve file permissions and the signing key. To restore, stop the controller, restore its database and environment, then start the controller and tunnel. Verify the recovery gate clears and agents reconnect before making placement changes.
+Back up SQLite with its online backup API, and back up the private controller and tunnel environment files separately. Preserve file permissions and the signing key. To restore, stop the container with Docker Compose, restore its database and environment, then start it again. Verify the recovery gate clears and agents reconnect before making placement changes. Never run the old systemd scheduler alongside the container; stop the container before rolling back to that service.
 
 When an older database still contains runtime tables, the startup migration makes a private, consistent full backup under `/home/claude/runner-control/backups/before-memory-*.db`, removes those tables/settings from the active database and reclaims their pages. This includes removing the old persistent `slots` table; tunnel IDs and tokens are reloaded from Cloudflare as needed. App specs, source versions, app secrets and operator settings are preserved. Subsequent startups do not repeat the migration. Offline SQLite backups now contain configuration only; historical migration backups retain the previous data. Runtime `/api/export` queries still expose the process's live temporary tables to an authenticated administrator.
 

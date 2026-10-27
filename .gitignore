@@ -2,3 +2,10 @@
 node_modules/
 .dev.vars
 control/build/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+identity.json
+data/

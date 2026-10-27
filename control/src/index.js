@@ -60,8 +60,6 @@ const MAX_ENV_VALUE = 8192;
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const STANDALONE_HOLD_MS = 30 * 60_000; // a standalone machine that drops out keeps its slot this long, so a restart gets the same one
 const DNS_COMMENT = "runner fleet"; // on the DNS records this makes, so they can be told apart in the zone
-// Where machines that join with install.sh get the agent's code: a URL serving agent.mjs, metrics.mjs and ws.mjs (AGENT_URL).
-const DEFAULT_AGENT_URL = "https://raw.githubusercontent.com/hetp4401/runner/main/agent";
 const NUMBERED = /-m?\d+$/; // <project>-<k> is replica k's URL and <project>-m<n> machine n's, so no project name ends like that
 const MAX_REPLICAS = 50; // as many as the fleet can have machines; with more replicas than machines, machines run two or more copies
 const ARRIVAL_MS = 3 * 60_000; // after a (re)start, wait this long for the fleet and its metrics before placing anything
@@ -503,8 +501,9 @@ function buildSpec(body, { trusted = false } = {}) {
 }
 
 // Served at /install.sh: runs the agent in a container on any machine with Docker. The token isn't in it; the agent's
-// code comes from agentUrl (the repo's main branch unless AGENT_URL says otherwise).
+// code comes from this controller's bundled agent unless AGENT_URL overrides it.
 function installScript(origin, agentUrl) {
+  const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
   return `#!/bin/sh
 # Adds this server to the fleet at ${origin}. Needs Docker.
 #   curl -fsSL ${origin}/install.sh | sudo JOIN_TOKEN=<token> sh
@@ -516,17 +515,21 @@ set -eu
 : "\${JOIN_TOKEN:?set JOIN_TOKEN; the fleet's owner gets it from the Contribute page or with: runnerctl join-token}"
 DATA=\${RUNNER_DATA:-/var/lib/runner}
 command -v docker >/dev/null 2>&1 || { echo "Install Docker first: https://docs.docker.com/engine/install/" >&2; exit 1; }
+[ "$(docker info --format '{{.OSType}}')" = linux ] || { echo "Agents need a Linux Docker host." >&2; exit 1; }
+case "$DATA" in /*) ;; *) echo "RUNNER_DATA must be an absolute host path." >&2; exit 1;; esac
+export JOIN_TOKEN
 mkdir -p "$DATA"
 docker rm -f runner-agent >/dev/null 2>&1 || true
 docker run -d --name runner-agent --restart unless-stopped --stop-timeout 180 --network host --hostname "$(hostname)" \\
   -v /var/run/docker.sock:/var/run/docker.sock -v "$DATA:$DATA" \\
-  -e CONTROL_URL=${origin} -e JOIN_TOKEN="$JOIN_TOKEN" -e RUNNER_DATA="$DATA" \\
+  -e CONTROL_URL=${quote(origin)} -e AGENT_URL=${quote(agentUrl)} -e JOIN_TOKEN -e RUNNER_DATA="$DATA" \\
+  -e POOL -e POOL_SIZE -e MACHINE -e ROUTER_PORT \\
   -e LABEL="\${LABEL:-$(hostname)}" \\
-  docker:cli sh -c '
+  docker:28-cli sh -c '
     set -e
     apk add --no-cache nodejs >/dev/null
     mkdir -p /agent && cd /agent
-    for f in agent.mjs metrics.mjs ws.mjs control-link.mjs; do wget -qO $f ${agentUrl}/$f; done
+    for f in agent.mjs metrics.mjs ws.mjs control-link.mjs; do wget -qO "$f" "$AGENT_URL/$f"; done
     exec node agent.mjs'
 echo "Joined. Follow it with: docker logs -f runner-agent"
 `;
@@ -564,12 +567,15 @@ function eventText(e) {
 export class Control {
   // sql: { exec(query, ...args) -> { toArray() } } over SQLite; env: settings and secrets; alarm(at): call this.alarm()
   // at that time (replacing any earlier call); page: the web app's HTML; restart(): exit so the process is started again.
-  constructor({ sql, env, alarm, page, restart }) {
+  constructor({ sql, env, alarm, page, restart, agentFile = () => null }) {
     this.sql = sql;
     this.env = env;
     this.setAlarm = alarm;
     this.page = page;
     this.restart = restart;
+    this.agentFile = agentFile;
+    this.tunnelPrefix = env.TUNNEL_PREFIX || "runner";
+    if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(this.tunnelPrefix)) throw new Error("TUNNEL_PREFIX must contain 1-63 lowercase letters, digits or hyphens");
     for (const query of [
       `CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, version INTEGER NOT NULL, stable INTEGER,
          rollout INTEGER NOT NULL, halted TEXT, updated INTEGER NOT NULL)`,
@@ -898,7 +904,16 @@ export class Control {
       if (request.method === "GET" && (path === "/admin" || path === "/metrics")) {
         return new Response(null, { status: 302, headers: { location: `/?from=${path.slice(1)}` } });
       }
-      if (request.method === "GET" && path === "/install.sh") return new Response(installScript(url.origin, this.env.AGENT_URL || DEFAULT_AGENT_URL), { headers: { "content-type": "text/plain; charset=utf-8" } });
+      if (request.method === "GET" && path === "/install.sh") {
+        const origin = this.env.PUBLIC_URL || url.origin;
+        return new Response(installScript(origin, this.env.AGENT_URL || `${origin}/agent`), { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+      }
+      const agentAsset = /^\/agent\/(agent|metrics|ws|control-link)\.mjs$/.exec(path);
+      if (request.method === "GET" && agentAsset) {
+        const source = this.agentFile(`${agentAsset[1]}.mjs`);
+        if (source == null) throw new HttpError(404, "agent source is not bundled with this controller");
+        return new Response(source, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache" } });
+      }
       if (request.method === "GET" && path === "/internal/dns") return json({ names: Object.fromEntries(this.dnsTargets(Date.now())) }); // where each replica's name points (tests)
       if (path.startsWith("/admin/api/")) {
         // The UI: apps are open unless locked with a password; fleet changes need the admin password. Changes sent
@@ -1069,6 +1084,7 @@ export class Control {
       const secret = action === "password" || (wasNew && input?.password != null) ? await this.newAppSecret(input?.password) : null;
       // No awaits from here on.
       const creating = !action && method === "PUT" && !this.projects.has(name);
+      if (this.env.REQUIRE_DEPLOY_AUTH === "1" && (creating || !this.appPasswords.has(name))) need(admin);
       if (!creating && !admin) {
         this.project(name); // 404 if there's no such app
         const current = this.appPasswords.get(name);
@@ -3411,11 +3427,12 @@ export class Control {
           const data = await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
           if (!Array.isArray(data.result)) throw new Error("Cloudflare returned an invalid tunnel listing");
           for (const tunnel of data.result) {
-            const match = /^runner-([1-9]\d*)$/.exec(tunnel?.name);
+            const prefix = `${this.tunnelPrefix}-`;
+            const match = typeof tunnel?.name === "string" && tunnel.name.startsWith(prefix) ? /^([1-9]\d*)$/.exec(tunnel.name.slice(prefix.length)) : null;
             if (!match || tunnel.deleted_at) continue;
             const n = Number(match[1]);
             if (!Number.isSafeInteger(n) || typeof tunnel.id !== "string" || !tunnel.id) throw new Error("Cloudflare returned an invalid runner tunnel");
-            if (found.has(n) && found.get(n).tunnel !== tunnel.id) throw new Error(`multiple Cloudflare tunnels are named runner-${n}`);
+            if (found.has(n) && found.get(n).tunnel !== tunnel.id) throw new Error(`multiple Cloudflare tunnels are named ${this.tunnelPrefix}-${n}`);
             found.set(n, { n, tunnel: tunnel.id, token: "" });
           }
           const info = data.result_info ?? {};
@@ -3447,7 +3464,7 @@ export class Control {
     if (!this.tunnelJobs.has(n)) {
       const job = (async () => {
         const account = this.env.ACCOUNT_ID;
-        const name = `runner-${n}`;
+        const name = `${this.tunnelPrefix}-${n}`;
         let t = this.slots.has(n) ? { id: this.slots.get(n).tunnel } : null;
         if (!t) {
           const matches = (await this.cf(`/accounts/${account}/cfd_tunnel?name=${name}&is_deleted=false`)).result.filter((x) => x.name === name && !x.deleted_at);
@@ -3724,6 +3741,7 @@ export class Control {
     return {
       now,
       domain: this.env.DOMAIN,
+      requireDeployAuth: this.env.REQUIRE_DEPLOY_AUTH === "1",
       regions: Object.entries(REGIONS).map(([name, label]) => ({ name, label,
         machines: [...this.liveMachines(now).values()].filter((r) => regionOf(r.location) === name).length,
       })),

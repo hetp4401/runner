@@ -12,6 +12,7 @@ import { LocalStore } from "./src/local-store.mjs";
 
 const env = { ...process.env, RECOVER_RUNTIME: "1", RECOVER_TUNNELS: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
 const port = Number(env.PORT) || 8920;
+const host = env.BIND_HOST || "127.0.0.1";
 const dataDir = env.DATA_DIR || ".";
 const MAX_BODY = 1_000_000; // bytes; a spec is at most 250 KB, plus JSON quoting
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
@@ -26,10 +27,12 @@ const sql = new LocalStore(`${dataDir}/control.db`, { initialize: env.INIT_CONTR
 if (sql.backupPath) log(`configuration-only storage migration complete; previous database backed up at ${sql.backupPath}`);
 
 let timer = null;
+const agentFiles = new Map(["agent.mjs", "metrics.mjs", "ws.mjs", "control-link.mjs"].map((name) => [name, readFileSync(new URL(`../agent/${name}`, import.meta.url), "utf8")]));
 const control = new Control({
   sql,
   env,
   page: readFileSync(new URL("./src/app.html", import.meta.url), "utf8"),
+  agentFile: (name) => agentFiles.get(name),
   alarm(at) {
     clearTimeout(timer);
     timer = setTimeout(() => control.alarm().catch((e) => log(`alarm failed: ${e.message}`)), Math.max(0, at - Date.now()));
@@ -44,6 +47,10 @@ sql.protect(control);
 const server = http.createServer(async (req, res) => {
   try {
     if (sql.failed) throw new Error("configuration storage is unavailable");
+    if (req.method === "GET" && req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      return res.end(JSON.stringify({ ok: true, tunnelsReady: control.tunnelsReady }));
+    }
     const chunks = [];
     let size = 0;
     for await (const c of req) {
@@ -156,7 +163,7 @@ function adapt(ws) {
     onClose: (fn) => ws.on("close", () => fn()),
   };
 }
-server.listen(port, "127.0.0.1", () => log(`control plane listening on 127.0.0.1:${port}, data in ${dataDir}`));
+server.listen(port, host, () => log(`control plane listening on ${host}:${port}, data in ${dataDir}`));
 
 let stopping = false;
 function shutdown(code) {

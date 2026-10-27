@@ -1,0 +1,14 @@
+.git
+**/node_modules
+.env
+.env.*
+!.env.example
+**/*.db
+**/*.db-*
+**/identity.json
+**/backups
+**/.dev.vars
+**/.wrangler
+control/build
+data
+.DS_Store

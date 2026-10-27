@@ -368,6 +368,7 @@ const locked = (name) => S.status?.projects.find((x) => x.name === name)?.hasPas
 // Runs fn(secret) for a change: straight away when no password is needed, else once one has been typed into a sheet.
 // A wrong password keeps the sheet open to try again; cancelling gives null; any other failure is thrown to the caller.
 async function withPassword({ app = null, admin = false, why = null }, fn) {
+  if (app && S.status?.requireDeployAuth && !locked(app)) admin = true;
   if (!admin && !(app && locked(app))) return fn({});
   let result, failure = null;
   const ok = await sheet({
@@ -1528,7 +1529,7 @@ function vApps() {
   return {
     title: "Apps",
     html: `<div class="row"><h1 class="grow">Apps</h1><a class="btn primary" href="#/apps/new">New app</a></div>
-      <div class="sub">Anyone can deploy, change or remove an app, unless it has an app password; then changing it asks for that password (or the admin password). Each app runs as many replicas as it asks for, on the servers with the most room (two on one server when there are more replicas than servers).</div>
+      <div class="sub">${S.status?.requireDeployAuth ? "Deploying a new app takes the admin password. Existing apps can also use their own app password." : "Anyone can deploy, change or remove an app, unless it has an app password; then changing it asks for that password (or the admin password)."} Each app runs as many replicas as it asks for, on the servers with the most room (two on one server when there are more replicas than servers).</div>
       <div id="apps-filter"></div><div class="cards" id="apps-list" style="margin-top:14px"></div>`,
     status() {
       const st = S.status, runs = runsBy();
@@ -1696,7 +1697,7 @@ function vApp(name, q = new URLSearchParams()) {
           <button type="button" data-act="${p.enabled ? "disable" : "enable"}">${p.enabled ? "Disable" : "Enable"}</button>
           <button type="button" class="danger" data-act="delete">Delete</button>
           <button type="button" data-act="password">${p.hasPassword ? "Change app password" : "Set an app password"}</button></div>
-        <p class="hint">${!p.hasPassword ? "Open: anyone can change this app. Set an app password and every change will ask for it (or the admin password)."
+        <p class="hint">${!p.hasPassword ? (S.status?.requireDeployAuth ? "Changing this app requires the admin password. Set an app password to delegate access to it." : "Open: anyone can change this app. Set an app password and every change will ask for it (or the admin password).")
           : "Changing this app asks for its password, or the admin password."}</p>`);
       setHtml($("#ad-status"), appStatusBlock(p, runs, { full: true }));
       const want = pending.replicas[name] ?? p.replicas;
@@ -2016,7 +2017,7 @@ function vEditor(name, sample) {
       } else if (sample && SAMPLES[sample]) fill(SAMPLES[sample]);
       else checkName();
       if (!name) {
-        pwHint = `Leave it empty and anyone can change or remove the app. With an app password (${MIN_APP_PASSWORD} characters or more), changing it asks for that password (or the admin password); if it's lost, the fleet's owner can set a new one with the admin password.`;
+        pwHint = `${S.status?.requireDeployAuth ? "Leave it empty to require the admin password for changes." : "Leave it empty and anyone can change or remove the app."} With an app password (${MIN_APP_PASSWORD} characters or more), changing it asks for that password (or the admin password); if it's lost, the fleet's owner can set a new one with the admin password.`;
         $("#ed-pw-hint").textContent = pwHint;
       }
     },
@@ -2225,7 +2226,7 @@ function vContribute() {
         <ol><li>A Linux server (a VM, a server, a spare PC) with <a href="https://docs.docker.com/engine/install/" target="_blank" rel="noopener">Docker</a> installed. 2 CPU cores and 2 GB of memory or more is a good start.</li>
           <li>Outbound internet. No open ports, port forwarding or public IP: the server dials out through its tunnel.</li>
           <li>The join command, which carries the fleet's join token (below).</li></ol>
-        <div class="warnbox"><b>Only contribute a server you're happy for others to run code on.</b> Anyone can deploy apps to this fleet, and an app placed on your server runs as Docker containers with whatever its compose file asks for, which can include host folders and privileged access. A dedicated VM is the safe choice.</div>
+        <div class="warnbox"><b>Only join a fleet whose owner you trust to run code on this machine.</b> ${S.status?.requireDeployAuth ? "The fleet owner controls new deployments." : "Anyone can deploy apps to this fleet."} Apps run as Docker containers; deployments authorized by the owner can access host folders and privileged features. Use a dedicated machine or VM.</div>
         <h3>1. Get the join command</h3>
         <div id="cj-join"></div>
         <h3>2. Run it on the server</h3>

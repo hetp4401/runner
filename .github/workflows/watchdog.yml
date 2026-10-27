@@ -17,6 +17,7 @@ permissions:
 
 jobs:
   watchdog:
+    if: ${{ vars.CONTROL_URL != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -24,13 +25,14 @@ jobs:
         shell: bash # fails the step when a command in a pipeline fails, so a wrong token or an unreachable control plane shows as red
         env:
           JOIN_TOKEN: ${{ secrets.JOIN_TOKEN }}
+          CONTROL_URL: ${{ vars.CONTROL_URL }}
           GH_TOKEN: ${{ github.token }}
           POOL: ${{ vars.POOL || 'github' }}
           POOL_SIZE: ${{ vars.POOL_SIZE }} # how many machines this pool keeps running (empty: the control plane's default)
         run: |
           [ -n "$JOIN_TOKEN" ] || { echo "::error::the JOIN_TOKEN secret isn't set"; exit 1; }
           start=$(curl -fsS --max-time 20 --retry 3 -X POST -H "Authorization: Bearer $JOIN_TOKEN" \
-            "https://runners.billybishop4-workers.xyz/api/claim?pool=$POOL&size=$POOL_SIZE" | jq -r '.start[]?') # empty when nothing is missing
+            "$CONTROL_URL/api/claim?pool=$POOL&size=$POOL_SIZE" | jq -r '.start[]?') # empty when nothing is missing
           rc=0
           for m in $start; do
             if gh run list -R "$GITHUB_REPOSITORY" -w machine.yml -s queued --json displayTitle -q '.[].displayTitle' | grep -qx "machine $m"; then
