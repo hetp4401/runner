@@ -470,7 +470,10 @@ function renderMetricsStatus() {
   let message;
   if (S.metricsErr) message = `${esc(S.metricsErr)}. ${esc(old)} <button type="button" class="small" data-metrics-retry>Retry</button>`;
   else if (metricsRequest) message = `Loading ${esc(metricsRequest.range)} trends…${S.metrics && S.metrics.range !== S.range ? ` Showing ${esc(S.metrics.range)} until ready.` : ""}`;
-  else if (S.metrics) message = `Current samples · refreshed ${ago(Date.now() - S.metricsAt)} ago · trends over ${esc(S.metrics.range)}`;
+  else if (S.metrics) {
+    const historyReady = Object.values(S.metrics.m).some((machine) => Object.values(machine.h ?? {}).some((values) => Array.isArray(values) && values.some(isNum)));
+    message = `Current samples · refreshed ${ago(Date.now() - S.metricsAt)} ago · trends over ${esc(S.metrics.range)}${historyReady ? "" : " · waiting for trend history; current readings are available"}`;
+  }
   else message = "Loading metrics…";
   for (const node of $$("[data-metrics-status]")) {
     node.classList.toggle("failed", Boolean(S.metricsErr));
@@ -876,7 +879,7 @@ function lineChart(body, series, opts = {}) {
   series = series.filter((s) => s.values?.some(isNum));
   body.replaceChildren();
   if (!series.length) {
-    body.innerHTML = '<div class="nodata">No data in this range yet</div>';
+    body.innerHTML = `<div class="nodata">${esc(opts.empty ?? "No data in this range yet")}</div>`;
     return;
   }
   series.forEach((s, i) => (s.color ??= SERIES[i % SERIES.length]));
@@ -1166,7 +1169,8 @@ function appMetricPanel(parent, metric, rows, columns, target) {
   chart.dataset.title = `${info.label} by app`;
   panel.append(chart);
   parent.append(panel);
-  lineChart(chart, appStack(columns), { unit: info.unit, stacked: true, height: 140 });
+  lineChart(chart, appStack(columns), { unit: info.unit, stacked: true, height: 140,
+    empty: "Waiting for recorded trend samples. Current app usage is shown above." });
 }
 function usageHeatmap(parent, machines, columns, { host = false } = {}) {
   const rows = machines.map((m) => ({ id: m, name: `server ${m}`, href: machineHref(m), values: columns(m) }));
