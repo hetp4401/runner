@@ -612,8 +612,8 @@ export class Control {
     if (columns("events").has("pool")) this.sql.exec("ALTER TABLE events DROP COLUMN pool"); // (briefly had one)
     const copyColumns = columns("copies");
     for (const col of ["key TEXT", "cause TEXT"]) if (!copyColumns.has(col.split(" ")[0])) this.sql.exec(`ALTER TABLE copies ADD COLUMN ${col}`);
-    // Working state lives in memory (the object is single-threaded); SQLite keeps it across restarts,
-    // which happen when the process is restarted.
+    // Working state lives in memory (the object is single-threaded). The VPS
+    // adapter uses in-memory TEMP tables for runtime rows; agents restore them.
     this.projects = new Map(this.all("SELECT * FROM projects").map((p) => [p.name, p]));
     this.runs = new Map(this.all("SELECT * FROM runs").map((r) => [r.id, { ...r, status: JSON.parse(r.status), savedSeen: r.seen }]));
     this.starts = new Map(this.all("SELECT machine, at FROM starts").map((s) => [s.machine, s.at]));
@@ -1093,12 +1093,16 @@ export class Control {
       if (action === "move" && method === "POST") return json(this.move(name, Number(url.searchParams.get("from")), url.searchParams.get("to"), url.searchParams.get("replica")));
       if ((action === "enable" || action === "disable") && method === "POST") return json(this.setEnabled(name, action === "enable"));
       if (!action && method === "PUT") {
-        const out = this.putProject(name, input, { trusted: admin });
-        if (creating && secret) {
-          this.saveAppPassword(name, secret);
-          out.hasPassword = true;
-        }
-        return json(out);
+        const apply = () => {
+          const out = this.putProject(name, input, { trusted: admin });
+          if (creating && secret) {
+            this.saveAppPassword(name, secret);
+            out.hasPassword = true;
+          }
+          return json(out);
+        };
+        // A newly password-protected app and its password commit together.
+        return this.sql.mutate ? this.sql.mutate(apply) : apply();
       }
       if (!action && method === "DELETE") return json(this.deleteProject(name));
     }
@@ -2823,8 +2827,8 @@ export class Control {
   }
 
   // Each agent keeps its own signed scheduling receipt on its host. The receipt
-  // contains no credentials or app source. D1 is authoritative for desired
-  // config and tunnel credentials. The host stores the receipt privately.
+  // contains no credentials or app source. Persisted configuration remains
+  // authoritative for desired apps; a receipt only reconstructs runtime state.
   recoveryActive(now = Date.now()) {
     if (now < this.recoveringUntil) return true;
     for (const run of this.recoveryMissing) {
@@ -2928,7 +2932,11 @@ export class Control {
     for (const start of saved.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, rr?.pool);
     if (saved.at > (this.recoverySettingsAt ?? 0)) {
       this.recoverySettingsAt = saved.at;
-      for (const setting of saved.runtime ?? []) this.setSetting(setting.key, setting.value);
+      for (const setting of saved.runtime ?? []) {
+        // An older receipt must never replace the operator's current settings.
+        if (["pools", "rebalance", "roll"].includes(setting.key) || /^roll_\d+$/.test(setting.key)) continue;
+        this.setSetting(setting.key, setting.value);
+      }
       this.poolAsks = new Map(Object.entries(JSON.parse(this.settings.get("pool_asks") ?? "{}")));
       this.autoMoved = new Map(Object.entries(JSON.parse(this.settings.get("auto_moved") ?? "{}")));
       this.versionFails = new Map(Object.entries(JSON.parse(this.settings.get("version_fails") ?? "{}")).map(([k, v]) => [k, new Set(v)]));

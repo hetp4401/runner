@@ -37,6 +37,8 @@ node control/test/sim/phase5.test.mjs   # dark and lit replicas, cold departures
 node control/test/sim/regions.test.mjs  # regional placement, shortages, moves, eviction, deadlines, cross-region handovers
 node control/test/sim/hybrid.test.mjs   # D1 encryption/write suppression, receipts, witnesses and cold recovery
 node control/test/agent-link.mjs        # large reports, fragmented WebSocket replies, ping and wake
+node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero runtime writes, migration and cold recovery
+node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
 ```
 
 ## Hybrid integration

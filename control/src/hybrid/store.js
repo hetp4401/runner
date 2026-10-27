@@ -1,11 +1,11 @@
 // SQLite is a disposable working copy. Only the explicitly selected configuration
 // rows below are written to D1; runs, health, placements and metrics never are.
-export const CONFIG_TABLES = ["projects", "versions", "settings", "app_passwords", "app_env", "slots"];
+import { CONFIG_TABLES, durableSetting } from "../state-policy.js";
+export { CONFIG_TABLES, durableSetting } from "../state-policy.js";
 const KEYS = {
   projects: ["name"], versions: ["name", "version"], settings: ["key"],
   app_passwords: ["name"], app_env: ["name", "key"], slots: ["n"],
 };
-export const durableSetting = (key) => ["pools", "rebalance", "roll"].includes(key) || /^roll_\d+$/.test(key);
 export const rowKey = (table, row) => JSON.stringify(KEYS[table].map((key) => row[key]));
 export const isConfiguration = (table, row) => CONFIG_TABLES.includes(table) && (table !== "settings" || durableSetting(row.key));
 

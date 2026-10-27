@@ -1,31 +1,29 @@
-// The control plane as one process: SQLite in DATA_DIR, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
+// The control plane as one process: configuration in SQLite, runtime tables in memory, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
 // runners.<domain>). Settings and secrets come from the environment (see the README).
 //   PORT (8920), DATA_DIR (.), DOMAIN, CONTROL_HOST, ZONE, ACCOUNT_ID, POOLS, MAX_SLOTS (optional cap on machines), FLEET_PASSWORD, JOIN_TOKEN,
 //   CF_API_TOKEN (or CF_API_KEY + CF_API_EMAIL), CF_API_BASE (tests), POLL_S, DNS=off (no DNS changes), ALERT_WEBHOOK,
+//   STATE_SIGNING_KEY (required), RECOVERY_MS (180000), MEMORY_HISTORY_MIN (360), INIT_CONTROL_DB=1 (new fleet only),
 //   QUIET_MS and YOUNG_MS (tests)
 import http from "node:http";
 import { mkdirSync, readFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import { WebSocketServer } from "ws";
 import { Control } from "./src/index.js";
+import { LocalStore } from "./src/local-store.mjs";
 
-const env = process.env;
+const env = { ...process.env, RECOVER_RUNTIME: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
 const port = Number(env.PORT) || 8920;
 const dataDir = env.DATA_DIR || ".";
 const MAX_BODY = 1_000_000; // bytes; a spec is at most 250 KB, plus JSON quoting
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 
-mkdirSync(dataDir, { recursive: true });
-const db = new DatabaseSync(`${dataDir}/control.db`);
-db.exec("PRAGMA journal_mode = WAL");
-db.exec("PRAGMA synchronous = NORMAL");
-// The same shape the code was written against: exec(query, ...args) runs the statement and gives { toArray() }.
-const sql = {
-  exec(query, ...args) {
-    const rows = db.prepare(query).all(...args);
-    return { toArray: () => rows };
-  },
-};
+if (!env.STATE_SIGNING_KEY || !env.JOIN_TOKEN) throw new Error("STATE_SIGNING_KEY and JOIN_TOKEN are required for agent recovery");
+process.umask(0o077);
+mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+const sql = new LocalStore(`${dataDir}/control.db`, { initialize: env.INIT_CONTROL_DB === "1", onFailure() {
+  log("configuration storage failed; restarting before issuing more plans");
+  setImmediate(() => shutdown(1));
+} });
+if (sql.backupPath) log(`configuration-only storage migration complete; previous database backed up at ${sql.backupPath}`);
 
 let timer = null;
 const control = new Control({
@@ -41,9 +39,11 @@ const control = new Control({
     shutdown(0);
   },
 });
+sql.protect(control);
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (sql.failed) throw new Error("configuration storage is unavailable");
     const chunks = [];
     let size = 0;
     for await (const c of req) {
@@ -85,6 +85,7 @@ const status = control.status.bind(control);
 control.status = () => ({ ...status(), controlPlane: {
   mode: "vps-v1", owner: "vps", name: env.CONTROLLER_NAME || "VPS",
   configStorage: "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
+  runtimeStorage: "memory", metricsHistoryMinutes: Number(env.MEMORY_HISTORY_MIN),
   recoveryUntil: control.recoveringUntil, recoveryMissing: [...control.recoveryMissing],
 } });
 const originalWake = control.wake.bind(control);
@@ -106,6 +107,7 @@ server.on("upgrade", (req, socket, head) => {
         ws.on("message", (raw) => {
           let message;
           try {
+            if (sql.failed) throw new Error("configuration storage is unavailable");
             message = JSON.parse(raw);
             if (message.type !== "sync" || !Number.isSafeInteger(message.id)) throw new Error("invalid report");
             run = message.body?.run;
@@ -161,7 +163,7 @@ function shutdown(code) {
   clearTimeout(timer);
   for (const ws of wss.clients) ws.terminate();
   server.close(() => {
-    db.close();
+    sql.close();
     process.exit(code);
   });
   setTimeout(() => process.exit(code), 5_000).unref();
