@@ -184,7 +184,7 @@
   .meter i.warn { background: var(--deploying); } .meter i.crit { background: var(--failed); }
   .heatlegend { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); margin: 0 0 4px; }
   .heatlegend .ramp { width: 120px; height: 8px; border-radius: 4px; }
-  details.more > summary { cursor: pointer; font-size: var(--fs-sm); font-weight: 600; color: var(--fg-2); padding: 10px 0; }
+  .metric-controls { margin: 12px 0; }
   .spark { display: inline-block; vertical-align: middle; margin-right: 6px; }
   .log { font-size: var(--fs-sm); margin-top: 8px; }
   .log > div { padding: 3px 0; overflow-wrap: anywhere; }
@@ -348,11 +348,18 @@ function rebuild(box, fn) {
 const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?)?services:\n  app:\n    build: \.\n(?:    ports: \["\d+:\d+"\]\n)?    restart: unless-stopped\n?$/;
 
 // ======================================================================== state
+const METRICS = {
+  cpu: { label: "CPU", fields: ["cpu"], unit: "cores" },
+  mem: { label: "Memory", fields: ["mem"], unit: "bytes" },
+  disk: { label: "Disk I/O", fields: ["diskRead", "diskWrite"], unit: "rate" },
+  net: { label: "Network", fields: ["netRx", "netTx"], unit: "rate" },
+};
+const savedMetric = localStorage.getItem("metrics-sort");
 const S = {
   status: null, statusAt: 0, statusErr: null,
   metrics: null, metricsAt: 0,
   range: localStorage.getItem("metrics-range") || "1h",
-  heat: localStorage.getItem("metrics-heat") || "cpu",
+  metric: Object.hasOwn(METRICS, savedMetric) ? savedMetric : "cpu",
   fastUntil: 0, filter: "",
 };
 const pending = { replicas: {} }; // stepper values not saved yet
@@ -524,8 +531,8 @@ function sheet({ title, html, ok = "OK", okKind = "primary", cancel = "Cancel", 
 const confirmSheet = (title, text, ok, okKind = "primary") => sheet({ title, ok, okKind, html: `<p>${text}</p>` });
 
 // A table; on phones each row becomes a small card (the header becomes labels). rows: [{ cells, href?, cls? }]
-function table(head, rows, { empty = "Nothing here", num = [] } = {}) {
-  const th = head.map((h, i) => `<th${num.includes(i) ? ' class="num"' : ""}>${esc(h)}</th>`).join("");
+function table(head, rows, { empty = "Nothing here", num = [], sort = null } = {}) {
+  const th = head.map((h, i) => `<th${num.includes(i) ? ' class="num"' : ""}${i === sort ? ' aria-sort="descending"' : ""}>${esc(h)}</th>`).join("");
   const body = rows.map((r) => `<tr class="${r.href ? "click " : ""}${r.cls ?? ""}"${r.href ? ` data-href="${esc(r.href)}"` : ""}>${r.cells.map((c, i) =>
     `<td data-label="${esc(head[i])}"${num.includes(i) ? ' class="num"' : ""}>${c}</td>`).join("")}</tr>`).join("");
   return `<div class="tablewrap"><table class="rl"><thead><tr>${th}</tr></thead><tbody>${body || `<tr><td colspan="${head.length}" class="s">${esc(empty)}</td></tr>`}</tbody></table></div>`;
@@ -537,6 +544,8 @@ const meter = (pct) => {
 const codebox = (text, { copy = true } = {}) => `<div class="codebox${copy ? "" : " plain"}"><pre class="code">${esc(text)}</pre>${copy ? `<button type="button" class="small" data-copy>Copy</button>` : ""}</div>`;
 const rangeSeg = () => `<span class="seg" role="group" aria-label="Time range">${["1h", "6h", "24h", "7d", "30d"].map((r) =>
   `<button type="button" data-range="${r}" aria-pressed="${r === S.range}">${r}</button>`).join("")}</span>`;
+const metricControls = () => `<div class="row metric-controls"><span class="meta">Highest first:</span><span class="seg" role="group" aria-label="Rank usage by">${Object.entries(METRICS).map(([key, metric]) =>
+  `<button type="button" data-metric-sort="${key}" aria-pressed="${S.metric === key}">${metric.label}</button>`).join("")}</span></div>`;
 
 // ======================================================================== fleet facts
 // The run that speaks for each machine: its newest live one that's ready, or its newest if none is ready yet. While a
@@ -1003,24 +1012,6 @@ function heatmap(body, rows, opts = {}) {
   hit.addEventListener("pointerleave", (e) => { if (e.pointerType !== "touch") { outline.setAttribute("visibility", "hidden"); hideTip(); } });
   body.append(svg);
 }
-// A collapsed "Disk and network" section, drawn when opened; it stays open across refreshes once opened.
-function moreSection(box, drawInto) {
-  const more = document.createElement("details");
-  more.className = "more";
-  more.innerHTML = "<summary>Disk and network</summary>";
-  const mg = document.createElement("div");
-  mg.className = "grid";
-  more.append(mg);
-  box.append(more);
-  more.ontoggle = () => {
-    S.moreOpen = more.open;
-    if (more.open && !mg.childElementCount) drawInto(mg);
-  };
-  if (S.moreOpen) { // drawn now, not in the toggle event later, so the page doesn't change height after the redraw
-    more.open = true;
-    drawInto(mg);
-  }
-}
 // A 64x20 line of the last hour or so, with a dot at the end.
 function spark(vals) {
   const v = (vals ?? []).slice(-60);
@@ -1052,7 +1043,6 @@ function combine(cols, how) {
   }
   return out;
 }
-const map2 = (a, b, f) => (a ?? []).map((v, i) => (isNum(v) && isNum(b?.[i]) ? f(v, b[i]) : null));
 const fleetH = (k, how = "sum") => combine(machineNums().map((m) => hcol(m, k)), how);
 function appNames() {
   const set = new Set();
@@ -1072,7 +1062,57 @@ function appStack(cols) {
 }
 const liveRows = () => Object.entries(M().live).map(([m, x]) => ({ m: Number(m), ...x })).sort((a, b) => a.m - b.m);
 const sumLive = (f) => liveRows().reduce((s, r) => s + (isNum(f(r)) ? f(r) : 0), 0);
-const io = (a, b) => `${F.rate(a)} <span class="s">${F.rate(b)}</span>`;
+// Rank numeric samples, not formatted strings. Missing data follows real zeroes;
+// ties use a stable name/number so rows do not shuffle on every refresh.
+const sumNumbers = (values) => {
+  const known = values.filter(isNum);
+  return known.length ? known.reduce((a, b) => a + b, 0) : null;
+};
+function descending(rows, value, key) {
+  return [...rows].sort((a, b) => {
+    const x = value(a), y = value(b);
+    const order = isNum(x) && isNum(y) ? y - x : isNum(x) ? -1 : isNum(y) ? 1 : 0;
+    return order || String(key(a)).localeCompare(String(key(b)), undefined, { numeric: true });
+  });
+}
+const metricFields = (host) => host && S.metric === "mem" ? ["memUsed"] : METRICS[S.metric].fields;
+const metricValue = (sample, host = false) => sumNumbers(metricFields(host).map((key) => sample?.[key]));
+const metricColumns = (column, host = false) => combine(metricFields(host).map(column), "sum");
+const ioUsage = (a, b, first, second) => `${F.rate(sumNumbers([a, b]))}<div class="s">${first} ${F.rate(a)} · ${second} ${F.rate(b)}</div>`;
+function usageTable(label, rows, { host = false } = {}) {
+  const sort = Object.keys(METRICS).indexOf(S.metric) + 1;
+  const head = [label, ...Object.entries(METRICS).map(([key, metric]) => metric.label + (S.metric === key ? " ↓" : ""))];
+  return table(head, descending(rows, (row) => metricValue(row.values, host), (row) => row.id).map((row) => {
+    const v = row.values ?? {};
+    return { href: row.href, cells: [
+      `${row.href ? `<a href="${esc(row.href)}"><b>${esc(row.label)}</b></a>` : `<b>${esc(row.label)}</b>`}${row.starting ? ' <span class="s">starting</span>' : ""}`,
+      host ? `${F.pct(v.cpu)}${meter(v.cpu)}` : F.cores(v.cpu),
+      host ? `${bytes(v.memUsed)} <span class="s">${F.pct(pctOf(v.memUsed, v.memTotal))}</span>` : bytes(v.mem),
+      ioUsage(v.diskRead, v.diskWrite, "read", "write"), ioUsage(v.netRx, v.netTx, "in", "out"),
+    ] };
+  }), { empty: "Nothing reporting right now", num: [1, 2, 3, 4], sort });
+}
+function liveAppRows(machines = liveRows()) {
+  const apps = new Map();
+  for (const machine of machines) for (const [name, values] of Object.entries(machine.a ?? {})) {
+    const total = apps.get(name) ?? {};
+    for (const key of Object.values(METRICS).flatMap((metric) => metric.fields)) {
+      if (isNum(values?.[key])) total[key] = (total[key] ?? 0) + values[key];
+    }
+    apps.set(name, total);
+  }
+  return [...apps].map(([name, values]) => ({ id: name, label: appLabel(name), href: name === "_system" ? null : appHref(name), values }));
+}
+function usageHeatmap(parent, machines, columns, { host = false } = {}) {
+  const rows = machines.map((m) => ({ id: m, name: `server ${m}`, href: machineHref(m), values: columns(m) }));
+  const average = (row) => {
+    const values = (row.values ?? []).filter(isNum);
+    return values.length ? sumNumbers(values) / values.length : null;
+  };
+  const unit = host && S.metric === "cpu" ? "pct" : METRICS[S.metric].unit;
+  heatmap(ccard(parent, METRICS[S.metric].label, "Average in selected range, highest first · tap a server to open it", true),
+    descending(rows, average, (row) => row.id), { unit, ...(unit === "pct" ? { max: 100 } : {}) });
+}
 function fleetTiles() {
   const live = liveRows();
   const memTotal = sumLive((r) => r.h.memTotal), memUsed = sumLive((r) => r.h.memUsed);
@@ -1667,7 +1707,7 @@ function vApp(name, q = new URLSearchParams()) {
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
       <h2>Replicas</h2><div id="ad-replicas"></div>
       <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div id="ad-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2>${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
       <h2>Versions</h2><div id="ad-versions"></div>`,
     status() {
@@ -1749,17 +1789,18 @@ function vApp(name, q = new URLSearchParams()) {
         { label: "Disk read", value: F.rate(total("diskRead")), sub: `write ${F.rate(total("diskWrite"))}` },
         { label: "Network in", value: F.rate(total("netRx")), sub: `out ${F.rate(total("netTx"))}` },
       ]));
+      box.insertAdjacentHTML("beforeend", `<h2>Servers now</h2>${usageTable("Server", inst.map(({ r, v }) => ({
+        id: r.m, label: `Server ${r.m}`, href: machineHref(r.m), values: v,
+      })))}`);
       const A = (k) => combine(ms.map((m) => acol(m, name, k)), "sum");
       const g = section(box, "All replicas together");
       g.previousElementSibling.style.marginTop = "18px";
       lineChart(ccard(g, "CPU"), [{ name: "CPU", values: A("cpu") }], { unit: "cores" });
       lineChart(ccard(g, "Memory"), [{ name: "memory", values: A("mem") }], { unit: "bytes" });
+      lineChart(ccard(g, "Disk I/O"), [{ name: "read", values: A("diskRead") }, { name: "write", values: A("diskWrite") }], { unit: "rate" });
+      lineChart(ccard(g, "Network I/O", "apps on host networking aren't counted"), [{ name: "in", values: A("netRx") }, { name: "out", values: A("netTx") }], { unit: "rate" });
       const heat = section(box, "Per server");
-      heatmap(ccard(heat, "CPU", "cores, per server", true), ms.filter((m) => acol(m, name, "cpu")?.some(isNum)).map((m) => ({ name: `server ${m}`, values: acol(m, name, "cpu"), href: machineHref(m) })), { unit: "cores" });
-      moreSection(box, (mg) => {
-        lineChart(ccard(mg, "Disk I/O"), [{ name: "read", values: A("diskRead") }, { name: "write", values: A("diskWrite") }], { unit: "rate" });
-        lineChart(ccard(mg, "Network I/O", "apps on host networking aren't counted"), [{ name: "in", values: A("netRx") }, { name: "out", values: A("netTx") }], { unit: "rate" });
-      });
+      usageHeatmap(heat, ms.filter((m) => M().m[m]?.a?.[name] || M().live[m]?.a?.[name]), (m) => metricColumns((key) => acol(m, name, key)));
       });
     },
     async click(e) {
@@ -2066,7 +2107,7 @@ function vMachine(n) {
     title: `Server ${n}`, wantsMetrics: true,
     html: `<a class="back" href="#/machines">← Servers</a><div id="md-head"></div>
       <h2>Apps here</h2><div id="md-apps"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div id="md-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2>${metricControls()}<div id="md-charts"><div class="meta">Loading…</div></div>
       <h2>Fleet actions</h2><div id="md-actions"></div>`,
     status() {
       const st = S.status, runs = runsBy(), r = runs.get(n), ms = machineState(n, r);
@@ -2104,22 +2145,15 @@ function vMachine(n) {
       const g = section(box, "Server");
       lineChart(ccard(g, "CPU", "average and peak, % of all cores"), [{ name: "average", values: H("cpu") }, { name: "peak", values: H("cpuMax") }], { unit: "pct" });
       lineChart(ccard(g, "Memory used"), [{ name: "used", values: H("memUsed") }], { unit: "bytes", ref: { name: "installed", value: x.memTotal ?? Math.max(0, ...(H("memTotal") ?? []).filter(isNum)) } });
+      lineChart(ccard(g, "Disk I/O"), [{ name: "read", values: H("diskRead") }, { name: "write", values: H("diskWrite") }], { unit: "rate" });
+      lineChart(ccard(g, "Network I/O"), [{ name: "in", values: H("netRx") }, { name: "out", values: H("netTx") }], { unit: "rate" });
+      box.insertAdjacentHTML("beforeend", `<h2>Apps now</h2>${usageTable("App", liveAppRows(live ? [live] : []))}`);
       const apps = section(box, "Apps on this server");
       const A = (k) => (a) => acol(n, a, k);
       lineChart(ccard(apps, "CPU by app"), appStack(A("cpu")), { unit: "cores", stacked: true });
       lineChart(ccard(apps, "Memory by app"), appStack(A("mem")), { unit: "bytes", stacked: true });
-      if (live) {
-        const rows = Object.entries(live.a).sort(([a], [b]) => (a === "_system") - (b === "_system") || a.localeCompare(b)).map(([a, v]) => ({
-          href: a === "_system" ? null : appHref(a), cells: [`<b>${esc(appLabel(a))}</b>`, F.cores(v.cpu), bytes(v.mem), io(v.diskRead, v.diskWrite), io(v.netRx, v.netTx)] }));
-        const h = document.createElement("h2");
-        h.textContent = "Apps now";
-        box.append(h);
-        box.insertAdjacentHTML("beforeend", table(["App", "CPU", "Memory", "Disk read / write", "Network in / out"], rows, { num: [1, 2, 3, 4] }));
-      }
-      moreSection(box, (mg) => {
-        lineChart(ccard(mg, "Disk I/O"), [{ name: "read", values: H("diskRead") }, { name: "write", values: H("diskWrite") }], { unit: "rate" });
-        lineChart(ccard(mg, "Network I/O"), [{ name: "in", values: H("netRx") }, { name: "out", values: H("netTx") }], { unit: "rate" });
-      });
+      lineChart(ccard(apps, "Disk I/O by app", "read + write"), appStack((a) => combine([acol(n, a, "diskRead"), acol(n, a, "diskWrite")], "sum")), { unit: "rate", stacked: true });
+      lineChart(ccard(apps, "Network by app", "in + out; apps on host networking aren't counted"), appStack((a) => combine([acol(n, a, "netRx"), acol(n, a, "netTx")], "sum")), { unit: "rate", stacked: true });
       });
     },
     click(e) {
@@ -2135,42 +2169,32 @@ function vMachine(n) {
 function vMetrics() {
   return {
     title: "Metrics", wantsMetrics: true,
-    html: `<div class="row"><h1 class="grow">Metrics</h1>${rangeSeg()}</div><div class="sub" id="mx-sub">Loading…</div><div id="mx"></div>`,
+    html: `<div class="row"><h1 class="grow">Metrics</h1>${rangeSeg()}</div><div class="sub" id="mx-sub">Loading…</div>${metricControls()}
+      <p class="meta">Tables rank current usage. Memory is bytes used; disk is read + write per second; network is in + out per second.</p><div id="mx"></div>`,
     charts() {
       const box = $("#mx");
       if (!box) return;
       rebuild(box, () => {
       $("#mx-sub").textContent = `${S.metrics.step / 60000}-minute points · updated ${ago(Date.now() - S.metricsAt)} ago`;
-      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}<h2>Servers now</h2>`);
-      box.insertAdjacentHTML("beforeend", table(["Server", "CPU", "Memory", "Disk read / write", "Network in / out"], liveRows().map((r) => ({
-        href: machineHref(r.m),
-        cells: [`<a href="${machineHref(r.m)}"><b>Server ${r.m}</b></a>${r.ready ? "" : ' <span class="s">starting</span>'}`,
-          `${spark(hcol(r.m, "cpu"))} ${F.pct(r.h.cpu)}${meter(r.h.cpu)}`,
-          `${F.pct(pctOf(r.h.memUsed, r.h.memTotal))}${meter(pctOf(r.h.memUsed, r.h.memTotal))} <span class="s">${bytes(r.h.memUsed)}</span>`,
-          io(r.h.diskRead, r.h.diskWrite), io(r.h.netRx, r.h.netTx)],
-      })), { empty: "Nothing reporting right now", num: [1, 2, 3, 4] }));
+      box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}
+        <h2>Apps now <span class="meta">summed across reporting servers</span></h2>${usageTable("App", liveAppRows())}
+        <p class="meta">Per-app network usage excludes containers using host networking.</p>
+        <h2>Servers now</h2>${usageTable("Server", liveRows().map((r) => ({
+          id: r.m, label: `Server ${r.m}`, href: machineHref(r.m), values: r.h, starting: !r.ready,
+        })), { host: true })}`);
       const ms = machineNums();
-      const heat = section(box, "Per server", `<span class="seg" role="group" aria-label="Heatmap shows"><button type="button" data-heat="cpu" aria-pressed="${S.heat === "cpu"}">CPU</button><button type="button" data-heat="mem" aria-pressed="${S.heat === "mem"}">Memory</button></span>`);
-      const rows = ms.map((m) => ({ name: `server ${m}`, href: machineHref(m),
-        values: S.heat === "cpu" ? hcol(m, "cpu") : map2(hcol(m, "memUsed"), hcol(m, "memTotal"), (u, t) => (100 * u) / t) }));
-      heatmap(ccard(heat, S.heat === "cpu" ? "CPU" : "Memory", `% ${S.heat === "cpu" ? "of all cores" : "used"} · tap a server's name to open it`, true), rows, { unit: "pct", max: 100 });
+      usageHeatmap(section(box, "Per server"), ms, (m) => metricColumns((key) => hcol(m, key), true), { host: true });
       const g = section(box, "Whole fleet");
       lineChart(ccard(g, "CPU", "average across servers, and the busiest server"), [{ name: "average", values: fleetH("cpu", "avg") }, { name: "busiest server", values: fleetH("cpu", "max") }], { unit: "pct" });
-      lineChart(ccard(g, "Memory by app", "summed over servers"), appStack((a) => combine(ms.map((m) => acol(m, a, "mem")), "sum")), { unit: "bytes", stacked: true });
-      lineChart(ccard(g, "CPU by app", "summed over servers"), appStack((a) => combine(ms.map((m) => acol(m, a, "cpu")), "sum")), { unit: "cores", stacked: true });
       lineChart(ccard(g, "Memory used", "all servers"), [{ name: "used", values: fleetH("memUsed") }], { unit: "bytes", ref: { name: "installed", value: Math.max(0, ...fleetH("memTotal").filter(isNum)) } });
-      moreSection(box, (mg) => {
-        lineChart(ccard(mg, "Disk I/O", "all servers"), [{ name: "read", values: fleetH("diskRead") }, { name: "write", values: fleetH("diskWrite") }], { unit: "rate" });
-        lineChart(ccard(mg, "Network I/O", "all servers"), [{ name: "in", values: fleetH("netRx") }, { name: "out", values: fleetH("netTx") }], { unit: "rate" });
+      lineChart(ccard(g, "Disk I/O", "all servers"), [{ name: "read", values: fleetH("diskRead") }, { name: "write", values: fleetH("diskWrite") }], { unit: "rate" });
+      lineChart(ccard(g, "Network I/O", "all servers"), [{ name: "in", values: fleetH("netRx") }, { name: "out", values: fleetH("netTx") }], { unit: "rate" });
+      const apps = section(box, "Usage by app");
+      for (const metric of Object.values(METRICS)) {
+        lineChart(ccard(apps, `${metric.label} by app`, "Largest consumers in the selected range · summed across servers"),
+          appStack((a) => combine(ms.flatMap((m) => metric.fields.map((key) => acol(m, a, key))), "sum")), { unit: metric.unit, stacked: true });
+      }
       });
-      });
-    },
-    click(e) {
-      const b = e.target.closest("[data-heat]");
-      if (!b) return;
-      S.heat = b.dataset.heat;
-      localStorage.setItem("metrics-heat", S.heat);
-      this.charts();
     },
   };
 }
@@ -2354,7 +2378,7 @@ function renderChrome() {
   setHtml($("#summary"), `${controller}${pill(n ? "failed" : "healthy", `${runsBy().size} up${n ? ` · ${n} problem${n === 1 ? "" : "s"}` : ""}`)}`);
 }
 
-// Global controls: copy buttons, the time range.
+// Global controls: copy buttons, the time range and client-side usage ranking.
 document.addEventListener("click", async (e) => {
   const copy = e.target.closest("[data-copy]");
   if (copy) {
@@ -2367,6 +2391,13 @@ document.addEventListener("click", async (e) => {
     localStorage.setItem("metrics-range", S.range);
     $$("[data-range]").forEach((b) => b.setAttribute("aria-pressed", b.dataset.range === S.range));
     loadMetrics();
+  }
+  const metric = e.target.closest("[data-metric-sort]");
+  if (metric && Object.hasOwn(METRICS, metric.dataset.metricSort)) {
+    S.metric = metric.dataset.metricSort;
+    localStorage.setItem("metrics-sort", S.metric);
+    $$("[data-metric-sort]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.metricSort === S.metric));
+    if (S.metrics) view?.charts?.();
   }
 });
 
