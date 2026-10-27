@@ -70,7 +70,7 @@ function watcher(c, f, apps) {
   ok("no replica went dark", Object.keys(w.dark).length === 0, JSON.stringify(w.dark));
 }
 
-{ // 3. shrinking a pool: one server at a time leaves, each after its copies moved out
+{ // 3. explicitly drained servers leave one at a time, after their copies move
   const c = makeControl();
   const f = new Fleet(c, { a: { size: 6, cap: 20 } }, { drainAt: () => null, reportDeadline: true, build: 60_000 });
   await f.startPool("a");
@@ -78,16 +78,18 @@ function watcher(c, f, apps) {
   deploy(c, "web", app("web", 6));
   await f.run(12 * MIN);
   const w = watcher(c, f, { web: 6 });
-  c.putSettings({ pools: { a: 3 } });
-  f.pools.a.size = 3;
+  const retiring = new Set(f.alive("a").slice(0, 3).map((s) => s.agent));
+  const body = f.body.bind(f);
+  f.body = (s, extra = {}) => body(s, { ...(retiring.has(s.agent) ? { starts: false } : {}), ...extra });
+  for (const agent of retiring) c.drain({ agent });
   await f.run(40 * MIN, w.each);
-  ok("the pool shrank to 3", f.alive("a").length === 3, `${f.alive("a").length} left`);
+  ok("only the explicitly drained servers leave", f.alive("a").length === 3, `${f.alive("a").length} left`);
   ok("one eviction at a time", w.maxPool <= 1, `max ${w.maxPool}`);
   ok("no replica went dark", Object.keys(w.dark).length === 0, JSON.stringify(w.dark));
   ok("every web copy is placed on the remaining servers", c.copiesOf("web").filter((x) => !x.leaving).length === 6 && c.copiesOf("web").every((x) => f.alive().some((s) => s.machine === x.machine)), placed(c, "web").join(" "));
 }
 
-{ // 4. a server that dies without warning: its pool's next machine takes its slot and inherits its copies
+{ // 4. a lost server does not imply an expected replacement; use available capacity
   const c = makeControl();
   const f = new Fleet(c, { a: { size: 4, cap: 20 } }, { drainAt: () => null, reportDeadline: true, build: 60_000 });
   await f.startPool("a");
@@ -100,8 +102,8 @@ function watcher(c, f, apps) {
   await f.run(15 * MIN);
   const after = c.recentEvents.slice(eventsBefore);
   const back = f.alive().find((s) => s.machine === victim.machine);
-  ok("a new server took the dead one's slot", Boolean(back), f.alive().map((s) => s.machine).join(","));
-  ok("and inherited its copy: no move, no re-placement elsewhere", !after.some((e) => (e.kind === "place" || e.kind === "move-start") && e.app === "web"), after.filter((e) => e.app).map((e) => `${e.kind} ${e.app}#${e.replica}@${e.machine}`).join(", "));
+  ok("no replacement is requested for a target count", !back && f.alive().length === 3 && c.starts.size === 0, f.alive().map((s) => s.machine).join(","));
+  ok("its copy recovers on the connected servers", c.copiesOf("web").filter((x) => !x.leaving).length === 4 && c.copiesOf("web").every((x) => f.alive().some((s) => s.machine === x.machine)), placed(c, "web").join(" "));
   ok("its loss was recorded", after.some((e) => e.kind === "server-lost" && e.machine === victim.machine));
 }
 

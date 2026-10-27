@@ -70,18 +70,16 @@ const poolsOf = (c, f, name) => {
   const f = new Fleet(c, { a: { size: 2, cap: 20 } }, { drainAt: () => null, build: 60_000 });
   await f.startPool("a");
   await f.run(4 * MIN);
-  c.putSettings({ pools: { a: 3 } }); // a third server is asked for; it takes a few minutes to arrive
-  f.pools.a.size = 3;
-  const realStart = f.start.bind(f);
-  const pending = [];
-  f.start = async (pool, want) => { pending.push([pool, want]); return null; }; // the start takes a while
-  await f.run(1 * MIN);
+  // The external supplier provides a third tagged server. It has checked in,
+  // but is still booting; the CP has no desired server count to wait for.
+  const third = await f.start("a");
+  f.silent.add(third.machine);
+  c.sync(f.body(third));
   deploy(c, "web", app("web", 3));
-  await f.run(2 * MIN);
+  await f.run(2 * MIN, () => c.sync(f.body(third)));
   const doubledEarly = f.alive().some((s) => c.copiesOn("web", s.machine).length > 1);
   ok("while a server is starting, the third copy waits instead of doubling up", !doubledEarly && c.blocked.get("web")?.includes("starting"), c.blocked.get("web"));
-  f.start = realStart;
-  for (const [pool, want] of pending) await f.start(pool, want);
+  f.silent.delete(third.machine);
   await f.run(5 * MIN);
   ok("then it goes to the new server", c.copiesOf("web").length === 3 && !f.alive().some((s) => c.copiesOn("web", s.machine).length > 1), placed(c, "web").join(" "));
 }

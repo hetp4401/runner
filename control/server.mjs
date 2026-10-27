@@ -1,6 +1,6 @@
 // The control plane as one process: configuration in SQLite, runtime tables in memory, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
 // runners.<domain>). Settings and secrets come from the environment (see the README).
-//   PORT (8920), DATA_DIR (.), DOMAIN, CONTROL_HOST, ZONE, ACCOUNT_ID, POOLS, MAX_SLOTS (optional cap on machines), FLEET_PASSWORD, JOIN_TOKEN,
+//   PORT (8920), DATA_DIR (.), DOMAIN, CONTROL_HOST, ZONE, ACCOUNT_ID, MAX_SLOTS (optional cap on slots), FLEET_PASSWORD, JOIN_TOKEN,
 //   CF_API_TOKEN (or CF_API_KEY + CF_API_EMAIL), CF_API_BASE (tests), POLL_S, DNS=off (no DNS changes), ALERT_WEBHOOK,
 //   STATE_SIGNING_KEY (required), RECOVERY_MS (180000), MEMORY_HISTORY_MIN (360), INIT_CONTROL_DB=1 (new fleet only),
 //   QUIET_MS and YOUNG_MS (tests)

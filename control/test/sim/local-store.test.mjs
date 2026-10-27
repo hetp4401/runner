@@ -111,7 +111,9 @@ try {
   control.sync({ ...reports[0], recovery: { payload, signature: createHmac("sha256", signingKey).update(payload).digest("hex") } });
   check("receipts never override current operator intent", () => {
     assert.equal(control.rebalanceOn(), false);
-    assert.equal(control.poolSize("test"), 3);
+    assert.equal(control.groups().find((g) => g.tag === "test").online, 3);
+    assert.equal(control.settings.has("pools"), false);
+    assert.equal("expected" in control.status(), false);
   });
   for (let i = 0; i < 10; i++) {
     advance(20_000);
@@ -166,7 +168,10 @@ try {
     assert.equal(control.appEnv.get("web").get("TOKEN"), "updated-secret");
   });
   const beforeFailedEdit = snapshot(store.db);
-  assert.throws(() => control.putSettings({ rebalance: true, pools: { test: -1 } }), /whole number/);
+  assert.throws(() => store.mutate(() => {
+    control.setSetting("rebalance", "on");
+    throw new Error("fixture failure after configuration write");
+  }), /fixture failure/);
   check("a failed multi-part configuration edit is rolled back and stops further plans", () => {
     assert.deepEqual(snapshot(store.db), beforeFailedEdit);
     assert.equal(store.failed, true);

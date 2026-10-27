@@ -17,7 +17,7 @@ import YAML from "yaml";
 import { REGIONS, regionOf, regionForReplica, machineRegion, validRegion } from "./regions.js";
 import { agentPlan, relativeBinds } from "./agent-plan.mjs";
 import { installScript } from "./install-script.mjs";
-import { durableSetting } from "./state-policy.js";
+import { durableSetting, obsoleteSetting } from "./state-policy.js";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
 // grows with the number of machines (20 machines: every 20 s; 50: every 43 s). Never under MIN_POLL_S or over
@@ -138,6 +138,16 @@ class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+// A tag is mandatory metadata, never a desired fleet size. POOL remains an
+// input alias for installed agents; a signed prior run can migrate standalone.
+function agentTag(body, previous = null) {
+  const value = Object.hasOwn(body ?? {}, "tag") ? body.tag
+    : typeof body?.pool === "string" ? body.pool : previous ? previous.pool || "standalone" : null;
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]{0,29}$/.test(value))
+    throw new HttpError(400, "A server tag is required: use 1-30 lowercase letters, digits or dashes, or standalone.");
+  return value;
 }
 
 const json = (data, status = 200) => Response.json(data, { status });
@@ -580,8 +590,7 @@ export class Control {
     this.runs = new Map(this.all("SELECT * FROM runs").map((r) => [r.id, { ...r, status: JSON.parse(r.status), savedSeen: r.seen }]));
     this.starts = new Map(this.all("SELECT machine, at FROM starts").map((s) => [s.machine, s.at]));
     this.startPools = new Map();
-    this.settings = new Map(this.all("SELECT key, value FROM settings").map((s) => [s.key, s.value]));
-    this.poolAsks = new Map(Object.entries(JSON.parse(this.settings.get("pool_asks") ?? "{}"))); // pool sizes as their joiners gave them
+    this.settings = new Map(this.all("SELECT key, value FROM settings").filter((s) => !obsoleteSetting(s.key)).map((s) => [s.key, s.value]));
     this.versions = new Map(); // "name@version" -> { compose, port, replicas, files, claims }
     this.blocked = new Map(); // project -> why a replica of it has no machine (a clash with what's placed everywhere)
     this.copies = new Map(); // project -> [{ machine, replica, since, reason, leaving, ports }], one per copy
@@ -718,23 +727,14 @@ export class Control {
     );
   }
 
-  // Pools and how many machines each should have running. Any pool can join: its members (and whatever watches it,
-  // through /api/claim) say how big it should be. The POOLS setting (portal, runnerctl pool) overrides that, and the
-  // POOLS var is the default for a pool nobody has given a size for.
-  pools() {
-    const fromEnv = typeof this.env.POOLS === "string" ? JSON.parse(this.env.POOLS || "{}") : this.env.POOLS ?? {};
-    const out = { ...fromEnv, ...Object.fromEntries(this.poolAsks), ...JSON.parse(this.settings.get("pools") ?? "{}") };
-    for (const r of this.runs.values()) if (r.pool && !(r.pool in out)) out[r.pool] = 0; // pools that showed up without a size
-    return out;
-  }
-
-  // A pool's size as its joiners give it (members re-send it with every check-in; kept across restarts, so a pool
-  // whose members can't start machines isn't taken for oversized until its watcher asks again).
-  askPoolSize(pool, size) {
-    const n = Number(size);
-    if (!pool || size == null || size === "" || !Number.isInteger(n) || n < 0 || n > this.maxSlots() || this.poolAsks.get(pool) === n) return;
-    this.poolAsks.set(pool, n);
-    this.setSetting("pool_asks", JSON.stringify(Object.fromEntries(this.poolAsks)));
+  // Groups describe observed servers. There are no desired server counts.
+  groups(now = Date.now()) {
+    const groups = new Map();
+    for (const r of this.liveRuns(now)) {
+      const tag = r.pool || "standalone";
+      (groups.get(tag) ?? groups.set(tag, new Set()).get(tag)).add(r.machine);
+    }
+    return [...groups].sort(([a], [b]) => a.localeCompare(b)).map(([tag, machines]) => ({ tag, online: machines.size }));
   }
 
   // Just after a (re)start, or a gap in check-ins (the control plane was unreachable), the runs that were live when it
@@ -783,13 +783,9 @@ export class Control {
     return { events: this.all(`SELECT * FROM events WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...args, limit).map((e) => ({ ...e, text: eventText(e) })) };
   }
 
-  poolSize(pool) {
-    return Number(this.pools()[pool] ?? 0);
-  }
-
-  // Machines expected to be up: every pool's size (standalone machines come and go as they please).
-  expectedMachines() {
-    return Object.values(this.pools()).reduce((a, b) => a + Number(b), 0);
+  // Planning uses the capacity that has actually checked in.
+  fleetSize(now = Date.now()) {
+    return this.liveMachines(now).size;
   }
 
   // How many machines can have a slot (a tunnel each): MAX_SLOTS if it's set to a number above 0, else no cap.
@@ -1022,9 +1018,9 @@ export class Control {
       this.env.USE_EDGE_LOCATION === "1" ? decodeURIComponent(request.headers.get("x-runner-location") || "") : null));
     if (method === "POST" && route === "/claim") {
       need(node, "the join token");
-      const pool = url.searchParams.get("pool");
-      this.askPoolSize(pool, url.searchParams.get("size"));
-      return json({ start: this.claimStarts(pool, "claim", Date.now()) });
+      // Compatibility for older suppliers: an agent may label its origin, but
+      // cannot create a capacity target or ask the CP to fill a group.
+      return json({ start: [], mode: "passive" });
     }
     if (method === "POST" && route === "/drain") return need(node, "the join token"), json(this.drain(await body()));
     if (method === "GET" && route === "/wake") return need(node, "the join token"), json(await this.wait(url.searchParams.get("run")));
@@ -1200,7 +1196,7 @@ export class Control {
     }
     const spec = buildSpec(body, { trusted });
     const t = Date.now();
-    const machines = this.expectedMachines();
+    const machines = this.fleetSize();
     // env: {KEY: "value"} in the same request sets the app's env (see putEnv) before the version is made, so a new
     // app's first version already has it (a secret the containers need to start, say).
     const envChanged = body.env !== undefined ? this.mergeEnv(name, body.env, t) : false;
@@ -1281,7 +1277,7 @@ export class Control {
         "INSERT INTO versions (name, version, compose, port, files, replicas, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
         name, version, latest.compose, latest.port, JSON.stringify(latest.files), latest.replicas, t,
       );
-      this.saveProject({ ...p, version, stable: version, rollout: this.expectedMachines(), halted: null, updated: t });
+      this.saveProject({ ...p, version, stable: version, rollout: this.fleetSize(), halted: null, updated: t });
       this.place(t);
     }
     return { ...this.describe(this.project(name)), keys: this.envKeys(name), unchanged: !changed || undefined };
@@ -1326,23 +1322,14 @@ export class Control {
   }
 
   putSettings(body) {
-    const { pools, rebalance } = isMap(body) ? body : {};
+    const { rebalance } = isMap(body) ? body : {};
+    if (isMap(body) && ["pools", "expected", "serverCount"].some((key) => Object.hasOwn(body, key)))
+      throw new HttpError(400, "Server targets are not supported. Set SERVER_TAG on each agent to identify its group.");
     if (rebalance !== undefined) {
       if (typeof rebalance !== "boolean") throw new HttpError(400, "rebalance must be true or false");
       this.setSetting("rebalance", rebalance ? "on" : "off");
     }
-    if (pools !== undefined) {
-      if (!isMap(pools)) throw new HttpError(400, 'pools must be an object of pool name to size, like {"name": 10}');
-      const next = { ...JSON.parse(this.settings.get("pools") ?? "{}") };
-      for (const [name, size] of Object.entries(pools)) {
-        if (!/^[a-z0-9-]{1,30}$/.test(name)) throw new HttpError(400, "a pool name is lowercase letters, digits and dashes");
-        if (!(Number.isInteger(size) && size >= 0 && size <= this.maxSlots())) throw new HttpError(400, Number.isFinite(this.maxSlots()) ? `a pool's size is 0-${this.maxSlots()}` : "a pool's size is a whole number, 0 or more");
-        next[name] = size;
-      }
-      this.setSetting("pools", JSON.stringify(next));
-      this.scheduleDns();
-    }
-    return { pools: this.pools(), rebalance: this.rebalanceOn() };
+    return { groups: this.groups(), rebalance: this.rebalanceOn() };
   }
 
   rebalanceOn() {
@@ -1531,7 +1518,7 @@ export class Control {
     // After a (re)start the first machine to check in would get every replica, because it's the only one with
     // metrics; wait until every machine that's up has reported some (or 3 minutes).
     const measured = (machine) => now - (this.liveMetrics.get(machine)?.t ?? 0) < 3 * this.liveMs;
-    const arrived = now - this.settleAt > ARRIVAL_MS || (up.size >= this.expectedMachines() && [...up.keys()].every(measured));
+    const arrived = now - this.settleAt > ARRIVAL_MS || [...up.keys()].every(measured);
     const counts = new Map(); // machine -> copies placed on it
     for (const [name, list] of this.copies) {
       // Projects that are gone or disabled need no copies; neither do machines that have gone, nor replicas
@@ -1742,10 +1729,9 @@ export class Control {
   }
 
   // When the control plane wants a run to leave: some time between 4 h and 5 h 10 min after its start (a fixed spread per
-  // run), always at least 45 minutes before its deadline. Only runs that know their deadline (LIFETIME_MIN) and belong to
-  // a pool (so a replacement can be started) get one.
+  // run), always at least 45 minutes before its declared deadline (LIFETIME_MIN).
   dueAt(r) {
-    if (!r.deadline || !r.pool) return null;
+    if (!r.deadline) return null;
     let h = 2166136261;
     for (const ch of r.id) h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0;
     return Math.min(r.started + (240 + (h % 70)) * MIN, r.deadline - 45 * MIN);
@@ -2493,22 +2479,16 @@ export class Control {
   sickDrain(r, now) {
     if (!((r.quarantine ?? 0) > now) || !this.sickWhy.has(r.id) || r.drain || r.handover || r.evict || r.retire) return;
     const why = this.sickWhy.get(r.id);
-    if (!r.pool) {
+    if (!r.starts) {
       this.alert("sick-server", { machine: r.machine }, `server ${r.machine} looks sick (${why}); nothing replaces it automatically, so it needs a look`, now);
       return;
     }
-    if (now - (this.sickDrains[r.pool] ?? 0) < SICK_DRAIN_GAP_MS || this.poolShort(r.pool, now) || this.capped(r.pool, now)) return;
+    if (now - (this.sickDrains[r.pool] ?? 0) < SICK_DRAIN_GAP_MS || this.capped(r.pool, now)) return;
     r.drain = now;
     this.saveRun(r);
     this.sickDrains[r.pool] = now;
     this.setSetting("sick_drains", JSON.stringify(this.sickDrains));
     this.logEvent("drain", { machine: r.machine, run: r.id, cause: "sick", detail: `server ${r.machine} looks sick (${why}): it asks to leave, for a fresh one`, t: now });
-  }
-
-  // A pool with fewer live servers than its size.
-  poolShort(pool, now) {
-    const size = this.pools()[pool];
-    return Boolean(size) && new Set(this.liveRuns(now).filter((r) => r.pool === pool).map((r) => r.machine)).size < size;
   }
 
   // ---- logs ----
@@ -2733,6 +2713,7 @@ export class Control {
     if (body.region != null && body.region !== "" && !validRegion(body.region)) throw new HttpError(400, "region must be a lowercase region label");
     const observed = this.observedRuns.has(run);
     const receipt = this.readRecovery(body, now);
+    const tag = agentTag(body, this.runs.get(run) ?? receipt?.runRow);
     if (!this.coldRecoveryComplete && this.recoveringUntil && (!this.tunnelsReady || now < this.recoveringUntil || this.recoveryMissing.size)) this.recoverAgent(body, now, receipt);
     else {
       // A timer expiring does not make a late agent's running inventory empty.
@@ -2754,12 +2735,11 @@ export class Control {
     const status = this.reportedStatus(body.status, run, machine);
     const ready = body.ready ? 1 : 0;
     // How the agent describes its machine (see the top of this file).
-    const pool = typeof body.pool === "string" && /^[a-z0-9-]{1,30}$/.test(body.pool) ? body.pool : null;
+    const pool = tag === "standalone" ? null : tag;
     const label = String(body.label ?? "").slice(0, 80) || null;
-    const starts = body.starts !== false; // agents from before this field could all start machines
+    const starts = body.starts === true; // explicit replacement capability, independent of the origin tag
     // When whatever runs the machine will stop it (LIFETIME_MIN), if it knows: between 1 minute and a day after its start.
     const deadline = Number(body.deadline) > started + MIN && Number(body.deadline) < started + 86400_000 ? Number(body.deadline) : null;
-    this.askPoolSize(pool, body.poolSize);
     let r = this.runs.get(run);
     if (!r) {
       const agent = String(body.agent ?? run).slice(0, 100);
@@ -2843,9 +2823,8 @@ export class Control {
       } else if (r.evict) this.progressEvict(r, now);
       else this.retireStuckSuccessor(r, now);
     }
-    this.trimPools(now);
+    this.spreadDepartures(now);
     const handover = !r.retire && this.wantsHandover(r, now);
-    const start = !r.retire && r.ready && r.pool && r.starts ? this.claimStarts(r.pool, run, now) : []; // pool members start their peers
     this.followCopies(now);
     this.cleanup(now);
     const older = r.retire ? null : this.predecessorOf(r, now);
@@ -2872,7 +2851,7 @@ export class Control {
       desired,
       retire: Boolean(r.retire),
       handover,
-      start,
+      start: [], // servers are supplied externally; the CP never fills a target
       // A successor (an older run of this machine still serves): it opens its tunnel once it serves what that run does.
       ...(older ? { successor: true, serve: [...new Set([...Object.keys(desired).filter((k) => older.status?.[k]?.s === "healthy" && older.status[k].r !== false), ...regionPending])] } : {}),
     };
@@ -2892,7 +2871,7 @@ export class Control {
   }
 
   recoveryFor(r, now = Date.now()) {
-    const runtime = this.all("SELECT * FROM settings").filter((x) => !durableSetting(x.key));
+    const runtime = this.all("SELECT * FROM settings").filter((x) => !durableSetting(x.key) && !obsoleteSetting(x.key));
     const payload = JSON.stringify({ v: 1, at: now, agent: r.agent, run: r.id, machine: r.machine,
       runRow: this.all("SELECT * FROM runs WHERE id = ?", r.id)[0],
       copies: this.all("SELECT * FROM copies WHERE machine = ?", r.machine),
@@ -2979,20 +2958,16 @@ export class Control {
       for (const row of saved.fleet.runs ?? []) this.recoverRun(row, saved.at);
       const machines = new Set([...(saved.fleet.copies ?? []).map((x) => x.machine), ...(saved.fleet.runs ?? []).map((x) => x.machine), ...[...this.copies.values()].flat().map((x) => x.machine)]);
       for (const machine of machines) this.recoverCopies(machine, saved.fleet.copies ?? [], saved.at);
-      const pools = new Map(saved.fleet.startPools ?? []);
-      for (const start of saved.fleet.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, pools.get(start.machine));
     }
     if (rr) this.recoverRun({ ...rr, region: saved.region ?? rr.region ?? null }, saved.at, saved.location);
     this.recoverCopies(saved.machine, saved.copies ?? [], saved.at);
-    for (const start of saved.starts ?? []) if (now - start.at < START_WAIT_MS && start.at > (this.starts.get(start.machine) ?? 0)) this.markStart(start.machine, start.at, start.by, rr?.pool);
     if (saved.at > (this.recoverySettingsAt ?? 0)) {
       this.recoverySettingsAt = saved.at;
       for (const setting of saved.runtime ?? []) {
         // An older receipt must never replace the operator's current settings.
-        if (durableSetting(setting.key)) continue;
+        if (durableSetting(setting.key) || obsoleteSetting(setting.key)) continue;
         this.setSetting(setting.key, setting.value);
       }
-      this.poolAsks = new Map(Object.entries(JSON.parse(this.settings.get("pool_asks") ?? "{}")));
       this.autoMoved = new Map(Object.entries(JSON.parse(this.settings.get("auto_moved") ?? "{}")));
       this.versionFails = new Map(Object.entries(JSON.parse(this.settings.get("version_fails") ?? "{}")).map(([k, v]) => [k, new Set(v)]));
       this.massArms = JSON.parse(this.settings.get("mass_arms") ?? "[]");
@@ -3078,7 +3053,7 @@ export class Control {
       this.lossLog.push(now);
       this.logEvent("server-lost", { machine: r.machine, run: r.id, cause: "silent", detail: `server ${r.machine} stopped checking in without saying it was leaving`, t: now });
     }
-    if (lost.size < Math.max(MASS_LOSS_MIN, Math.ceil(0.1 * this.expectedMachines()))) return;
+    if (lost.size < Math.max(MASS_LOSS_MIN, Math.ceil(0.1 * this.fleetSize(now)))) return;
     this.massArms = this.massArms.filter((t) => now - t < 3600_000);
     if (this.massArms.length >= 2) {
       if (now - (this.massExhaustedAt ?? 0) > 3600_000) {
@@ -3199,7 +3174,7 @@ export class Control {
   departureGate(r, now) {
     if (r.retire || r.evict || r.handover || this.successorOf(r, now) || !this.due(r, now)) return null;
     const urgent = this.urgent(r, now);
-    const how = urgent || this.capped(r.pool, now) ? "evict" : "handover";
+    const how = urgent || ((r.deadline || r.drain) && !r.starts) || this.capped(r.pool, now) ? "evict" : "handover";
     const out = (wait) => ({ how, wait });
     if (urgent) return out(null);
     if (this.quiet(now)) return out("the control plane is in its quiet period after a restart or gap");
@@ -3340,24 +3315,15 @@ export class Control {
     if (!older.evict) this.startEvict(older, now, "its successor couldn't take over");
   }
 
-  // Pools over their size lose one run at a time, by moving its copies out first: the run with the fewest copies, the
-  // youngest of those. Pools also get their crowded departures spread out (flatten).
-  trimPools(now) {
-    if (now - (this.lastTrim ?? 0) < 10_000) return;
+  // Spread declared deadlines within each observed group. Origin tags never
+  // cause healthy servers to be removed as surplus.
+  spreadDepartures(now) {
+    if (now - (this.lastTrim ?? 0) < 10_000 || this.quiet(now)) return;
     this.lastTrim = now;
-    if (this.quiet(now)) return;
     const live = this.liveRuns(now);
-    for (const [pool, size] of Object.entries(this.pools())) {
-      const members = live.filter((r) => r.pool === pool && !this.successorOf(r, now));
-      if (members.length > size && !members.some((r) => r.evict) && !this.departing(now).some((r) => r.pool === pool)) {
-        const recent = this.departLog.filter((d) => now - d.t < 10 * MIN);
-        if (recent.length < 4 && recent.filter((d) => d.kind === "evict").length < 2) {
-          const count = (r) => [...this.copies.values()].reduce((n, list) => n + list.filter((x) => x.machine === r.machine).length, 0);
-          const victim = members.sort((a, b) => count(a) - count(b) || b.started - a.started)[0];
-          this.startEvict(victim, now, "surplus");
-        }
-      }
-      this.flatten(pool, members, now);
+    for (const { tag } of this.groups(now)) {
+      const pool = tag === "standalone" ? null : tag;
+      this.flatten(pool, live.filter((r) => (r.pool ?? null) === pool && !this.successorOf(r, now)), now);
     }
   }
 
@@ -3372,15 +3338,10 @@ export class Control {
     if (oldest) this.pulled.add(oldest.id);
   }
 
-  // A pool machine that went silent keeps its copies for its slot for up to START_WAIT_MS, so the next machine its pool
-  // starts takes the slot and inherits them (no moves, no DNS changes): the pool, while that holds, else null. Not for a
-  // run that said it's leaving (it may not be replaced) or that moved its copies out.
+  // Supply is external: do not keep workloads waiting for an unrequested
+  // group replacement after a server actually disappears.
   heldBy(n, now) {
-    if (this.liveRuns(now).some((r) => r.machine === n)) return null;
-    const last = [...this.runs.values()].filter((r) => r.machine === n).sort((a, b) => b.seen - a.seen)[0];
-    if (!last?.pool || last.left || last.evict) return null;
-    if (![...this.copies.values()].some((list) => list.some((x) => x.machine === n && !x.leaving))) return null;
-    return now - (last.seen + this.liveMs) < START_WAIT_MS ? last.pool : null;
+    return null;
   }
 
   // When a machine last checked in (any of its runs).
@@ -3388,45 +3349,6 @@ export class Control {
     let t = 0;
     for (const r of this.runs.values()) if (r.machine === n && r.seen > t) t = r.seen;
     return t;
-  }
-
-  // Machines to start so a pool has its size. Whoever asks (a member of the pool, or something watching it from
-  // outside through /api/claim) starts them, each with the slot it should take; the slot is held until it shows up.
-  claimStarts(pool, by, now) {
-    if (!pool || !(pool in this.pools())) return [];
-    const live = this.liveRuns(now);
-    if (this.settling(now)) return []; // claiming now would start a whole pool's worth of extras
-    // A start of this pool that never showed up: whatever starts its servers can't start more right now. Claim nothing
-    // new until that passes (a start that's only late still arrives).
-    for (const [n, at] of [...this.starts]) {
-      if (this.startPools.get(n) !== pool || now - at < START_WAIT_MS) continue;
-      if (!live.some((x) => x.machine === n && x.started >= at - MIN)) this.markCapped(pool, now, `a machine started for slot ${n} didn't show up within ${START_WAIT_MS / MIN} minutes`);
-      this.startPools.delete(n);
-    }
-    if (this.capped(pool, now)) return [];
-    const members = new Set(live.filter((x) => x.pool === pool).map((x) => x.machine));
-    // Only this pool's starts count (a start from before a restart, pool unknown, counts for every pool).
-    const starting = [...this.starts].filter(([n, at]) => now - at < START_WAIT_MS && !live.some((x) => x.machine === n) &&
-      (this.startPools.get(n) ?? pool) === pool).length;
-    const out = [];
-    // Its machines' held slots first: a machine started for one inherits its copies.
-    const held = [...new Set([...this.runs.values()].map((r) => r.machine))].filter((n) => this.heldBy(n, now) === pool &&
-      !(now - (this.starts.get(n) ?? 0) < START_WAIT_MS)).sort((a, b) => a - b);
-    for (let missing = this.poolSize(pool) - members.size - starting; missing > 0; missing--) {
-      const n = held.shift() ?? this.freeSlot(now, null, pool);
-      if (!n) break;
-      this.markStart(n, now, by, pool);
-      out.push(n);
-    }
-    if (out.length) this.logEvent("start", { cause: "start", detail: `starting ${out.length === 1 ? "a server" : `${out.length} servers`}: slot${out.length === 1 ? "" : "s"} ${out.join(", ")}`, t: now });
-    return out;
-  }
-
-  // A pool's runs beyond its size: the ones in the highest slots go.
-  surplusInPool(r, now) {
-    if (!r.pool) return false;
-    const slots = [...new Set(this.liveRuns(now).filter((x) => x.pool === r.pool).map((x) => x.machine))].sort((a, b) => a - b);
-    return slots.indexOf(r.machine) >= this.poolSize(r.pool);
   }
 
   // A slot is taken while another agent runs in it, while a machine is starting for it, and for a while after a
@@ -3453,7 +3375,8 @@ export class Control {
     const now = Date.now();
     const agent = String(body?.agent ?? "");
     if (!agent || agent.length > 100) throw new HttpError(400, "agent (an ID for this agent) is required");
-    const pool = typeof body.pool === "string" && /^[a-z0-9-]{1,30}$/.test(body.pool) ? body.pool : null;
+    const tag = agentTag(body, this.agents.get(agent));
+    const pool = tag === "standalone" ? null : tag;
     const label = String(body.label ?? "").slice(0, 80) || null;
     const want = Number(body.want);
     const max = this.maxSlots();
@@ -3481,7 +3404,7 @@ export class Control {
     );
     this.holds.set(slot, { agent, at: now }); // holds the slot until its first check-in
     const tunnel = await this.tunnelFor(slot);
-    return { machine: slot, tunnelToken: tunnel.token, domain: this.env.DOMAIN };
+    return { machine: slot, tunnelToken: tunnel.token, domain: this.env.DOMAIN, tag };
   }
 
   async cf(path, init = {}) {
@@ -3818,7 +3741,7 @@ export class Control {
       this.metricsCache.set(rangeName, c);
     }
     return Response.json({
-      now, range: rangeName, expected: this.expectedMachines(),
+      now, range: rangeName, servers: this.fleetSize(now),
       projects: [...this.projects.values()].map((p) => this.describe(p)).sort((a, b) => a.name.localeCompare(b.name)),
       live: this.liveNow(now), ...c.history,
     }, { headers: { "cache-control": "no-store" } });
@@ -3834,8 +3757,9 @@ export class Control {
         ...[...this.projects.values()].flatMap((p) => { const policy = this.version(p.name, p.version)?.policy; return [policy?.region, ...(policy?.regions ?? [])].filter(Boolean); })])].sort().map((name) => ({ name, label: REGIONS[name] ?? name,
         machines: [...this.liveMachines(now).values()].filter((r) => machineRegion(r) === name).length,
       })),
-      pools: Object.entries(this.pools()).map(([name, size]) => ({ name, size, live: new Set(this.liveRuns(now).filter((r) => r.pool === name).map((r) => r.machine)).size })),
-      expected: this.expectedMachines(),
+      fleetMode: "passive",
+      groups: this.groups(now),
+      servers: this.fleetSize(now),
       dnsError: this.dnsError,
       dnsNotes: this.dnsNotes ?? [],
       rebalance: {
@@ -3886,6 +3810,8 @@ export class Control {
           protocol: r.protocol ?? 1,
           recoveryAt: r.recoveryAt ?? null, witnessAt: r.witnessAt ?? null,
           pool: r.pool ?? null,
+          tag: r.pool || "standalone",
+          canReplace: Boolean(r.starts),
           draining: Boolean(r.drain),
           label: r.label,
           rtt: r.rtt ?? null, // ms, the agent's last check-in round trip: the machine's latency to the control plane

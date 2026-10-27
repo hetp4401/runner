@@ -84,7 +84,7 @@ try {
     const stateFile = join(directory, "state.json"), audit = join(directory, "audit.jsonl");
     writeFileSync(stateFile, JSON.stringify({ containers: { old: { id: "old", name: "runner-agent", control: origin, running: true } } }));
     const run = spawnSync("/bin/sh", ["-c", program], { encoding: "utf8", timeout: 20_000, env: {
-      ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: directory, RUNNER_DATA: data, JOIN_TOKEN: "fake-test-join", ORIGIN: origin,
+      ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: directory, RUNNER_DATA: data, JOIN_TOKEN: "fake-test-join", SERVER_TAG: "standalone", ORIGIN: origin,
       RUNNER_TEST_INSTALLER_LOCK: join(directory, "installer.lock"), SCENARIO: scenario, STATE: stateFile, AUDIT: audit,
       ARCHIVE: archive, ARCHIVE_HASH: bundle.archiveHash,
     } });

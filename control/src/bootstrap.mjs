@@ -77,7 +77,6 @@ export function settings(input) {
   if (!/^\d+$/.test(env.TUNNEL_METRICS_PORT) || Number(env.TUNNEL_METRICS_PORT) < 1 || Number(env.TUNNEL_METRICS_PORT) > 65535 || Number(env.TUNNEL_METRICS_PORT) === Number(env.PORT)) throw new Error("invalid TUNNEL_METRICS_PORT");
   env.DATA_DIR ||= "/data";
   env.BIND_HOST ||= "0.0.0.0";
-  env.POOLS ||= "{}";
   env.CONTROLLER_NAME ||= env.CONTROL_HOST;
   env.REQUIRE_DEPLOY_AUTH = flag(env.REQUIRE_DEPLOY_AUTH, "REQUIRE_DEPLOY_AUTH", "1");
   env.AUTO_TUNNEL = flag(env.AUTO_TUNNEL, "AUTO_TUNNEL", "1");

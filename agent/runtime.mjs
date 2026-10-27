@@ -6,6 +6,13 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export const OWNER_LABEL = "io.runners.owner";
 export const COPY_LABEL = "io.runners.copy";
+export function resolveServerTag(env, saved = null) {
+  const value = env.SERVER_TAG ?? env.POOL ?? saved?.tag ?? saved?.pool ??
+    (saved?.run && saved?.control === env.CONTROL_URL ? "standalone" : null);
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9-]{0,29}$/.test(value))
+    throw new Error("SERVER_TAG is required: use 1-30 lowercase letters, digits or dashes, or standalone");
+  return value;
+}
 export const namespace = (control) => `runner-${createHash("sha256").update(new URL(control).origin).digest("hex").slice(0, 12)}`;
 export function projectName(owner, key) {
   if (!/^[a-z0-9][a-z0-9-]{0,70}$/.test(key)) throw new Error("invalid application copy name");

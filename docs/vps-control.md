@@ -4,6 +4,8 @@ The only active scheduler is the `runner-control` Docker container on the Billy 
 
 ## State and services
 
+The fleet accepts servers as they connect; it has no desired server count. Every agent has an origin tag (`SERVER_TAG`), including an explicit `standalone` tag. Current groups and their connected counts are observations, not capacity targets. Existing `POOL` values migrate as tags, while `POOL_SIZE`, old pool settings and legacy fixed-count claims cannot restore server targets. The settings migration privately backs up the previous database before removing obsolete targets. App specs, credentials and source versions remain authoritative.
+
 - SQLite: `/home/claude/runner-control/control.db`, containing only app specifications, source versions, app secrets/passwords and operator settings (five tables). Existing source history is retained for rollback.
 - Runtime tables (runs, placements, starts, agent inventory, health, metrics, events and geolocation) use SQLite TEMP tables with `temp_store=MEMORY`. Runtime settings such as cooldowns and metric cursors also stay in RAM. They are never copied back to disk at shutdown.
 - Tunnel mappings and tokens also use an in-memory TEMP table. On every startup the controller lists Cloudflare tunnels, selects exact `runner-<slot>` names, and publishes the mappings only after all pages succeed. Unrelated and deleted tunnels are ignored; duplicate slot names prevent recovery. Connection tokens are fetched only when a machine joins and are kept in RAM until restart. Existing agents retain their own connection credentials.

@@ -58,11 +58,6 @@ export class LocalStore {
       LEFT JOIN main.versions s ON s.name=p.name AND s.version=p.stable
       WHERE v.name IS NULL OR (p.stable IS NOT NULL AND s.name IS NULL) LIMIT 1`).get();
     if (missing) throw new Error(`configuration is incomplete for app ${missing.name}; refusing to issue plans`);
-    const pools = this.db.prepare("SELECT value FROM main.settings WHERE key='pools'").get();
-    if (pools) {
-      const value = JSON.parse(pools.value);
-      if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some((n) => !Number.isInteger(n) || n < 0)) throw new Error("invalid persisted fleet sizes");
-    }
   }
 
   atomic(fn) {

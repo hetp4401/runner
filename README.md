@@ -2,7 +2,7 @@
 
 A self-hosted control plane schedules Docker apps across your own Linux machines and optional GitHub Actions agents. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
-Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Optional **pools** group replaceable machines with a target count; agents with a `START_CMD` can start replacements when the CP asks. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. GitHub-specific setup lives in [`machine.yml`](.github/workflows/machine.yml), including its 355-minute lifetime, 330-minute backstop drain and replacement command. See [How it works](#how-it-works) for the entities and their responsibilities.
+Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Every agent has a required `SERVER_TAG` naming its origin group, or `standalone`. Tags are metadata: the CP accepts supplied servers and has no desired server counts. An explicit `START_CMD` can start that agent's own replacement during a requested handover. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. GitHub-specific setup lives in [`machine.yml`](.github/workflows/machine.yml), including its 355-minute lifetime, 330-minute backstop drain and replacement command. See [How it works](#how-it-works) for the entities and their responsibilities.
 
 - **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
   - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.
@@ -106,7 +106,7 @@ POST   /api/projects/<name>/disable | /enable   stop / start it on every machine
 DELETE /api/projects/<name>                     delete it and its versions
 POST   /api/roll[?machine=N]                    replace machines one at a time
 DELETE /api/roll                                call a roll off: servers go back to their own schedules
-PUT    /api/settings                            {"pools": {"<pool>": 10}, "rebalance": true}  (machines to keep per pool; automatic rebalancing)
+PUT    /api/settings                            {"rebalance": true}  (automatic rebalancing; fixed server targets are rejected)
 POST   /api/projects/<name>/move?from=N[&to=M][&replica=K]  move one copy off machine N (to M, or the machine with the most room)
 POST   /api/machines/<n>/evict[?force=1]        move every placed project off machine n (apps changing as much as they may wait, unless forced)
 POST   /api/projects/<name>/logs?replica=K      watch a replica's live logs: a session, for the WebSocket /admin/api/logs/<session> (the app's password or the admin password)
@@ -114,8 +114,8 @@ POST   /api/projects/<name>/diagnostics        current failure details (the app'
 GET    /api/events?since=&kinds=&app=&machine=&limit=  recent changes; hybrid history is disposable and partly recovered from agents
 DELETE /api/slots/<n>                           retire an empty slot: tunnel, records and DNS names go
 GET    /api/join-token                          the join token (needs the admin password)
-POST   /api/join                                an agent starting up: {"agent", "pool", "url", "label", "want"} -> its slot and tunnel token
-POST   /api/claim?pool=<name>                    machines to start so the pool has its size (for a watchdog outside the pool)
+POST   /api/join                                an agent starting up: {"agent", "tag", "label", "want"} -> its slot, tag and tunnel token
+POST   /api/claim?pool=<name>                    legacy compatibility: returns an empty start list; never creates a server target
 POST   /api/drain                               {"agent": id}, {"run": id} or {"machine": n}: it's going down soon, hand it over
 WS     /api/agent                              (agents) authenticated reports, plans and requests for a fresh report; replaces /api/wake
 WS     /api/logs/stream?session=<id>&run=<run>  (agents) a live log stream for a session
@@ -133,7 +133,7 @@ runnerctl apply examples/hello --port 9000 --replicas 3   # a folder: Dockerfile
 runnerctl apply examples/stremio.yml         # a compose file
 runnerctl apply path/to/Dockerfile myapp --port 8000
 runnerctl status | get <name> [version] | disable <name> | enable <name> | rm <name>   # status marks a doubled-up copy with *
-runnerctl roll [n] | pool <name> <n>
+runnerctl roll [n] | groups
 ```
 
 ## Your own machines
@@ -141,12 +141,12 @@ runnerctl roll [n] | pool <name> <n>
 Any Linux machine with Docker can join. Get the command, token included, from the Fleet page ("Add a machine"), or the token with `runnerctl join-token`, then on the machine:
 
 ```sh
-curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN=<token> sh
+curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN=<token> SERVER_TAG=standalone sh
 ```
 
-Add `LABEL=<name>` to name it on the status pages and `REGION=eu-west` (or another region slug) to label its placement region. A machine joined this way stands on its own (no pool) and keeps its slot across restarts; the web app doesn't show pools at all, it's just one set of machines.
+Add `LABEL=<name>` to name it on the status pages and `REGION=eu-west` (or another region slug) to label its placement region. Set `SERVER_TAG=github`, another origin group, or `standalone`. The server list and Fleet page show observed tags and connected counts, with no targets or missing-server totals.
 
-The installer prints the agent container name after building its local image. The agent takes the lowest free slot and keeps it across restarts. A normal restart uses local code; an explicit roll verifies and stages a new release before restarting, retaining the running release if the download fails. Re-run the installer to update Node and Docker Compose in the image. A host without `POOL` is standalone and doesn't count toward any pool's size.
+The installer prints the agent container name after building its local image. The agent takes the lowest free slot and keeps it across restarts. A normal restart uses local code; an explicit roll verifies and stages a new release before restarting, retaining the running release if the download fails. Re-run the installer to update Node and Docker Compose in the image. New installations must supply `SERVER_TAG`. Existing `POOL` labels migrate as tags; legacy `POOL_SIZE` values are ignored. Known persisted standalone agents retain their identity during migration.
 
 Containers managed by the agent have a fleet-specific `io.runners.owner` label; app containers also have `io.runners.copy`, while the router and connector have `io.runners.component=router` or `tunnel`. The agent checks ownership before stopping or adopting containers, so unrelated Docker workloads can coexist on the host. To remove a host, move its apps off through the dashboard, stop its agent, and remove only that fleet's owned infrastructure containers. Then retire its slot from the web app or with `runnerctl retire <n>` so its tunnel and DNS records are removed.
 
@@ -173,7 +173,7 @@ flowchart LR
 | Machine / slot | The CP's numbered fleet position, with a stable tunnel identity. A replacement host can take the same slot. |
 | Agent | The host's Docker manager. Its private local state keeps its identity across restarts. |
 | Run | One incarnation of an agent. A process crash resumes it; a reboot or deliberate upgrade creates a new run. Old and new runs can overlap on a slot during handover. |
-| Pool / region | Optional labels: a pool manages a target number of replaceable machines; a region constrains app placement. |
+| Server tag / region | A required tag identifies origin, including standalone. An optional region constrains app placement. Neither declares fleet size. |
 
 An app can contain several Compose services. For example, one GDrive replica includes both its app container and WARP container; those services move together.
 
@@ -201,8 +201,8 @@ Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then 
 ### Self-healing
 
 - A departing machine hands over to a replacement on its own slot, without downtime: with a `START_CMD` it starts one for its own slot; without, it restarts its agent.
-- If a pool member dies, members that can start machines start a replacement within about 2 minutes; for a pool whose members can't, whatever watches it starts the slots `POST /api/claim?pool=<name>` returns.
-- On GitHub Actions, the control plane schedules each machine's departure from its reported deadline (a backstop drain at 330 minutes covers a control plane that didn't), and the workflow stops the agent before the 6-hour limit. A run that ends on its own then asks the control plane what's missing and starts it. If the control plane cannot be reached, the watchdog retries when it returns; a sufficiently long CP outage can therefore exhaust short-lived runners. A cancelled run doesn't request replacements: cancelling the runs is how a pool is stopped by hand.
+- If a server disappears, its workloads recover on available servers. New capacity is supplied externally; the CP never fills or trims groups to a fixed count.
+- On GitHub Actions, declared job deadlines still support orderly handovers. An agent with an explicit replacement command can replace itself; fleet-wide quantities are controlled externally, not by `/api/claim`.
 - [`watchdog.yml`](.github/workflows/watchdog.yml) is scheduled every 10 minutes and starts machines if none are left. GitHub runs scheduled workflows late or skips them when it's busy (hours apart has been seen), so it's the backstop, not the mechanism.
 - [`roll.yml`](.github/workflows/roll.yml) restarts the fleet one machine at a time when the agent changes.
 
@@ -212,7 +212,7 @@ Use the [self-hosting guide](docs/self-hosting.md) for Docker setup and recovery
 
 The production server also runs locally for development:
 
-`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `POOLS` (default pool sizes, JSON), `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` can override the bundled agent download URL (default: the controller's own `/agent/` endpoint). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. `BIND_HOST` defaults to 127.0.0.1 for direct Node execution and 0.0.0.0 in Docker; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
+`control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` can override the bundled agent download URL (default: the controller's own `/agent/` endpoint). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. `BIND_HOST` defaults to 127.0.0.1 for direct Node execution and 0.0.0.0 in Docker; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
 The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, backups and migration. [Billy Bishop deployment notes](docs/vps-control.md) describe the existing fleet. Startup also waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
 
@@ -226,8 +226,8 @@ The Docker setup uses a persistent data volume and private `.env` configuration.
 - **Control plane secrets:** two you use, `ADMIN_PASSWORD` (the fleet owner's master password: locked apps and fleet changes need it; the web app asks for it, and `runnerctl` sends it; `FLEET_PASSWORD` and the header `x-fleet-password`, its old names, still work) and `JOIN_TOKEN` (machines join with it: `install.sh` takes it, and the GitHub repos have it as the secret `JOIN_TOKEN`), plus `CF_API_TOKEN`, which only the control plane uses: a Cloudflare token with Tunnel edit on the account and DNS edit on the zone. App passwords are kept by the control plane.
 - **Web app:** changes sent from other sites are refused.
 - **History:** until 2026-10-03 the control plane was a Cloudflare Worker with a Durable Object, and the replica URLs went through the Worker. The Workers free plan's 100,000 requests a day (the machines' check-ins alone were 86,400) is why it moved.
-- **More machines:** raise a pool's size with `runnerctl pool github <n>` (the web app doesn't show pools) (tunnels are made as needed; there's no cap unless `MAX_SLOTS` is set). Change sizes there rather than through the repos' `POOL_SIZE` variable: machines keep re-sending the size they started with, so a change there only takes hold as they're replaced. GitHub Free runs 20 jobs at once, and handovers overlap briefly, so stay at about 18 or fewer. Cloudflare allows 1,000 tunnels per account. Default sizes come from the controller’s `POOLS` environment setting, with persisted settings taking precedence.
-- **Another GitHub account:** a copy of this repo there (public, so Actions minutes are free) is a pool of its own in the same fleet. Give it the `JOIN_TOKEN` secret and the repo variables `CONTROL_URL` (your controller URL), `POOL` (the pool's name), `POOL_SIZE` (how many machines it keeps) and `AGENT_REPO=your-org/runner`, so its machines run this repo's agent and agent changes need no copying. Disable its `roll` workflow: a roll from here already restarts every pool. Workflow changes do need copying there (merge this repo's main into its main; it isn't a fast-forward).
+- **More servers:** start tagged agents through your provider automation or the required-tag join command. The CP schedules onto servers that connect; it never fills a target or retires extra healthy servers.
+- **Another provider or account:** assign a distinct `SERVER_TAG`, supply its servers externally and reuse the fleet join token. Tags group observed machines without pre-registering a capacity or quantity.
 - **The machines are pinned to `ubuntu-24.04`**, not `ubuntu-latest`, so a new Ubuntu release doesn't change the machines under the fleet; move the pin on purpose. The run logs show only the router's and tunnel's logs, never the apps' (the repos are public).
 - **The join token only joins.** A machine started for a slot that's live gets that slot only if the control plane asked for a machine there (a handover's replacement, or a claimed start); otherwise it's given a free slot instead, so the token alone can't take over a live machine's tunnel.
 - **Watchdog pausing:** GitHub pauses scheduled workflows in public repos after 60 days without repo activity.

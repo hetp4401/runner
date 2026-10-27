@@ -40,7 +40,10 @@ try {
 
   const partial = make();
   const before = partial.store.db.prepare("SELECT * FROM main.settings").all();
-  assert.throws(() => partial.control.putSettings({ rebalance: false, pools: { bad: -1 } }), /whole number/);
+  assert.throws(() => partial.store.mutate(() => {
+    partial.control.setSetting("rebalance", "off");
+    throw new Error("fixture failure after configuration write");
+  }), /fixture failure/);
   check("partial configuration edits roll back and still stop further plans", () => {
     assert.deepEqual(partial.store.db.prepare("SELECT * FROM main.settings").all(), before);
     assert.equal(partial.store.failed, true);

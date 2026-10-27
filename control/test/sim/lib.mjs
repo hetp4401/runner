@@ -53,7 +53,7 @@ export class Fleet {
     this.restartLoop = new Set(); // "app@machine" or "app@run": a copy there restarts at every check-in
     this.cpuFromApps = opts.cpuFromApps ?? false; // a server's CPU is its base plus its healthy copies' (4 cores)
     this.log = [];
-    for (const [name, p] of Object.entries(pools)) control.putSettings({ pools: { [name]: p.size } });
+    // Supplier sizes belong to the test's external providers, never the CP.
   }
   alive(pool = null) { return this.servers.filter((s) => s.alive && (!pool || s.pool === pool)); }
   jobs(pool) { return this.alive(pool).length; }
@@ -88,7 +88,7 @@ export class Fleet {
     s.minuteT = minute;
     const status = Object.fromEntries(Object.entries(s.status).map(([k, st]) => [k, { v: st.v, s: st.s, ...(st.r !== undefined ? { r: st.r } : {}), ...(st.e ? { e: st.e } : {}), t0: st.t0, n: st.n ?? 0 }]));
     return {
-      machine: s.machine, run: s.run, agent: s.agent, pool: s.pool, poolSize: this.pools[s.pool].size, starts: true, started: s.started,
+      machine: s.machine, run: s.run, agent: s.agent, protocol: 3, tag: s.pool, pool: s.pool, starts: true, started: s.started,
       ready: s.ready, status, ...(this.reportDeadline ? { deadline: s.deadline } : {}), cpus: 4,
       disk: { free: (this.disk.get(s.machine) ?? 0.5) * 100e9, total: 100e9 },
       metrics: { live: { t: T, h, a }, minutes }, ...extra,

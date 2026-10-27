@@ -69,9 +69,24 @@ await check('departure alerts clear when handover starts and do not transfer to 
   h.status.departures.list[0].leaving=null; h.status.runs[0].started=now;
   assert.equal(h.run('problems().length'),0);
 });
-await check('real missing capacity names its pools and remains visible',()=>{
+await check('legacy server targets do not generate missing-capacity warnings',()=>{
   const h=harness(); h.status.pools.push({name:'missing-pool',size:18,live:0});
-  assert.match(h.run('problems().map(p=>p.text).join(" | ")'),/18 servers missing \(missing-pool: 0\/18 online\)/);
+  assert.equal(h.run('problems().length'),0);
+});
+await check('a departed empty server is history rather than missing capacity',()=>{
+  const h=harness();h.status.runs[0].live=false;h.status.projects[0].enabled=false;
+  assert.equal(h.run('problems().some(p=>p.kind==="gone")'),false);
+  assert.equal(h.run('machineState(1,null).text'),'inactive');
+});
+await check('the join form requires a tag and offers standalone explicitly',()=>{
+  const h=harness(), form=h.run('joinBlock()');
+  assert.match(form,/id="cj-tag" required/);
+  assert.match(form,/value="standalone"/);
+});
+await check('join command values are quoted as literal shell arguments',()=>{
+  const h=harness();
+  h.context.label="host $(printf surprise) 'quoted'";
+  assert.equal(h.run('shellQuote(label)'),"'host $(printf surprise) '\\''quoted'\\'''" );
 });
 await check('a late app response cannot overwrite the next page',async()=>{
   const h=harness(), d=deferred(); h.context.hooks.spec=()=>d.promise;

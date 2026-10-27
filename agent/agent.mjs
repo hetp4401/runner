@@ -8,11 +8,10 @@
 //   CONTROL_URL, JOIN_TOKEN   the control plane and the fleet's join token (required)
 //   RUNNER_DATA   where projects and the agent's ID live (default /var/lib/runner)
 //   AGENT_ID      this agent's ID (default: one made up once and kept in RUNNER_DATA, so a restart gets its slot back)
-//   POOL, POOL_SIZE   the pool this machine belongs to and how many machines it should have (none: a standalone host)
+//   SERVER_TAG    required origin group, e.g. github, or standalone (POOL is a legacy tag alias)
 //   MACHINE       the slot to take, when the machine was started for one
 //   LABEL         what the pages call it (optional; without one it's just its machine number)
-//   START_CMD     a shell command that starts a new machine for slot $SLOT. With it, the agent starts the pool members
-//                 the control plane says are missing, and its own replacement when it's handed over; without it, a
+//   START_CMD     a shell command that starts this machine's replacement for slot $SLOT when handed over; without it, a
 //                 handover restarts the agent (where it runs under a supervisor, it comes back with the latest code)
 //   LIFETIME_MIN  the most this machine runs, in minutes, when whatever runs it stops it then: the control plane plans
 //                 its departure before that. Without it, the machine has no deadline.
@@ -25,17 +24,18 @@ import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
-import { namespace, projectName, fingerprint, resumeState, ownsCompose, ownsInfrastructure, containerHealth,
+import { namespace, projectName, fingerprint, resumeState, resolveServerTag, ownsCompose, ownsInfrastructure, containerHealth,
   privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
 if (env.REGION && !/^[a-z][a-z0-9-]{0,31}$/.test(env.REGION)) throw new Error("REGION must start with a letter and contain up to 32 lowercase letters, digits or dashes");
-const pool = env.POOL || null;
 const base = resolve(env.RUNNER_DATA || "/var/lib/runner");
 const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => "")).trim();
 let saved = null;
 try { saved = JSON.parse(await readFile(`${base}/agent-state.json`, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw new Error("cannot read the saved agent inventory; restore it before restarting"); }
 const resumed = resumeState(saved, bootId, env.CONTROL_URL, Date.now(), env.RUNNER_INSTALL_REVISION);
+const tag = resolveServerTag(env, saved);
+const pool = tag === "standalone" ? null : tag;
 const started = resumed.started;
 const owner = namespace(env.CONTROL_URL);
 const settleBy = started + 10 * 60_000; // open the tunnel by then even if a project is still struggling
@@ -58,8 +58,8 @@ let cachedDesired = saved?.desired || {};
 // What this agent tells the control plane about its machine.
 const deadline = Number(env.LIFETIME_MIN) > 0 ? started + Number(env.LIFETIME_MIN) * 60_000 : undefined;
 const describe = () => ({
+  tag,
   pool,
-  poolSize: pool && env.POOL_SIZE ? Number(env.POOL_SIZE) : undefined, // how many machines the pool should have
   label: env.LABEL || null,
   region: env.REGION || undefined,
   starts: Boolean(env.START_CMD),
@@ -130,7 +130,7 @@ let domain = saved?.domain || "";
 let stateWrites = Promise.resolve();
 function saveState() {
   const data = JSON.stringify({ v: 2, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, previousRun, restartRequested, wasReady,
-    installedRevision: env.RUNNER_INSTALL_REVISION || saved?.installedRevision, domain,
+    installedRevision: env.RUNNER_INSTALL_REVISION || saved?.installedRevision, domain, tag,
     recovery, desired: cachedDesired, projects: [...projects], metrics: metrics.history() });
   stateWrites = stateWrites.catch(() => {}).then(async () => {
     const path = `${base}/agent-state.json`;
@@ -624,14 +624,12 @@ async function shutdown(reason, code = 0, { keepTunnel = false } = {}) {
   }
   process.exit(code);
 }
-// Stopped from outside. A pool member is interchangeable, so that means it's going away for good: say so in one last
-// check-in, so its replicas are placed elsewhere straight away. A standalone host is probably just restarting its
-// agent and keeps them.
+// Stopping an agent is a restart, regardless of its origin tag. Preserve its
+// serving tunnel and inventory; deliberate departures use the drain protocol.
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     if (stopping || leaving) return;
-    leaving = Boolean(pool);
-    (leaving ? sync().catch(() => {}) : Promise.resolve()).finally(() => shutdown("cancelled", 0, { keepTunnel: !pool }));
+    saveState().finally(() => shutdown("cancelled", 0, { keepTunnel: true }));
   });
 }
 
@@ -716,7 +714,7 @@ async function main() {
   await privateDirectory(dir);
   await privateDirectory(deploymentsDir);
   await join();
-  log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}${pool ? `, pool ${pool}` : ""}`);
+  log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}, tag ${tag}`);
   routerName = await selectInfrastructure("router");
   tunnelName = await selectInfrastructure("tunnel");
   metricsSystem.add(routerName); metricsSystem.add(tunnelName);
@@ -792,7 +790,6 @@ async function main() {
         cleaned = true;
         await removeLeftovers(plan.desired);
       }
-      if (env.START_CMD) for (const m of plan.start ?? []) startMachine(m);
       if (plan.handover && !env.START_CMD && Date.now() - lastUpgradeAttempt >= 60_000) {
         lastUpgradeAttempt = Date.now();
         try {

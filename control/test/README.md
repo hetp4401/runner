@@ -9,7 +9,7 @@ control/test/placement.sh   # replicas and placement by capacity
 control/test/moves.sh       # moving replicas, evicting a machine
 control/test/rebalance.sh   # the hot rule over minute summaries, the cooldown, switching it off
 control/test/replicas.sh    # replica numbers, their routes and DNS names
-control/test/pools.sh       # pool sizes, who starts machines, draining by agent ID
+control/test/pools.sh       # passive capacity, mandatory origin tags and legacy migration
 control/test/auth.sh        # what needs an app's password, the admin password, or nothing (prints ok/WRONG)
 control/test/clashes.sh     # port and container-name clashes in placement, replica-only deploys, the generated compose, the join guard (ok/WRONG)
 control/test/doubling.sh    # more replicas than machines: second copies with moved ports, their routes, moves by replica (ok/WRONG)
@@ -24,8 +24,7 @@ They need Node 24 (`node:sqlite`), `jq` and `curl`, and use ports 8911 (control 
 
 `sim/*.test.mjs` run the real control plane in-process (SQLite in memory, a fake Cloudflare API) on a fake clock,
 against a simulated fleet (`sim/lib.mjs`): servers that join, check in every 20 seconds, build what they're told, fail
-or crash when a scenario says so, report minute summaries (CPU, steal, memory, per app), disk and restarts, start the
-servers their pool asks for within their account's job cap, hand over, and stop at their deadline. Hours of fleet life
+or crash when a scenario says so, report minute summaries (CPU, steal, memory, per app), disk and restarts, receive servers supplied by the fixture's external providers within their job cap, hand over, and stop at their deadline. Hours of fleet life
 take seconds. Each prints ok or WRONG per check and exits non-zero on a WRONG.
 
 ```sh
@@ -42,7 +41,9 @@ node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure ho
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
 node control/test/self-hosting.mjs      # initialization, Cloudflare setup, namespace isolation, auth and bundled agents
 node control/test/api-ui-cli-regressions.mjs # request-local SQL errors, browser creation/auth, CLI HTTP failures
-node control/test/ui-lifecycle.mjs       # recovered alerts, missing pools, stale navigation/version/editor responses and modal cancellation
+node control/test/ui-lifecycle.mjs       # current alerts, no server targets, required-tag forms and stale response cancellation
+node control/test/passive-fleet.mjs       # mandatory tags, passive capacity, legacy migration and receipt replay
+node control/test/tag-installer.mjs       # missing/invalid tags rejected before host or network changes
 node control/test/env-order.mjs          # stable environment bytes and workload revisions across controller recovery
 node control/test/client-ip.mjs          # trusted proxy chains, spoofing rejection and socket address fallback
 node control/test/cp-robustness.mjs       # late/old receipts, restart identities, redacted errors, custom regions

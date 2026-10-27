@@ -5,6 +5,9 @@ export function installScript(origin, agentUrl) {
 # Restarts use local code; explicit rolls download and verify a new code release.
 set -eu
 : "\${JOIN_TOKEN:?set JOIN_TOKEN to the fleet join token}"
+SERVER_TAG=\${SERVER_TAG:-\${POOL:-}}
+[ -n "$SERVER_TAG" ] || { echo "Set SERVER_TAG to the server's origin group, or standalone." >&2; exit 1; }
+printf '%s\\n' "$SERVER_TAG" | grep -Eq '^[a-z0-9][a-z0-9-]{0,29}$' || { echo "SERVER_TAG must be 1-30 lowercase letters, digits or dashes." >&2; exit 1; }
 DATA=\${RUNNER_DATA:-/var/lib/runner}
 ORIGIN=${quote(origin)}
 AGENT_URL=${quote(agentUrl)}
@@ -69,7 +72,7 @@ IMAGE="runner-agent:$PACKAGE"
 docker build --pull -t "$IMAGE" "$BUILD_DIR"
 mkdir -p "$DATA"
 DATA=$(cd "$DATA" && pwd -P)
-export JOIN_TOKEN
+export JOIN_TOKEN SERVER_TAG
 # A reinstall selects this image's baseline; old releases remain available on disk.
 [ ! -L "$DATA/agent-code" ] || { echo "Unsafe agent-code directory." >&2; exit 1; }
 [ ! -L "$DATA/agent-code/current.json" ] || { echo "Unsafe agent release selection." >&2; exit 1; }
@@ -96,7 +99,7 @@ if ! docker run -d --name runner-agent --restart unless-stopped --stop-timeout 1
   -v /var/run/docker.sock:/var/run/docker.sock -v "$DATA:$DATA" \\
   -e CONTROL_URL="$ORIGIN" -e AGENT_URL="$AGENT_URL" -e JOIN_TOKEN -e RUNNER_DATA="$DATA" \\
   -e RUNNER_INSTALL_REVISION="$PACKAGE" -e RUNNER_CODE_MANAGED=1 \\
-  -e POOL -e POOL_SIZE -e MACHINE -e ROUTER_PORT -e REGION \\
+  -e SERVER_TAG -e MACHINE -e ROUTER_PORT -e REGION \\
   -e LABEL="\${LABEL:-$(hostname)}" "$IMAGE"; then restore_previous; fi
 sleep 2
 [ "$(docker inspect --format '{{.State.Running}}' runner-agent)" = true ] || restore_previous

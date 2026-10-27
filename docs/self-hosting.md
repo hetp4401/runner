@@ -40,7 +40,7 @@ On each Linux Docker host, use its fleet's join token:
 
 ```sh
 curl -fsSL https://runners.example.com/install.sh |
-  sudo JOIN_TOKEN='your-join-token' LABEL='my-server' sh
+  sudo JOIN_TOKEN='your-join-token' SERVER_TAG=standalone LABEL='my-server' sh
 ```
 
 The installer downloads and verifies **your control plane's bundled agent release**, then builds a local image containing Node, Docker Compose and the agent before replacing an existing agent container. Normal restarts run local code without downloading packages or contacting the CP to fetch code. The agent claims a machine slot and starts its router and Cloudflare connector. Agents receive only their connection token; they do not need the Cloudflare management key, account ID or domain configuration. Each host keeps its agent identity, recovery receipt, cached agent releases and app data under `/var/lib/runner`.
@@ -49,7 +49,7 @@ An explicit agent roll can fetch and verify a new code release while the current
 
 Agents installed with the older four-file downloader can still restart against this CP: its legacy `/agent/agent.mjs` endpoint includes the additional runtime dependency. Those old containers still download packages and code at startup. Re-run the install command on each such host to move it to the local image and get offline restarts; it preserves that host's agent data. Verified bundle hashes describe the raw bundle files, while the legacy entrypoint is served separately for compatibility.
 
-Use one agent per Docker host. `LABEL` is optional; `RUNNER_DATA` can select another absolute host path. `POOL` and `POOL_SIZE` are optional advanced settings for managed groups of machines. A standalone host needs no pool or machine-starting command.
+Use one agent per Docker host. `LABEL` is optional; `RUNNER_DATA` can select another absolute host path. `SERVER_TAG` is required: choose an origin group or `standalone`. Existing `POOL` values are accepted as legacy tags; `POOL_SIZE` has no effect. The CP has no fixed server targets and never removes a server as surplus.
 
 ```sh
 docker logs -f runner-agent
@@ -107,4 +107,4 @@ At initialization, new Docker fleets derive a tunnel namespace from their contro
 
 ## Optional GitHub Actions agents
 
-Set repository variable `CONTROL_URL` to your CP URL and repository secret `JOIN_TOKEN` to its join token. Set `POOL` and `POOL_SIZE` if using a managed pool. `AGENT_REPO` optionally selects a different checkout; otherwise it uses the current repository. Forked workflows stay inactive until `CONTROL_URL` is configured. Agent code changes request a rolling restart; workflow configuration changes can be rolled manually.
+Set repository variable `CONTROL_URL` to your CP URL and repository secret `JOIN_TOKEN` to its join token. Set `SERVER_TAG` to the origin group (the legacy `POOL` variable remains an alias). Supply the machines through your provider automation; the CP does not request a fixed quantity. `AGENT_REPO` optionally selects a different checkout; otherwise it uses the current repository. Forked workflows stay inactive until `CONTROL_URL` is configured. Agent code changes request a rolling restart; workflow configuration changes can be rolled manually.

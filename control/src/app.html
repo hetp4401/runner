@@ -619,19 +619,18 @@ function runsBy() {
 }
 // A slot whose only live run is on its way out.
 const leavingSlot = (n) => S.status.runs.some((r) => r.machine === n && r.live && r.retiring);
-// A slot with no live server whose last run was a pool member, with that pool whole again: the server was replaced
-// (pool members are interchangeable; a replacement takes whatever slot is free), which is routine, not a problem. A
-// standalone host, or a member of a pool that's short, is down.
+// An intentionally retired run is history, not missing capacity.
 const replacedSlot = (n) => {
   const last = S.status.runs.filter((r) => r.machine === n).sort((a, b) => b.seen - a.seen)[0];
-  const pool = last?.pool ? S.status.pools.find((p) => p.name === last.pool) : null;
-  return Boolean(pool && pool.live >= pool.size);
+  const assigned = S.status.projects.some((p) => p.enabled && p.placed.some((x) => x.machine === n && !x.leaving));
+  return Boolean(last?.retiring || last?.handover || last?.draining || !assigned);
 };
+const serverTag = (r) => r?.tag || r?.pool || "standalone";
 function machineState(n, r) {
   if (!r && (S.status.starting ?? []).includes(n)) return { kind: "deploying", text: "being started" };
   if (!r && leavingSlot(n)) return { kind: "leaving", text: "leaving" };
   if (!r && S.status.settling) return { kind: "deploying", text: "not heard from yet" }; // the control plane just (re)started
-  if (!r) return replacedSlot(n) ? { kind: "leaving", text: "replaced" } : { kind: "gone", text: "down" };
+  if (!r) return replacedSlot(n) ? { kind: "leaving", text: "inactive" } : { kind: "gone", text: "down" };
   if (r.handover || r.replacing) return { kind: "deploying", text: "replacing itself" };
   if (r.draining) return { kind: "leaving", text: "going down soon" };
   if (r.departing === "evict") return { kind: "leaving", text: "moving its apps out" };
@@ -760,10 +759,6 @@ function problems() {
     if (list.length > 3) out.push({ kind: "failed", href: "#/activity", text: `${list.length} alerts like this one in the last 2 hours (${ago(st.now - list[0].t)} ago): ${list[0].text}` });
     else for (const a of list) out.push({ kind: "failed", href: a.app ? appHref(a.app) : a.machine ? machineHref(a.machine) : "#/activity", text: `${ago(st.now - a.t)} ago: ${a.text}` });
   }
-  const shortPools = st.pools.filter((p) => p.live < p.size);
-  const short = shortPools.reduce((n, x) => n + x.size - x.live, 0);
-  const starting = (st.starting ?? []).length;
-  if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "server")} missing (${shortPools.map((p) => `${p.name}: ${p.live}/${p.size} online`).join("; ")})${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
   return out;
 }
 const problemList = (list) => list.length
@@ -1445,7 +1440,7 @@ async function saveReplicas(name) {
 // ======================================================================== fleet actions
 // A server that can start its own replacement hands over to it; a contributed server (no pool) restarts its agent
 // in place, and its replicas are unreachable meanwhile.
-const inPlace = (r) => r && !r.pool;
+const inPlace = (r) => r && !r.canReplace;
 async function restartMachine(n) {
   const text = inPlace(runsBy().get(n)) ? "This is a contributed server, so its agent restarts in place: the replicas on it are unreachable for a minute or two."
     : "A replacement takes over before the old one leaves, so nothing goes down.";
@@ -1494,12 +1489,13 @@ async function setRebalance(on) {
     if (r) { toast(`Automatic rebalancing is ${r.rebalance ? "on" : "off"}`); loadStatus(); }
   } catch (e) { fail(e); }
 }
-async function showJoin(label) {
+const shellQuote = (value) => "'" + String(value).replaceAll("'", "'\\''") + "'";
+async function showJoin(label, tag) {
   try {
     const r = await withPassword({ admin: true }, (secret) => api("GET", "/join-token", null, { secret }));
     if (!r) return;
-    const vars = [`JOIN_TOKEN=${r.token}`, label && `LABEL=${JSON.stringify(label)}`].filter(Boolean).join(" ");
-    joinInfo = { command: `curl -fsSL ${location.origin}/install.sh | sudo ${vars} sh`, slots: new Set(S.status.runs.map((x) => x.id)) };
+    const vars = [`JOIN_TOKEN=${shellQuote(r.token)}`, `SERVER_TAG=${shellQuote(tag)}`, label && `LABEL=${shellQuote(label)}`].filter(Boolean).join(" ");
+    joinInfo = { tag, command: `curl -fsSL ${location.origin}/install.sh | sudo ${vars} sh`, slots: new Set(S.status.runs.map((x) => x.id)) };
     view?.status?.();
   } catch (e) { fail(e); }
 }
@@ -1695,6 +1691,7 @@ function machineCards(compact = false) {
   const st = S.status, runs = runsBy(), live = S.metrics?.live ?? {};
   return st.slots.map((n) => {
     const r = runs.get(n), ms = machineState(n, r), h = live[n]?.h;
+    const origin = r ?? st.runs.filter((x) => x.machine === n).sort((a, b) => b.seen - a.seen)[0];
     const apps = st.projects.flatMap((p) => p.placed.filter((x) => x.machine === n).map((x) => ({ p, x })));
     const chips = apps.map(({ p, x }) => {
       const s = r?.projects[keyOn(p, n, x.replica)];
@@ -1704,7 +1701,7 @@ function machineCards(compact = false) {
     const errs = r ? Object.entries(r.projects).filter(([, s]) => s.s === "failed") : [];
     return `<a class="card" href="${machineHref(n)}">
       <div class="row"><span class="name grow">Server ${n}</span>${pill(ms.kind, ms.text)}</div>
-      <div class="meta">${r ? [r.label ? esc(r.label) : "", whereAndHowFar(r)].filter(Boolean).join(" · ") : ms.kind === "deploying" ? "a replacement is starting" : "not checking in"}</div>
+      <div class="meta">${r ? [`tag ${esc(serverTag(r))}`, r.label ? esc(r.label) : "", whereAndHowFar(r)].filter(Boolean).join(" · ") : `${origin ? `tag ${esc(serverTag(origin))} · ` : ""}${ms.kind === "deploying" ? "a replacement is starting" : "not checking in"}`}</div>
       ${h ? `<div class="meta" style="margin-top:6px">CPU ${F.pct(h.cpu)}${meter(h.cpu)} &nbsp; memory ${F.pct(pctOf(h.memUsed, h.memTotal))}${meter(pctOf(h.memUsed, h.memTotal))} ${compact ? "" : spark(hcol(n, "cpu"))}</div>` : ""}
       ${chips ? `<div class="chips">${chips}</div>` : compact ? "" : `<div class="meta" style="margin-top:6px">No apps placed here</div>`}
       ${!compact && errs.length ? `<div class="errbox">${errs.map(([name, s]) => `<div class="item"><b>${esc(name)}</b> v${esc(s.v)}<pre>${esc(s.e || "failed")}</pre></div>`).join("")}</div>` : ""}
@@ -2282,9 +2279,10 @@ function vMachine(n) {
     status() {
       const st = S.status, runs = runsBy(), r = runs.get(n), ms = machineState(n, r);
       const known = st.slots.includes(n) || r;
+      const origin = r ?? st.runs.filter((x) => x.machine === n).sort((a, b) => b.seen - a.seen)[0];
       const startingHere = !r && ((st.starting ?? []).includes(n) || leavingSlot(n));
       setHtml($("#md-head"), `<div class="row"><h1 class="grow">Server ${n}</h1>${pill(ms.kind, ms.text)}</div>
-        <div class="sub">${r ? `${r.label ? `${esc(r.label)} · ` : ""}up ${ago(st.now - r.started)}${whereAndHowFar(r) ? ` · ${whereAndHowFar(r)}` : ""}${r.replacing ? " · a fresh server is starting to take over" : ""}`
+        <div class="sub">${!r && origin ? `tag ${esc(serverTag(origin))} · ` : ""}${r ? `${r.label ? `${esc(r.label)} · ` : ""}tag ${esc(serverTag(r))} · up ${ago(st.now - r.started)}${whereAndHowFar(r) ? ` · ${whereAndHowFar(r)}` : ""}${r.replacing ? " · a fresh server is starting to take over" : ""}`
           : (st.starting ?? []).includes(n) ? "A server is being started for this slot." : leavingSlot(n) ? "On its way out."
           : known ? "Not checking in right now; the charts show what it sent earlier." : "No server has used this slot recently."}</div>${serverFacts(r)}`);
       const apps = st.projects.flatMap((p) => p.placed.filter((x) => x.machine === n).map((x) => ({ p, x })));
@@ -2370,12 +2368,14 @@ function vMetrics() {
 function vFleet() {
   return {
     title: "Fleet",
-    html: `<h1>Fleet</h1><div class="sub">Everyone can see this page; changing anything here needs the admin password.</div>
+    html: `<h1>Fleet</h1><div class="sub">Servers join as they become available. Group tags describe their origin; there are no server targets.</div>
+      <h2>Server groups</h2><div id="fl-groups"></div>
       <h2>Rebalancing</h2><div id="fl-rebalance"></div>
       <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta" id="fl-roll-text"></span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
       <h2>Add a server</h2><div id="fl-join"></div>`,
     status() {
       const st = S.status;
+      setHtml($("#fl-groups"), table(["Tag", "Connected servers"], (st.groups ?? []).map((g) => ({ cells: [esc(g.tag), esc(g.online)] })), { empty: "No servers connected yet" }));
       setHtml($("#fl-rebalance"), `<div class="card"><div class="row"><span class="grow"><b>Automatic rebalancing</b></span>
         <button type="button" class="switch" role="switch" data-act="rebalance" aria-checked="${st.rebalance.on}" aria-pressed="${st.rebalance.on}" aria-label="Automatic rebalancing">${st.rebalance.on ? "✓ On" : "○ Off"}</button></div>${rebalanceLog(10)}</div>`);
       const roll = st.roll;
@@ -2399,10 +2399,11 @@ function vFleet() {
 // The join command: shown after the password, with the newcomers that checked in since.
 function joinBlock() {
   const st = S.status;
-  const newcomers = joinInfo ? st.runs.filter((r) => !joinInfo.slots.has(r.id) && r.live) : [];
-  if (joinInfo) return `${codebox(joinInfo.command)}<p class="hint">The token in it is a secret: anyone who has it can add a server to the fleet.</p>
+  const newcomers = joinInfo ? st.runs.filter((r) => !joinInfo.slots.has(r.id) && r.live && serverTag(r) === joinInfo.tag) : [];
+  if (joinInfo) return `<div class="row"><b class="grow">Tag: ${esc(joinInfo.tag)}</b><button type="button" class="small" data-act="join-new">Another server group</button></div>${codebox(joinInfo.command)}<p class="hint">The token in it is a secret: anyone who has it can add a server to the fleet.</p>
     <div style="margin-top:10px">${newcomers.length ? newcomers.map((r) => `<div class="ok-line">✓ Server ${r.machine} joined${r.label ? ` (${esc(r.label)})` : ""} <a href="${machineHref(r.machine)}">Open</a></div>`).join("") : `<span class="meta">${pill("deploying", "waiting")} for a new server to check in…</span>`}</div>`;
   return `<div class="row" style="align-items:flex-end">
+      <div><label class="f" for="cj-tag">Group tag (required)</label><input id="cj-tag" required pattern="[a-z0-9](?:[a-z0-9]|-){0,29}" maxlength="30" placeholder="group name or standalone" list="cj-tags" autocomplete="off" autocapitalize="off" spellcheck="false" style="width:210px"><datalist id="cj-tags">${[...new Set(["standalone", ...(st.groups ?? []).map((g) => g.tag)])].map((t) => `<option value="${esc(t)}"></option>`).join("")}</datalist></div>
       <div><label class="f" for="cj-label">Name (optional)</label><input id="cj-label" placeholder="its hostname" style="width:180px"></div>
       <button type="button" class="primary" data-act="join">Show the join command</button></div>
     <p class="hint">Showing it needs the admin password, because the command carries the join token. Without the password, ask the fleet's owner for the command.</p>`;
@@ -2423,9 +2424,9 @@ function vContribute() {
         <div id="cj-join"></div>
         <h3>2. Run it on the server</h3>
         <p>It runs <a href="/install.sh" target="_blank" rel="noopener">install.sh</a> from the control plane (read it first if you like), which starts the agent in the container <code>runner-agent</code>. The agent downloads its latest code each time it starts, joins, and keeps its server number across restarts.</p>
-        ${codebox(`curl -fsSL ${o}/install.sh | sudo JOIN_TOKEN=<token> sh`, { copy: false })}
+        ${codebox(`curl -fsSL ${o}/install.sh | sudo JOIN_TOKEN=<token> SERVER_TAG=standalone sh`, { copy: false })}
         <p>That's the shape of it; copy the real one, token filled in, from step 1. Options, as more <code>NAME=value</code> before <code>sh</code>:</p>
-        <ul><li><code>LABEL=&lt;name&gt;</code>: what the pages call it (default: its hostname).</li>
+        <ul><li><code>SERVER_TAG=&lt;group&gt;</code>: required origin group, or <code>standalone</code> for an independent server. Tags do not set server counts.</li><li><code>LABEL=&lt;name&gt;</code>: what the pages call it (default: its hostname).</li>
           <li><code>RUNNER_DATA=&lt;folder&gt;</code>: where it keeps its files (default <code>/var/lib/runner</code>).</li></ul>
         <h3>3. Check it joined</h3>
         <p>Within a minute it shows up under <a href="#/machines">Servers</a>, and new replicas start going to it. Follow it on the server with <code>docker logs -f runner-agent</code>.</p>
@@ -2440,9 +2441,12 @@ function vContribute() {
       else setHtml($("[data-act=join]", box), `Show the join command`);
     },
     click(e) {
-      const b = e.target.closest("[data-act=join]");
+      const b = e.target.closest("[data-act=join],[data-act=join-new]");
       if (!b) return;
-      showJoin($("#cj-label").value.trim());
+      if (b.dataset.act === "join-new") { joinInfo = null; this.status(); return; }
+      const tag = $("#cj-tag");
+      if (!tag.reportValidity()) return;
+      showJoin($("#cj-label").value.trim(), tag.value);
     },
   };
 }
