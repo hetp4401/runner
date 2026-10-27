@@ -3691,7 +3691,8 @@ export class Control {
     if (!isMap(metrics) || r.retire || !this.speaksFor(r, now)) return;
     if (isMap(metrics.live) && isMap(metrics.live.h)) {
       const h = metrics.live.h;
-      this.liveMetrics.set(r.machine, { run: r.id, started: r.started, t: Number(metrics.live.t) || now, h, a: isMap(metrics.live.a) ? metrics.live.a : {} });
+      this.liveMetrics.set(r.machine, { run: r.id, started: r.started, t: Number(metrics.live.t) || now, h, a: isMap(metrics.live.a) ? metrics.live.a : {},
+        ...(isMap(metrics.live.replicas) ? { replicas: metrics.live.replicas } : {}) });
       const list = this.samples.get(r.machine) ?? this.samples.set(r.machine, []).get(r.machine);
       list.push({ t: now, cpu: Number(h.cpu) || 0, mem: h.memTotal ? (100 * (h.memUsed || 0)) / h.memTotal : 0 });
       while (list.length && now - list[0].t > 5 * MIN) list.shift(); // room is judged on the last 3 minutes

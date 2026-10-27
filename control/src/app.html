@@ -340,7 +340,7 @@ const MIN_APP_PASSWORD = 6;
 // Replaces a box's contents on a refresh without disturbing whoever's using it: nothing happens when the markup is
 // the same, a text selection inside it is left alone (the next refresh catches up), and keyboard focus goes back to
 // the control it was on, found again by what it is and does.
-const focusKey = (x) => x.id || `${x.tagName}|${x.dataset.act ?? ""}|${x.dataset.v ?? ""}|${x.dataset.machine ?? ""}|${x.dataset.d ?? ""}|${x.dataset.tab ?? ""}|${x.dataset.metricSort ?? ""}|${x.dataset.rankAll ?? ""}|${x.closest("table")?.getAttribute("aria-label") ?? ""}|${x.getAttribute("href") ?? ""}`;
+const focusKey = (x) => x.id || `${x.tagName}|${x.dataset.act ?? ""}|${x.dataset.v ?? ""}|${x.dataset.machine ?? ""}|${x.dataset.d ?? ""}|${x.dataset.tab ?? ""}|${x.dataset.metricSort ?? ""}|${x.dataset.rankAll ?? ""}|${x.dataset.appAggregate ?? ""}|${x.closest("table")?.getAttribute("aria-label") ?? ""}|${x.getAttribute("href") ?? ""}`;
 function setHtml(el, html) {
   if (!el || el.__html === html) return;
   const sel = getSelection();
@@ -372,11 +372,14 @@ const METRICS = {
   net: { label: "Network", fields: ["netRx", "netTx"], unit: "rate" },
 };
 const savedMetric = localStorage.getItem("metrics-sort");
+const APP_AGGREGATIONS = { total: "Total", avg: "Average", max: "Max", p99: "P99" };
+const savedAggregate = localStorage.getItem("metrics-app-aggregate");
 const S = {
   status: null, statusAt: 0, statusErr: null,
   metrics: null, metricsAt: 0, metricsErr: null,
   range: localStorage.getItem("metrics-range") || "1h",
   metric: Object.hasOwn(METRICS, savedMetric) ? savedMetric : "cpu",
+  appAggregate: Object.hasOwn(APP_AGGREGATIONS, savedAggregate) ? savedAggregate : "total",
   fastUntil: 0, filter: "",
 };
 const pending = { replicas: {} }; // stepper values not saved yet
@@ -589,6 +592,10 @@ const rangeSeg = () => `<span class="seg" role="group" aria-label="Time range">$
   `<button type="button" data-range="${r}" aria-pressed="${r === S.range}">${r}</button>`).join("")}</span>`;
 const metricControls = () => `<div class="row metric-controls"><span class="meta">Sort tables (highest first):</span><span class="seg" role="group" aria-label="Rank usage by">${Object.entries(METRICS).map(([key, metric]) =>
   `<button type="button" data-metric-sort="${key}" aria-pressed="${S.metric === key}">${metric.label}</button>`).join("")}</span></div>`;
+const aggregateLabel = () => ({ total: "total usage", avg: "average per reporting replica", max: "maximum reporting replica", p99: "P99 across reporting replicas" })[S.appAggregate];
+const aggregateControls = () => `<div class="row metric-controls"><span class="meta">Current app usage:</span><span class="seg" role="group" aria-label="App replica aggregation">${Object.entries(APP_AGGREGATIONS).map(([key, label]) =>
+  `<button type="button" data-app-aggregate="${key}" aria-pressed="${S.appAggregate === key}">${label}</button>`).join("")}</span></div>
+  <p class="meta">${esc(aggregateLabel())}. Average, Max and P99 use individual app replicas with readings; P99 is interpolated. Trends show total usage over time.</p>`;
 
 // ======================================================================== fleet facts
 // The run that speaks for each machine: its newest live one that's ready, or its newest if none is ready yet. While a
@@ -1130,23 +1137,63 @@ function usageTable(label, rows, { host = false } = {}) {
   return table(head, descending(rows, (row) => metricValue(row.values, host), (row) => row.id).map((row) => {
     const v = row.values ?? {};
     return { href: row.href, cells: [
-      `${row.href ? `<a href="${esc(row.href)}"><b>${esc(row.label)}</b></a>` : `<b>${esc(row.label)}</b>`}${row.starting ? ' <span class="s">starting</span>' : ""}`,
+      `${row.href ? `<a href="${esc(row.href)}"><b>${esc(row.label)}</b></a>` : `<b>${esc(row.label)}</b>`}${row.starting ? ' <span class="s">starting</span>' : ""}${row.coverage && S.appAggregate !== "total" ? `<div class="s">${esc(replicaCoverage(row, S.metric))}</div>` : ""}`,
       host ? `${F.pct(v.cpu)}${meter(v.cpu)}` : F.cores(v.cpu),
       host ? `${bytes(v.memUsed)} <span class="s">${F.pct(pctOf(v.memUsed, v.memTotal))}</span>` : bytes(v.mem),
       ioUsage(v.diskRead, v.diskWrite, "read", "write"), ioUsage(v.netRx, v.netTx, "in", "out"),
     ] };
   }), { empty: "Nothing reporting right now", num: [1, 2, 3, 4], sort, metricHeaders: true, label: `${label} usage` });
 }
-function liveAppRows(machines = liveRows()) {
-  const apps = new Map();
-  for (const machine of machines) for (const [name, values] of Object.entries(machine.a ?? {})) {
-    const total = apps.get(name) ?? {};
-    for (const key of Object.values(METRICS).flatMap((metric) => metric.fields)) {
-      if (isNum(values?.[key])) total[key] = (total[key] ?? 0) + values[key];
+function replicaReadings(machine, name) {
+  // New agents report each Compose copy separately, including colocated copies.
+  if (machine.replicas && typeof machine.replicas === "object") return Object.entries(machine.replicas)
+    .filter(([, row]) => row?.app === name && Number.isInteger(row.replica) && row.replica > 0 && row.values)
+    .map(([key, row]) => ({ id: `${machine.m}:${key}`, values: row.values }));
+  // Compatibility is exact only when this host has one assigned, reported copy.
+  // Never present a sum of colocated replicas as an individual replica's maximum.
+  const project = M().projects?.find((p) => p.name === name);
+  const copies = (project?.placed ?? []).filter((copy) => copy.machine === machine.m);
+  const reported = Object.keys(machine.status ?? {}).filter((key) => key === name || key.startsWith(`${name}-r`) && /^\d+$/.test(key.slice(name.length + 2)));
+  return copies.length === 1 && reported.length === 1 && reported[0] === copies[0].key && machine.a?.[name]
+    ? [{ id: `${machine.m}:${copies[0].key}`, values: machine.a[name] }] : [];
+}
+function aggregateReplicas(samples, mode) {
+  const values = {}, coverage = {};
+  for (const [metric, info] of Object.entries(METRICS)) {
+    const known = samples.filter((sample) => info.fields.every((key) => isNum(sample.values?.[key])))
+      .sort((a, b) => metricValue(a.values, false, metric) - metricValue(b.values, false, metric) || a.id.localeCompare(b.id));
+    coverage[metric] = known.length;
+    if (!known.length) continue;
+    if (mode === "avg" || mode === "total") {
+      for (const key of info.fields) values[key] = known.reduce((sum, row) => sum + row.values[key], 0) / (mode === "avg" ? known.length : 1);
+    } else {
+      const position = mode === "max" ? known.length - 1 : 0.99 * (known.length - 1);
+      const low = Math.floor(position), high = Math.ceil(position), fraction = position - low;
+      // Keep read/write and inbound/outbound from the same winning replica (or
+      // the same pair of interpolated replicas), instead of mixing two maxima.
+      for (const key of info.fields) values[key] = known[low].values[key] * (1 - fraction) + known[high].values[key] * fraction;
     }
-    apps.set(name, total);
   }
-  return [...apps].map(([name, values]) => ({ id: name, label: appLabel(name), href: name === "_system" ? null : appHref(name), values }));
+  return { values, coverage };
+}
+const replicaCoverage = (row, metric) => `${row.coverage[metric] ?? 0}/${Math.max(row.expected ?? 0, row.coverage[metric] ?? 0)} replicas reporting`;
+function liveAppRows(machines = null) {
+  const fleet = machines == null;
+  machines ??= liveRows();
+  const names = new Set(machines.flatMap((machine) => Object.keys(machine.a ?? {})));
+  const rows = [];
+  for (const name of names) {
+    if (name === "_system" && S.appAggregate !== "total") continue;
+    const samples = machines.flatMap((machine) => replicaReadings(machine, name));
+    const project = M().projects?.find((p) => p.name === name);
+    const placed = (project?.placed ?? []).filter((copy) => machines.some((machine) => machine.m === copy.machine)).length;
+    const expected = fleet ? Math.max(project?.replicas ?? 0, placed) : placed;
+    const result = S.appAggregate === "total" ? { values: Object.fromEntries(Object.values(METRICS).flatMap((info) => info.fields)
+      .map((key) => [key, sumNumbers(machines.map((machine) => machine.a?.[name]?.[key]))])), coverage: null }
+      : aggregateReplicas(samples, S.appAggregate);
+    rows.push({ id: name, label: appLabel(name), href: name === "_system" ? null : appHref(name), expected, ...result });
+  }
+  return rows;
 }
 function appMetricPanel(parent, metric, rows, columns, target) {
   const info = METRICS[metric];
@@ -1157,13 +1204,13 @@ function appMetricPanel(parent, metric, rows, columns, target) {
   panel.className = "ccard metric-panel";
   panel.dataset.metric = metric;
   panel.innerHTML = `<div class="row"><h3 class="grow">${info.label}</h3><button type="button" class="small" data-rank-all="${metric}" data-usage-target="${target}">All apps ↓</button></div>
-    <div class="desc">Top apps now · highest first · ${metric === "cpu" ? "CPU cores" : metric === "mem" ? "bytes used" : metric === "disk" ? "read + write / second" : "in + out / second"}</div>
+    <div class="desc">${esc(aggregateLabel())} · highest first · ${metric === "cpu" ? "CPU cores" : metric === "mem" ? "bytes used" : metric === "disk" ? "read + write / second" : "in + out / second"}</div>
     ${top.length ? `<ol class="metric-rank">${top.map((row, i) => `<li><div class="row"><span class="rank-number">${i + 1}</span>
       ${row.href ? `<a class="rank-name" href="${esc(row.href)}">${esc(row.label)}</a>` : `<span class="rank-name">${esc(row.label)}</span>`}
-      <span class="rank-value">${esc(F[info.unit](value(row)))}</span></div><div class="rank-track" aria-hidden="true"><i style="width:${max > 0 ? (100 * value(row)) / max : 0}%;background:${appColor(row.id)}"></i></div></li>`).join("")}</ol>`
+      <span class="rank-value">${esc(F[info.unit](value(row)))}</span></div>${row.coverage ? `<div class="desc">${esc(replicaCoverage(row, metric))}</div>` : ""}<div class="rank-track" aria-hidden="true"><i style="width:${max > 0 ? (100 * value(row)) / max : 0}%;background:${appColor(row.id)}"></i></div></li>`).join("")}</ol>`
       : '<div class="nodata">No current readings for this metric</div>'}
     ${ranked.length && max === 0 ? '<p class="meta">All current readings are zero.</p>' : ""}
-    <div class="desc">App usage trend · ${esc(M().range)} · ${metric === "net" ? "host-networked containers excluded" : "selected time range"}</div>`;
+    <div class="desc">Total app usage trend · ${esc(M().range)} · ${metric === "net" ? "host-networked containers excluded" : "selected time range"}</div>`;
   const chart = document.createElement("div");
   chart.className = "chart";
   chart.dataset.title = `${info.label} by app`;
@@ -1778,7 +1825,7 @@ function vApp(name, q = new URLSearchParams()) {
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
       <h2>Replicas</h2><div id="ad-replicas"></div>
       <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${aggregateControls()}${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
       <h2>Versions</h2><div id="ad-versions"></div>`,
     status() {
@@ -1853,14 +1900,15 @@ function vApp(name, q = new URLSearchParams()) {
       rebuild(box, () => {
       const ms = machineNums();
       const inst = liveRows().filter((r) => r.a?.[name]).map((r) => ({ r, v: r.a[name] }));
-      const total = (k) => inst.reduce((s, x) => s + (x.v[k] ?? 0), 0);
+      const appUsage = liveAppRows().find((row) => row.id === name);
+      const total = (k) => appUsage?.values[k] ?? null;
       box.insertAdjacentHTML("beforeend", tiles([
-        { label: "CPU", value: F.cores(total("cpu")), sub: `${plural(inst.length, "server")} running it` },
-        { label: "Memory", value: bytes(total("mem")), sub: "all replicas" },
+        { label: "CPU", value: F.cores(total("cpu")), sub: appUsage?.coverage ? replicaCoverage(appUsage, "cpu") : `${plural(inst.length, "server")} running it` },
+        { label: "Memory", value: bytes(total("mem")), sub: aggregateLabel() },
         { label: "Disk read", value: F.rate(total("diskRead")), sub: `write ${F.rate(total("diskWrite"))}` },
         { label: "Network in", value: F.rate(total("netRx")), sub: `out ${F.rate(total("netTx"))}` },
       ]));
-      box.insertAdjacentHTML("beforeend", `<h2>Servers now</h2>${usageTable("Server", inst.map(({ r, v }) => ({
+      box.insertAdjacentHTML("beforeend", `<h2>Servers now <span class="meta">total app usage on each host</span></h2>${usageTable("Server", inst.map(({ r, v }) => ({
         id: r.m, label: `Server ${r.m}`, href: machineHref(r.m), values: v,
       })))}`);
       const A = (k) => combine(ms.map((m) => acol(m, name, k)), "sum");
@@ -2178,7 +2226,7 @@ function vMachine(n) {
     title: `Server ${n}`, wantsMetrics: true,
     html: `<a class="back" href="#/machines">← Servers</a><div id="md-head"></div>
       <h2>Apps here</h2><div id="md-apps"></div>
-      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${metricControls()}<div id="md-charts"><div class="meta">Loading…</div></div>
+      <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${aggregateControls()}${metricControls()}<div id="md-charts"><div class="meta">Loading…</div></div>
       <h2>Fleet actions</h2><div id="md-actions"></div>`,
     status() {
       const st = S.status, runs = runsBy(), r = runs.get(n), ms = machineState(n, r);
@@ -2218,10 +2266,10 @@ function vMachine(n) {
       lineChart(ccard(g, "Memory used"), [{ name: "used", values: H("memUsed") }], { unit: "bytes", ref: { name: "installed", value: x.memTotal ?? Math.max(0, ...(H("memTotal") ?? []).filter(isNum)) } });
       lineChart(ccard(g, "Disk I/O"), [{ name: "read", values: H("diskRead") }, { name: "write", values: H("diskWrite") }], { unit: "rate" });
       lineChart(ccard(g, "Network I/O"), [{ name: "in", values: H("netRx") }, { name: "out", values: H("netTx") }], { unit: "rate" });
-      box.insertAdjacentHTML("beforeend", `<div id="md-usage" class="metric-target"><h2>Apps now</h2>${usageTable("App", liveAppRows(live ? [live] : []))}</div>`);
+      box.insertAdjacentHTML("beforeend", `<div id="md-usage" class="metric-target"><h2>Apps now</h2>${usageTable("App", liveAppRows(live ? [{ m: n, ...live }] : []))}</div>`);
       const apps = section(box, "Apps on this server");
       for (const [key, metric] of Object.entries(METRICS)) {
-        appMetricPanel(apps, key, liveAppRows(live ? [live] : []), (a) => combine(metric.fields.map((field) => acol(n, a, field)), "sum"), "md-usage");
+        appMetricPanel(apps, key, liveAppRows(live ? [{ m: n, ...live }] : []), (a) => combine(metric.fields.map((field) => acol(n, a, field)), "sum"), "md-usage");
       }
       });
     },
@@ -2246,11 +2294,12 @@ function vMetrics() {
       rebuild(box, () => {
       box.insertAdjacentHTML("beforeend", `<h2>Fleet now</h2>${fleetTiles()}`);
       const ms = machineNums(), currentApps = liveAppRows();
-      const apps = section(box, "App usage");
+      box.insertAdjacentHTML("beforeend", `<h2>App usage</h2>${aggregateControls()}`);
+      const apps = document.createElement("div"); apps.className = "grid"; box.append(apps);
       for (const [key, metric] of Object.entries(METRICS)) {
         appMetricPanel(apps, key, currentApps, (a) => combine(ms.flatMap((m) => metric.fields.map((field) => acol(m, a, field))), "sum"), "mx-apps");
       }
-      box.insertAdjacentHTML("beforeend", `<div id="mx-apps" class="metric-target"><h2>All apps now <span class="meta">summed across reporting servers</span></h2>${metricControls()}${usageTable("App", currentApps)}</div>
+      box.insertAdjacentHTML("beforeend", `<div id="mx-apps" class="metric-target"><h2>All apps now <span class="meta">${esc(aggregateLabel())}</span></h2>${metricControls()}${usageTable("App", currentApps)}</div>
         <p class="meta">Per-app network usage excludes containers using host networking.</p>
         <p class="meta">Memory is bytes used; disk is read + write per second; network is in + out per second. Click a column to sort highest first.</p>
         <h2>Servers now</h2>${usageTable("Server", liveRows().map((r) => ({
@@ -2464,6 +2513,13 @@ document.addEventListener("click", async (e) => {
   }
   const retry = e.target.closest("[data-metrics-retry]");
   if (retry) loadMetrics();
+  const aggregate = e.target.closest("[data-app-aggregate]");
+  if (aggregate && Object.hasOwn(APP_AGGREGATIONS, aggregate.dataset.appAggregate)) {
+    S.appAggregate = aggregate.dataset.appAggregate;
+    localStorage.setItem("metrics-app-aggregate", S.appAggregate);
+    $$("[data-app-aggregate]").forEach((button) => button.setAttribute("aria-pressed", button.dataset.appAggregate === S.appAggregate));
+    if (S.metrics) view?.charts?.();
+  }
   const metric = e.target.closest("[data-metric-sort],[data-rank-all]");
   const metricKey = metric?.dataset.metricSort || metric?.dataset.rankAll;
   if (metric && Object.hasOwn(METRICS, metricKey)) {

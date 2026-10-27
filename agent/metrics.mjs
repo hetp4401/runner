@@ -112,15 +112,16 @@ function docker(path) {
 
 // Only the agent's own projects (appOf names the app a compose project belongs to, or null) and its own containers are
 // counted; whatever else runs on the machine isn't this fleet's business.
-async function readContainers(appOf, systemContainers) {
+async function readContainers(appOf, systemContainers, copyOf) {
   const list = (await docker("/containers/json")) ?? []; // running containers
   const out = await Promise.all(list.map(async (c) => {
     const name = (c.Names?.[0] ?? c.Id).replace(/^\//, "");
     const project = c.Labels?.["com.docker.compose.project"];
-    const app = project != null ? appOf(project) : systemContainers.has(name) ? "_system" : null;
+    const copy = project != null ? copyOf?.(project) : null;
+    const app = copy?.app ?? (project != null ? appOf(project) : systemContainers.has(name) ? "_system" : null);
     if (!app) return null;
     const st = await docker(`/containers/${c.Id}/stats?stream=false&one-shot=true`);
-    if (!st) return { id: c.Id, app };
+    if (!st) return { id: c.Id, app, copy };
     const ms = st.memory_stats ?? {};
     const inactive = ms.stats?.inactive_file ?? ms.stats?.total_inactive_file ?? 0;
     let rx = 0, tx = 0;
@@ -133,7 +134,7 @@ async function readContainers(appOf, systemContainers) {
       if (/^read$/i.test(e.op)) br += e.value;
       else if (/^write$/i.test(e.op)) bw += e.value;
     }
-    return { id: c.Id, app, cpuNs: st.cpu_stats?.cpu_usage?.total_usage ?? 0, mem: Math.max(0, (ms.usage ?? 0) - inactive), rx, tx, br, bw };
+    return { id: c.Id, app, copy, cpuNs: st.cpu_stats?.cpu_usage?.total_usage ?? 0, mem: Math.max(0, (ms.usage ?? 0) - inactive), rx, tx, br, bw };
   }));
   return { at: performance.now(), list: out.filter(Boolean) };
 }
@@ -159,9 +160,26 @@ function appSample(a, b) {
   return apps;
 }
 
+// A Compose deployment is one replica, even when it contains several services.
+// Require two complete readings for every running service before reporting it.
+export function replicaSample(a, b) {
+  const before = new Map(a.list.map((c) => [c.id, c]));
+  const copies = new Map(), unavailable = new Set();
+  for (const c of b.list) {
+    if (!c.copy?.key) continue;
+    copies.set(c.copy.key, c.copy);
+    const old = before.get(c.id);
+    if (c.cpuNs == null || old?.cpuNs == null || old.copy?.key !== c.copy.key || old.copy?.app !== c.copy.app || old.copy?.replica !== c.copy.replica) unavailable.add(c.copy.key);
+  }
+  const grouped = (sample) => ({ ...sample, list: sample.list.filter((c) => c.copy?.key && !unavailable.has(c.copy.key)).map((c) => ({ ...c, app: c.copy.key })) });
+  return Object.fromEntries(Object.entries(appSample(grouped(a), grouped(b))).map(([key, values]) => [key, {
+    app: copies.get(key).app, replica: copies.get(key).replica, values,
+  }]));
+}
+
 // ---- the sampler ----
 
-export function startMetrics({ appOf = (project) => project, history = [], systemContainers = SYSTEM_CONTAINERS } = {}) {
+export function startMetrics({ appOf = (project) => project, copyOf = null, history = [], systemContainers = SYSTEM_CONTAINERS } = {}) {
   let host = null;
   let cont = null;
   let latest = null;
@@ -192,7 +210,7 @@ export function startMetrics({ appOf = (project) => project, history = [], syste
     try {
       const now = Date.now();
       const t = now - (now % 60_000);
-      const [h, c] = await Promise.all([readHost(), readContainers(appOf, systemContainers)]);
+      const [h, c] = await Promise.all([readHost(), readContainers(appOf, systemContainers, copyOf)]);
       if (host && cont) {
         const hs = hostSample(host, h);
         const as = appSample(cont, c);
@@ -209,7 +227,8 @@ export function startMetrics({ appOf = (project) => project, history = [], syste
         }
         add(minute.h, hs);
         for (const [app, x] of Object.entries(as)) add((minute.apps[app] ??= acc()), x);
-        latest = { t: now, h: roundAll(hs), a: Object.fromEntries(Object.entries(as).map(([k, v]) => [k, roundAll(v)])) };
+        latest = { t: now, h: roundAll(hs), a: Object.fromEntries(Object.entries(as).map(([k, v]) => [k, roundAll(v)])),
+          ...(copyOf ? { replicas: Object.fromEntries(Object.entries(replicaSample(cont, c)).map(([key, row]) => [key, { ...row, values: roundAll(row.values) }])) } : {}) };
       }
       [host, cont] = [h, c];
     } catch (e) {

@@ -498,10 +498,14 @@ async function diskSpace() {
 
 let ready = false;
 
-// Only this machine's own projects (and the agent's own containers) go into the metrics, under their project's name
-// (a second copy of a project here is compose project <name>-r<k>, but the same app).
+// App totals retain their existing format; live replica samples distinguish
+// separate copies on one host and combine all services within each copy.
 const metricsSystem = new Set(["runner-agent", `${owner}-agent`]);
-const metrics = startMetrics({ appOf: (project) => [...projects].find(([key, p]) => (p.composeProject || key) === project)?.[1].app ?? null,
+const metricCopy = (project) => {
+  const entry = [...projects].find(([key, p]) => (p.composeProject || key) === project);
+  return entry ? { key: entry[0], app: entry[1].app, replica: entry[1].replica } : null;
+};
+const metrics = startMetrics({ appOf: (project) => metricCopy(project)?.app ?? null, copyOf: metricCopy,
   systemContainers: metricsSystem, history: saved?.metrics ?? [] });
 
 // Get a slot and its tunnel token. Keeps trying while the control plane is unreachable or every slot is taken; gives up

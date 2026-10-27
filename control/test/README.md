@@ -47,6 +47,7 @@ node control/test/cp-robustness.mjs       # late/old receipts, restart identitie
 node control/test/agent-plan.mjs          # private source, stable bind paths and safe delegated bind layouts
 node control/test/agent-runtime.mjs       # safe filesystem writes, ownership, health, content identity, offline releases
 node control/test/agent-lifecycle.mjs     # actual agent restarts, preserved inventory and background worker repair
+node control/test/replica-metrics.mjs     # colocated replicas, Average/Max/P99, paired I/O and zero durable writes
 node control/test/agent-launcher.mjs      # verified offline code and tamper rejection
 node control/test/install-script.mjs      # installer preflights, concurrent ownership and rollback after failures
 node control/test/legacy-agent-compat.mjs # existing four-file installers still load the current agent
