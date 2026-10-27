@@ -1300,7 +1300,10 @@ export class Control {
       `FLEET_HOST=${name}-${x.replica}.${this.env.DOMAIN}`,
       `FLEET_DOMAIN=${this.env.DOMAIN}`,
     ];
-    for (const [k, val] of this.appEnv.get(name) ?? []) lines.push(`${k}=${quote(val)}`);
+    // SQLite reloads keys in sorted order. Keep hot edits in that same order so
+    // a controller restart cannot change a copy's content revision on its own.
+    const variables = [...(this.appEnv.get(name) ?? [])].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    for (const [k, val] of variables) lines.push(`${k}=${quote(val)}`);
     return `${lines.join("\n")}\n`;
   }
 
