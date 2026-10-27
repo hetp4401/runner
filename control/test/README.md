@@ -42,6 +42,7 @@ node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure ho
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
 node control/test/self-hosting.mjs      # initialization, Cloudflare setup, namespace isolation, auth and bundled agents
 node control/test/api-ui-cli-regressions.mjs # request-local SQL errors, browser creation/auth, CLI HTTP failures
+node control/test/ui-lifecycle.mjs       # recovered alerts, missing pools, stale navigation/version/editor responses and modal cancellation
 node control/test/client-ip.mjs          # trusted proxy chains, spoofing rejection and socket address fallback
 node control/test/cp-robustness.mjs       # late/old receipts, restart identities, redacted errors, custom regions
 node control/test/agent-plan.mjs          # private source, stable bind paths and safe delegated bind layouts

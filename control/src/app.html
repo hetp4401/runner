@@ -534,7 +534,9 @@ const fail = (e) => toast(e.message, { kind: "failed" });
 
 // A modal sheet. Resolves with what onOk returns (true by default), or null if it's closed. An error thrown by onOk
 // is shown in the sheet, which stays open.
+let cancelSheet = null;
 function sheet({ title, html, ok = "OK", okKind = "primary", cancel = "Cancel", wide = false, onOpen, onOk }) {
+  cancelSheet?.();
   return new Promise((resolve) => {
     const d = $("#sheet");
     d.className = wide ? "wide" : "";
@@ -546,9 +548,12 @@ function sheet({ title, html, ok = "OK", okKind = "primary", cancel = "Cancel", 
     const finish = (v) => {
       if (done) return;
       done = true;
+      if (cancelSheet === dismiss) cancelSheet = null;
       if (d.open) d.close();
       resolve(v);
     };
+    const dismiss = () => finish(null);
+    cancelSheet = dismiss;
     $$("[data-x]", d).forEach((b) => (b.onclick = () => finish(null)));
     // A close event left over from the previous sheet can arrive while this one is open; only a real close counts.
     d.onclose = () => { if (!d.open) finish(null); };
@@ -561,6 +566,7 @@ function sheet({ title, html, ok = "OK", okKind = "primary", cancel = "Cancel", 
         const v = onOk ? await onOk(d) : true;
         finish(v ?? true);
       } catch (e) {
+        if (done) return;
         err.textContent = e.message;
         err.hidden = false;
         if (submit) submit.disabled = false;
@@ -692,6 +698,28 @@ const appUrls = (p, bold = false) => {
 const appHref = (name) => `#/apps/${enc(name)}`;
 const machineHref = (n) => `#/machines/${n}`;
 
+function alertIsActive(a, st, runs) {
+  // Alerts are also an incident history. Once its condition has recovered, an
+  // incident belongs in Activity rather than the current problem count.
+  if (a.cause === "grace") return false; // current outages are reported by dark replicas
+  if (a.cause === "fails-everywhere") {
+    const p = st.projects.find((p) => p.name === a.app);
+    const version = Number(a.text?.match(/\bversion (\d+)\b/)?.[1]);
+    return Boolean(p?.enabled && (!Number.isFinite(version) || p.version === version) && appState(p, runs) !== "live");
+  }
+  if (a.cause === "halted") return Boolean(st.projects.find((p) => p.name === a.app)?.halted);
+  if (a.cause === "departure-waiting") {
+    const r = runs.get(a.machine);
+    const d = st.departures?.list?.find((d) => d.machine === a.machine);
+    return Boolean(r && r.started <= a.t && d?.due && d.wait && !d.leaving);
+  }
+  if (a.cause === "sick-server") {
+    const r = runs.get(a.machine);
+    return Boolean(r?.quarantine && r.started <= a.t);
+  }
+  return true;
+}
+
 function problems() {
   const st = S.status, runs = runsBy(), out = [];
   if (st.dnsError) out.push({ kind: "failed", text: `DNS: ${st.dnsError}` });
@@ -722,7 +750,7 @@ function problems() {
   // What automation gave up on in the last 2 hours (dark replicas, the pause and capped pools have their own lines while they last).
   // The newest alert per cause and subject; more than 3 of one cause are one line (a roll's waits, say).
   const seenAlert = new Set(), byCause = new Map();
-  for (const a of (st.alerts ?? []).filter((x) => st.now - x.t < 2 * 3600_000 && !["dark", "paused", "capped"].includes(x.cause))) {
+  for (const a of (st.alerts ?? []).filter((x) => st.now - x.t < 2 * 3600_000 && !["dark", "paused", "capped"].includes(x.cause) && alertIsActive(x, st, runs))) {
     const key = `${a.cause}|${a.app ?? ""}|${a.machine ?? ""}`;
     if (seenAlert.has(key)) continue;
     seenAlert.add(key);
@@ -732,9 +760,10 @@ function problems() {
     if (list.length > 3) out.push({ kind: "failed", href: "#/activity", text: `${list.length} alerts like this one in the last 2 hours (${ago(st.now - list[0].t)} ago): ${list[0].text}` });
     else for (const a of list) out.push({ kind: "failed", href: a.app ? appHref(a.app) : a.machine ? machineHref(a.machine) : "#/activity", text: `${ago(st.now - a.t)} ago: ${a.text}` });
   }
-  const short = st.pools.reduce((n, x) => n + Math.max(0, x.size - x.live), 0); // the servers the fleet should have that aren't up
+  const shortPools = st.pools.filter((p) => p.live < p.size);
+  const short = shortPools.reduce((n, x) => n + x.size - x.live, 0);
   const starting = (st.starting ?? []).length;
-  if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "server")} missing${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
+  if (short && !waiting) out.push({ kind: "deploying", href: "#/machines", text: `${plural(short, "server")} missing (${shortPools.map((p) => `${p.name}: ${p.live}/${p.size} online`).join("; ")})${starting ? `; ${plural(starting, "replacement")} starting` : ""}` });
   return out;
 }
 const problemList = (list) => list.length
@@ -1711,30 +1740,36 @@ function vApps() {
 
 function vApp(name, q = new URLSearchParams()) {
   const st = { spec: null, shown: null, tab: null, version: null };
+  let disposed = false, specRequest = 0, streamRequest = 0;
   // Live logs: a password opens a session (kept here only while the viewer is open), then a WebSocket streams the
   // replica's container output from its server, through the control plane, which keeps none of it. Leaving the page,
   // closing the viewer or pausing ends the stream; resuming or switching replicas opens a new one.
   const lg = { open: false, secret: null, replica: Number(q.get("logs")) || 1, ws: null, state: "", text: "", err: null, paused: false, ended: false };
   const LOG_KEEP = 400_000; // characters kept on the page (the oldest go)
   const stopStream = () => {
+    streamRequest++;
     const ws = lg.ws;
     lg.ws = null;
-    if (ws) { ws.onclose = null; ws.close(); }
+    if (ws) { ws.onmessage = null; ws.onclose = null; ws.close(); }
   };
   const startStream = async (session = null) => {
     stopStream();
+    const request = streamRequest;
     Object.assign(lg, { text: "", ended: false, err: null, state: "opening…" });
     renderLogs(true);
     try {
       session ??= (await api("POST", `/projects/${enc(name)}/logs?replica=${lg.replica}`, null, { secret: lg.secret })).session;
     } catch (e) {
+      if (disposed || request !== streamRequest) return;
       lg.err = e.message;
       if (e.status === 401) Object.assign(lg, { open: false, secret: null });
       return renderLogs(true);
     }
+    if (disposed || request !== streamRequest || !lg.open || lg.paused) return;
     const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/admin/api/logs/${session}`);
     lg.ws = ws;
     ws.onmessage = (ev) => {
+      if (disposed || lg.ws !== ws) return;
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.t === "log") {
@@ -1755,6 +1790,7 @@ function vApp(name, q = new URLSearchParams()) {
     };
   };
   function renderLogs(fresh = false) {
+    if (disposed) return;
     const box = $("#ad-logs");
     const p = S.status?.projects.find((x) => x.name === name);
     if (!box || !p) return;
@@ -1785,8 +1821,8 @@ function vApp(name, q = new URLSearchParams()) {
     const p = S.status.projects.find((x) => x.name === name);
     try {
       const session = await withPassword({ app: name, admin: !p.hasPassword, why: `Logs can hold secrets and other people's data, so they need ${p.hasPassword ? `${name}'s app password, or the admin password` : "the admin password: this app has no password of its own"}.` },
-        async (secret) => { const r = await api("POST", `/projects/${enc(name)}/logs?replica=${lg.replica}`, null, { secret }); lg.secret = secret; return r.session; });
-      if (!session) return;
+        async (secret) => { const r = await api("POST", `/projects/${enc(name)}/logs?replica=${lg.replica}`, null, { secret }); if (!disposed) lg.secret = secret; return r.session; });
+      if (!session || disposed) return;
       Object.assign(lg, { open: true, paused: false, err: null });
       $("#ad-logs").innerHTML = "";
       startStream(session);
@@ -1796,16 +1832,21 @@ function vApp(name, q = new URLSearchParams()) {
     }
   };
   const loadSpec = async (version) => {
+    const request = ++specRequest;
     try {
-      st.spec = await getSpec(name, version);
+      const spec = await getSpec(name, version);
+      if (disposed || request !== specRequest) return;
+      st.spec = spec;
       st.shown = version;
       renderSpec();
       if (view?.title === name && S.status) view.status(); // the versions list comes with the spec
-    } catch (e) { $("#ad-spec").innerHTML = `<div class="errbox">${esc(e.message)}</div>`; }
+    } catch (e) {
+      if (!disposed && request === specRequest) setHtml($("#ad-spec"), `<div class="errbox">${esc(e.message)}</div>`);
+    }
   };
   function renderSpec() {
     const p = S.status.projects.find((x) => x.name === name);
-    if (!st.spec || !p) return;
+    if (disposed || !st.spec || !p || !$("#ad-spec")) return;
     const files = specFiles(st.spec);
     if (!files.some(([path]) => path === st.tab)) st.tab = files[0]?.[0] ?? null;
     const cur = files.find(([path]) => path === st.tab);
@@ -1821,7 +1862,7 @@ function vApp(name, q = new URLSearchParams()) {
   return {
     title: name, wantsMetrics: true,
     mount() { if (q.get("logs")) setTimeout(() => $("#ad-logs-h")?.scrollIntoView({ block: "start" })); },
-    unmount() { stopStream(); lg.secret = null; },
+    unmount() { disposed = true; specRequest++; stopStream(); lg.open = false; lg.secret = null; },
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
       <h2>Replicas</h2><div id="ad-replicas"></div>
       <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
@@ -1829,6 +1870,7 @@ function vApp(name, q = new URLSearchParams()) {
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
       <h2>Versions</h2><div id="ad-versions"></div>`,
     status() {
+      if (disposed) return;
       const p = S.status.projects.find((x) => x.name === name);
       if (!p) {
         this.missing = true;
@@ -1936,7 +1978,7 @@ function vApp(name, q = new URLSearchParams()) {
       if (act === "rep") { pending.replicas[name] = Math.max(1, Math.min(MAX_REPLICAS, (pending.replicas[name] ?? p.replicas) + Number(b.dataset.d))); if (pending.replicas[name] === p.replicas) delete pending.replicas[name]; return this.status(); }
       if (act === "cancelrep") { delete pending.replicas[name]; return this.status(); }
       if (act === "saverep") return saveReplicas(name);
-      if (act === "view") { await loadSpec(v); this.status(); return $("#ad-spec").scrollIntoView({ behavior: "smooth", block: "start" }); }
+      if (act === "view") { await loadSpec(v); if (disposed) return; this.status(); return $("#ad-spec")?.scrollIntoView({ behavior: "smooth", block: "start" }); }
       if (act === "diff") return showDiff(name, v);
       if (act === "rollback") return rollback(name, v);
       if (act === "logs-open") return openLogs();
@@ -1969,6 +2011,7 @@ let dirty = false;
 function vEditor(name, sample) {
   let latest = null;
   let pwHint = "";
+  let disposed = false;
   const fileRow = (path = "", content = "") => `<div class="file"><div class="row"><input class="grow f-path" placeholder="path, e.g. web/Dockerfile" autocapitalize="off" spellcheck="false" value="${esc(path)}">
     <button type="button" class="small danger" data-act="rmfile">Remove</button></div><textarea class="f-content" spellcheck="false">${esc(content)}</textarea></div>`;
   const taken = (v) => Boolean(S.status?.projects.some((p) => p.name === v));
@@ -2034,6 +2077,7 @@ function vEditor(name, sample) {
       if (/(^|\/)(\.git|node_modules|__pycache__|\.venv)\//.test(path) || path === ".DS_Store") continue;
       if (f.size > 250_000) { skipped.push(path); continue; }
       const text = await f.text();
+      if (disposed) return;
       if (text.includes("\u0000")) { skipped.push(path); continue; }
       if (/^(docker-)?compose\.ya?ml$/i.test(path)) $("#ed-compose").value = text;
       else if (path === "Dockerfile") $("#ed-dockerfile").value = text;
@@ -2091,6 +2135,7 @@ function vEditor(name, sample) {
       // password then serves the deploy, and nothing outlives this view.
       if (name) {
         if (!S.status) await loadStatus();
+        if (disposed) return;
         if (locked(name)) {
           const page = main.innerHTML;
           main.innerHTML = `<a class="back" href="${appHref(name)}">← ${esc(name)}</a><h1>Edit ${esc(name)}</h1>
@@ -2099,7 +2144,7 @@ function vEditor(name, sample) {
             await api("POST", sec.app ? `/projects/${enc(name)}/unlock` : "/unlock", null, { secret: sec });
             return sec;
           });
-          if (location.hash !== current) return; // left meanwhile
+          if (disposed) return;
           if (!secret) { location.hash = appHref(name); return; }
           this.secret = secret;
           main.innerHTML = page;
@@ -2137,8 +2182,10 @@ function vEditor(name, sample) {
         if (!body.port && !/^x-runner:\s*\n(?:[ \t]+\S.*\n)*?[ \t]+port:/m.test(body.compose) && !(latest && !latest.port)) {
           if (!(await confirmSheet("Deploy without a URL?", "No port is set, so the app gets no URL; it still runs. Give it the port it listens on (or <code>x-runner.port</code> in the compose file) to reach it.", "Deploy anyway"))) return;
         }
+        if (disposed) return;
         $("#ed-save").disabled = true;
         $("#ed-save").textContent = "Deploying…";
+        const saveButton = $("#ed-save");
         try {
           const put = (secret) => api("PUT", `/projects/${enc(n)}`, body, { secret });
           let p;
@@ -2147,26 +2194,29 @@ function vEditor(name, sample) {
             try { p = await put(this.secret); } catch (e) { if (e.status !== 401) throw e; p = await withPassword({ app: n }, put); }
           } else p = await withPassword({ app: n }, put);
           if (!p) return;
-          dirty = false;
+          if (!disposed) dirty = false;
           fast();
           toast(p.unchanged ? `${n} is already running that` : `Deploying ${n} v${p.version}`);
-          location.hash = appHref(n);
+          if (!disposed) location.hash = appHref(n);
           loadStatus();
         } catch (e) {
+          if (disposed) return;
           err.innerHTML = `<b>Not deployed:</b> ${esc(e.message)}`;
           err.hidden = false;
           err.scrollIntoView({ behavior: "smooth", block: "center" });
         } finally {
-          $("#ed-save").disabled = false;
-          $("#ed-save").textContent = "Deploy";
+          saveButton.disabled = false;
+          saveButton.textContent = "Deploy";
         }
       };
       if (name) {
         try {
           const p = await api("GET", `/projects/${enc(name)}`);
+          if (disposed) return;
           latest = p;
           fill(p);
         } catch (e) {
+          if (disposed) return;
           if (e.status === 404) { // deleted meanwhile: say so instead of showing an empty form
             dirty = false;
             main.innerHTML = `<a class="back" href="#/apps">← Apps</a><h1>No app called ${esc(name)}</h1><p class="meta">It may have been deleted. <a href="#/apps/new">Deploy a new app</a></p>`;
@@ -2181,6 +2231,7 @@ function vEditor(name, sample) {
         $("#ed-pw-hint").textContent = pwHint;
       }
     },
+    unmount() { disposed = true; this.secret = null; },
     status() {
       // The first status after the page opened: the domain in the name hint, and whether the name is taken.
       if (!name && !this.sawStatus && $("#ed-name")) {
@@ -2446,6 +2497,7 @@ function parseHash() {
 }
 function route() {
   view?.unmount?.();
+  cancelSheet?.();
   const { parts, q } = parseHash();
   const [a, b, c] = parts;
   view = a === "apps" && b === "new" ? vEditor(null, q.get("sample"))
@@ -2491,10 +2543,12 @@ function renderChrome() {
   banner.hidden = !S.statusErr;
   if (S.statusErr) banner.textContent = `${S.statusErr}. ${S.status ? `Showing what it said ${ago(Date.now() - S.statusAt)} ago.` : ""}`;
   if (!S.status) { $("#summary").textContent = S.statusErr ? "" : "Loading…"; return; }
-  const n = problems().filter((x) => x.kind === "failed" || x.kind === "gone").length;
+  const items = problems();
+  const n = items.filter((x) => x.kind === "failed" || x.kind === "gone").length;
+  const pending = items.filter((x) => x.kind === "deploying").length;
   const cp = S.status.controlPlane;
   const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? "Mac controller" : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
-  setHtml($("#summary"), `${controller}${pill(n ? "failed" : "healthy", `${runsBy().size} up${n ? ` · ${n} problem${n === 1 ? "" : "s"}` : ""}`)}`);
+  setHtml($("#summary"), `${controller}${pill(n ? "failed" : pending ? "deploying" : "healthy", `${upCount()} up${n ? ` · ${plural(n, "problem")}` : pending ? ` · ${pending} pending` : ""}`)}`);
 }
 
 // Global controls: copy buttons, the time range and client-side usage ranking.

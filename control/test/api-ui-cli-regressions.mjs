@@ -85,7 +85,7 @@ try {
     let prompts = 0, requests = 0;
     const context = vm.createContext({
       $: (id) => elements[id], S: { status: { requireDeployAuth: requireAuth, projects: [] } },
-      name: null, latest: null, MIN_APP_PASSWORD: 8, checkName: () => true, checkReplicas: () => true,
+      name: null, latest: null, disposed: false, MIN_APP_PASSWORD: 8, checkName: () => true, checkReplicas: () => true,
       formSpec: () => ({ compose: 'services:\n  web:\n    image: nginx\n    ports: ["8080:80"]\n', port: 8080 }),
       enc: encodeURIComponent, esc: (text) => text, dirty: false, fast() {}, toast() {}, appHref: (name) => name,
       location: {}, loadStatus() {},
