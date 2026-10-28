@@ -136,16 +136,6 @@ runnerctl status | get <name> [version] | disable <name> | enable <name> | rm <n
 runnerctl roll [n] | groups
 ```
 
-## Visitor connections
-
-The **Connections** tab shows visitor IPs by app and replica. **Live** means a completed HTTP request was observed within the last minute; **Visited** offers five-minute, fifteen-minute and one-hour windows. Filter by app, replica or IP. Reading this tab or `GET /api/connections` requires the fleet admin password; app passwords and join tokens cannot read visitor IPs. The password and results stay in the page only until it is locked or you leave the view.
-
-Collection runs on each agent, using Caddy's built-in, filtered access logging over loopback UDP. Only the host, peer/client IPs and timestamp are emitted; URLs, cookies, authorization and other headers are removed before encoding. The router trusts `CF-Connecting-IP` only through the existing host-local tunnel. Local health probes and unmapped hosts do not become visitors. [Caddy's logging documentation](https://caddyserver.com/docs/caddyfile/directives/log) describes the underlying logging and sampling mechanism.
-
-The agent deduplicates observations in memory (at most 2,000 app/replica/IP records), and sends at most 512 changed records with its existing reports. The controller retains at most 20,000 records for one hour, outside SQLite, public status, receipts and exports. Results show coverage and dropped observations. No activity database or extra telemetry service is needed. Caddy samples after the first 100 records per second, retaining one in 100 additional records; UDP observations can also be lost under load. Caddy's standard network writer can fall back to its container log while the receiver is unavailable.
-
-This is a recent-activity view, not a socket or unique-person count. Long-running HTTP/WebSocket streams appear when they finish. Requests answered entirely from Cloudflare cache never reach the agent. The page refreshes every ten seconds; observations arrive at the normal agent reporting interval. Agent or controller restarts clear the corresponding in-memory history. Existing agents gain collection after upgrading; the tab reports how many connected agents support it.
-
 ## Your own machines
 
 Any Linux machine with Docker can join. Get the command, token included, from the Fleet page ("Add a machine"), or the token with `runnerctl join-token`, then on the machine:

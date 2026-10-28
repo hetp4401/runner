@@ -18,7 +18,6 @@ import { REGIONS, regionOf, regionForReplica, machineRegion, validRegion } from 
 import { agentPlan, relativeBinds } from "./agent-plan.mjs";
 import { installScript } from "./install-script.mjs";
 import { durableSetting, obsoleteSetting } from "./state-policy.js";
-import { VisitorHistory } from "./connections.mjs";
 
 // How often agents check in: the whole fleet together makes about CHECKINS_PER_DAY check-ins a day, so the interval
 // grows with the number of machines (20 machines: every 20 s; 50: every 43 s). Never under MIN_POLL_S or over
@@ -696,7 +695,6 @@ export class Control {
     this.tunnelRecoveryError = null;
     this.lastCleanup = 0;
     this.liveMetrics = new Map(); // machine -> { run, t, h, a }, the newest sample from the run that speaks for it
-    this.visitors = new VisitorHistory();
     this.pendingMetrics = new Map(); // minute -> { machine: { h, a } }, not yet written
     this.lastRollup = 0;
     this.metricsCache = new Map(); // range -> { at, body }
@@ -891,7 +889,7 @@ export class Control {
         const ip = request.headers.get("x-runner-client-ip") ?? request.headers.get("cf-connecting-ip") ?? "unknown";
         // Passwords are only looked at where they count (fleet changes, changes to apps), so an address refused for
         // wrong guesses can still see everything.
-        const fleet = /^\/(unlock|settings|roll|join-token|connections|machines\/\d+\/evict|slots\/\d+)$/.test(route);
+        const fleet = /^\/(unlock|settings|roll|join-token|machines\/\d+\/evict|slots\/\d+)$/.test(route);
         const appChange = request.method !== "GET" && route.startsWith("/projects/");
         const password = adminPassword(request);
         const admin = (fleet || appChange) && password != null && await this.checkPassword(password, ip);
@@ -1013,11 +1011,6 @@ export class Control {
       if (!ok) throw new HttpError(401, `this needs ${what}`);
     };
     if (method === "GET" && route === "/status") return json(this.status());
-    if (method === "GET" && route === "/connections") {
-      need(admin, "the admin password");
-      return Response.json(this.visitors.query(url.searchParams, Date.now(), [...this.runs.values()], this.projects, this.liveMs),
-        { headers: { "cache-control": "no-store" } });
-    }
     if (method === "GET" && route === "/events") return json(this.events(url.searchParams));
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
@@ -2775,9 +2768,6 @@ export class Control {
     const cpus = Number(body.cpus);
     if (Number.isInteger(cpus) && cpus > 0 && cpus <= 1024) r.cpus = cpus;
     this.takeMetrics(r, body.metrics, now);
-    this.visitors.take(r, body.visitors, now, (app, replica) =>
-      typeof app === "string" && this.projects.has(app) && Number.isInteger(replica) && replica >= 1 && replica <= 50 &&
-      this.copiesOn(app, machine).some((copy) => copy.replica === replica));
     this.noteCopies(r, status, now);
     if (isMap(body.disk) && Number(body.disk.total) > 0) r.disk = { free: Number(body.disk.free) || 0, total: Number(body.disk.total) };
     if (Number.isInteger(body.edges)) r.edges = body.edges;

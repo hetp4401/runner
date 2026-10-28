@@ -75,9 +75,7 @@ jobs:
               if [ "$component" = tunnel ]; then docker stop -t 10 "$container" >/dev/null 2>&1 || true; fi
               echo "::group::$component ($container)"
               docker inspect --format '{{.Name}} {{.State.Status}} {{.Config.Image}}' "$container"
-              # The UDP writer can fall back to stderr while its receiver is down.
-              # Visitor metadata must never appear in public Actions run logs.
-              docker logs --tail 100 "$container" 2>&1 | sed '/http[.]log[.]access[.]visitors/d' || true
+              docker logs --tail 100 "$container" 2>&1 || true
               echo "::endgroup::"
             done
           done
