@@ -25,7 +25,7 @@ import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
 import { namespace, projectName, fingerprint, resumeState, resolveServerTag, ownsCompose, ownsInfrastructure, containerHealth,
-  privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
+  privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, startVisitors, visitorLogging, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
 if (env.REGION && !/^[a-z][a-z0-9-]{0,31}$/.test(env.REGION)) throw new Error("REGION must start with a letter and contain up to 32 lowercase letters, digits or dashes");
@@ -46,6 +46,8 @@ const dir = `${base}/projects`;
 const routerDir = `${base}/router`;
 const deploymentsDir = `${base}/deployments`;
 let routerName = `${owner}-router`, tunnelName = `${owner}-tunnel`;
+let visitors = null;
+let visitorHosts = new Map();
 let machine = saved?.machine || 0; // the slot, from the control plane
 let tunnelToken = saved?.tunnelToken || "";
 let agent = saved?.agent || "";
@@ -396,6 +398,8 @@ function routerJson() {
     match: [{ host: [replicaHost(p.app, p.replica)] }],
     handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }], flush_interval: -1, stream_close_delay: "1h" }],
   }));
+  visitorHosts = new Map([...projects.values()].filter((p) => p.port && domain).map((p) => [replicaHost(p.app, p.replica), p]));
+  const tracking = visitors ? visitorLogging(visitors.port, [...visitorHosts.keys()]) : null;
   routes.push({
     handle: [{
       handler: "static_response",
@@ -406,6 +410,7 @@ function routerJson() {
   });
   return JSON.stringify({
     admin: { listen: `127.0.0.1:${ADMIN_PORT}` },
+    ...(tracking ? { logging: tracking.logging } : {}),
     apps: {
       http: {
         servers: {
@@ -413,6 +418,7 @@ function routerJson() {
             listen: [`127.0.0.1:${ROUTER_PORT}`],
             automatic_https: { disable: true },
             routes,
+            ...(tracking ? { logs: tracking.logs, client_ip_headers: ["Cf-Connecting-Ip"] } : {}),
             // The tunnel is on this machine, so it's trusted: the X-Forwarded-* headers it carries (the replica's
             // public host, https, the visitor's address) reach the project instead of being replaced by this
             // machine's own. Projects that build links from them get their public address.
@@ -583,9 +589,11 @@ async function sync() {
   const t0 = Date.now();
   const edges = ready ? await tunnelEdges() : undefined;
   const disk = await diskSpace();
-  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 3, recovery };
+  const visitorPayload = visitors?.payload();
+  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 3, recovery,
+    ...(visitorPayload ? { visitors: visitorPayload } : {}) };
   const linked = await controlLink.report(body);
-  if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); return linked; }
+  if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); if (visitorPayload) visitors.confirm(visitorPayload); return linked; }
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
     method: "POST",
     headers: { authorization: `Bearer ${env.JOIN_TOKEN}`, "content-type": "application/json" },
@@ -595,6 +603,7 @@ async function sync() {
   rtt = Date.now() - t0;
   if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 200)}`);
   metrics.confirm(sent);
+  if (visitorPayload) visitors.confirm(visitorPayload);
   return res.json();
 }
 
@@ -717,6 +726,10 @@ async function main() {
   log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}, tag ${tag}`);
   routerName = await selectInfrastructure("router");
   tunnelName = await selectInfrastructure("tunnel");
+  visitors = await startVisitors({ copyForHost: (host) => visitorHosts.get(host), onError: log }).catch(() => {
+    log("visitor collector unavailable; applications keep serving");
+    return null;
+  });
   metricsSystem.add(routerName); metricsSystem.add(tunnelName);
   // Existing owned infrastructure and containers keep serving through an agent
   // restart or host reboot. Recreate only infrastructure that is actually down.

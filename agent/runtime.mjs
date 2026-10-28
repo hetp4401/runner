@@ -1,8 +1,101 @@
-// Host-local runtime helpers. No network calls or dependencies.
+// Host-local runtime helpers. No external dependencies.
 import { createHash, randomUUID } from "node:crypto";
+import { createSocket } from "node:dgram";
+import { isIP } from "node:net";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+
+// Best-effort visitor observations, never request bodies, URLs or credentials.
+// Caddy emits tiny UDP access records on loopback; neither collection nor a
+// missing collector can hold an HTTP response open waiting for this process.
+export class VisitorBuffer {
+  constructor({ limit = 2000, keepMs = 3600_000 } = {}) {
+    this.limit = limit;
+    this.keepMs = keepMs;
+    this.rows = new Map();
+    this.dirty = new Map();
+    this.dropped = 0;
+    this.prunedAt = 0;
+  }
+  observe(app, replica, ip, now = Date.now()) {
+    if (typeof ip !== "string" || !isIP(ip) || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(app) || !Number.isInteger(replica) || replica < 1 || replica > 50) return;
+    if (ip.startsWith("::ffff:") && isIP(ip.slice(7)) === 4) ip = ip.slice(7);
+    else if (isIP(ip) === 6) ip = new URL(`http://[${ip}]/`).hostname.slice(1, -1);
+    if (ip === "::1" || ip.startsWith("127.")) return;
+    if (now - this.prunedAt >= 30_000) this.prune(now);
+    const key = `${app}|${replica}|${ip}`, previous = this.rows.get(key);
+    if (!previous && this.rows.size >= this.limit) {
+      const oldest = this.rows.keys().next().value;
+      this.rows.delete(oldest); this.dirty.delete(oldest); this.dropped++;
+    }
+    const row = { app, replica, ip, first: previous?.first ?? now, last: now };
+    this.rows.delete(key); this.rows.set(key, row);
+    this.dirty.set(key, row);
+  }
+  prune(now = Date.now()) {
+    for (const [key, row] of this.rows) if (now - row.last > this.keepMs) { this.rows.delete(key); this.dirty.delete(key); }
+    this.prunedAt = now;
+  }
+  payload(now = Date.now()) {
+    this.prune(now);
+    return { v: 1, dropped: this.dropped, rows: [...this.dirty.values()].slice(0, 512) };
+  }
+  confirm(payload) {
+    for (const row of payload.rows) {
+      const key = `${row.app}|${row.replica}|${row.ip}`;
+      if (this.dirty.get(key)?.last === row.last) this.dirty.delete(key);
+    }
+  }
+}
+
+export async function startVisitors({ copyForHost, onError = () => {} }) {
+  const buffer = new VisitorBuffer(), socket = createSocket("udp4");
+  let second = 0, received = 0;
+  socket.on("message", (bytes, peer) => {
+    const now = Date.now(), tick = Math.floor(now / 1000);
+    if (tick !== second) { second = tick; received = 0; }
+    if (++received > 1000 || bytes.length > 4096 || peer.address !== "127.0.0.1") { buffer.dropped++; return; }
+    try {
+      const request = JSON.parse(bytes.toString()).request;
+      // Trust a forwarded client address only from the host-local tunnel. The
+      // router trusts CF-Connecting-IP, which Cloudflare sets at its edge.
+      if (!request || !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.remote_ip)) return;
+      const host = typeof request.host === "string" ? request.host.toLowerCase().replace(/:\d+$/, "") : "";
+      const copy = copyForHost(host);
+      if (copy) buffer.observe(copy.app, copy.replica, request.client_ip, now);
+    } catch { /* malformed datagrams are discarded */ }
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("error", reject);
+    socket.bind(0, "127.0.0.1", () => { socket.off("error", reject); resolve(); });
+  });
+  socket.on("error", () => onError("visitor collector unavailable"));
+  socket.unref();
+  const cleanup = setInterval(() => buffer.prune(), 30_000);
+  cleanup.unref();
+  return { port: socket.address().port, payload: () => buffer.payload(), confirm: (payload) => buffer.confirm(payload),
+    close: () => { clearInterval(cleanup); socket.close(); } };
+}
+
+export function visitorLogging(port, hosts) {
+  const access = "http.log.access.visitors";
+  return {
+    logging: { logs: {
+      default: { exclude: [access] },
+      visitors: {
+        include: [access],
+        writer: { output: "net", address: `udp/127.0.0.1:${port}`, dial_timeout: "10ms", soft_start: true },
+        encoder: { format: "filter", wrap: { format: "json" }, fields: Object.fromEntries([
+          "request>remote_port", "request>proto", "request>method", "request>uri", "request>headers", "request>tls",
+          "resp_headers", "user_id", "bytes_read", "duration", "size", "status",
+        ].map((key) => [key, { filter: "delete" }])) },
+        sampling: { interval: 1_000_000_000, first: 100, thereafter: 100 },
+      },
+    } },
+    logs: { logger_names: Object.fromEntries(hosts.map((host) => [host, ["visitors"]])), skip_unmapped_hosts: true },
+  };
+}
 
 export const OWNER_LABEL = "io.runners.owner";
 export const COPY_LABEL = "io.runners.copy";

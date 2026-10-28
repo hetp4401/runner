@@ -51,8 +51,8 @@
   @media (max-width: 760px) {
     header.top { backdrop-filter: none; background: var(--bg); } /* a filter would make it the tab bar's containing block */
     nav.tabs { position: fixed; left: 0; right: 0; bottom: 0; margin: 0; z-index: 6; background: var(--surface); border-top: 1px solid var(--line);
-               padding: 4px 4px calc(4px + env(safe-area-inset-bottom)); justify-content: space-around; }
-    nav.tabs a { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; padding: 6px 0; min-height: 50px; }
+               padding: 4px 4px calc(4px + env(safe-area-inset-bottom)); justify-content: space-around; overflow-x: auto; }
+    nav.tabs a { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; padding: 6px 0; min-height: 50px; min-width: 66px; }
     nav.tabs a i { display: block; font-size: 18px; line-height: 1.1; }
     main { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
     #summary .long { display: none; }
@@ -279,6 +279,7 @@
       <a href="#/machines" data-nav="machines"><i aria-hidden="true">▤</i>Servers</a>
       <a href="#/activity" data-nav="activity"><i aria-hidden="true">↻</i>Activity</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
+      <a href="#/connections" data-nav="connections"><i aria-hidden="true">◎</i>Connections</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
     </nav>
     <div class="spacer"></div>
@@ -1861,7 +1862,7 @@ function vApp(name, q = new URLSearchParams()) {
     mount() { if (q.get("logs")) setTimeout(() => $("#ad-logs-h")?.scrollIntoView({ block: "start" })); },
     unmount() { disposed = true; specRequest++; stopStream(); lg.open = false; lg.secret = null; },
     html: `<a class="back" href="#/apps">← Apps</a><div id="ad-head"></div><div id="ad-status"></div>
-      <h2>Replicas</h2><div id="ad-replicas"></div>
+      <h2><span class="grow">Replicas</span><a href="#/connections?app=${enc(name)}">Connections →</a></h2><div id="ad-replicas"></div>
       <h2 id="ad-logs-h">Logs</h2><div id="ad-logs"></div>
       <h2><span class="grow">Usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div>${aggregateControls()}${metricControls()}<div id="ad-charts"><div class="meta">Loading…</div></div>
       <h2>Spec</h2><div id="ad-spec"><div class="meta">Loading…</div></div>
@@ -2499,6 +2500,98 @@ function parseHash() {
   const [path, query = ""] = location.hash.replace(/^#\/?/, "").split("?");
   return { parts: path.split("/").filter(Boolean).map(decodeURIComponent), q: new URLSearchParams(query) };
 }
+function vConnections(q) {
+  let secret = null, data = null, error = null, request = null, disposed = false, timer = null, debounce = null;
+  let app = q.get("app") || "", replica = q.get("replica") || "", search = "", window = "1m";
+  const unlockMessage = `<div class="card empty"><p>Visitor IPs are visible to the fleet administrator.</p><button type="button" data-act="visitor-unlock">Unlock connections</button></div>`;
+  function filters() {
+    const projects = S.status?.projects ?? [];
+    const appSelect = $("#co-app"), replicaSelect = $("#co-replica");
+    if (!appSelect) return;
+    setHtml(appSelect, `<option value="">All apps</option>${projects.map((p) => `<option value="${esc(p.name)}"${p.name === app ? " selected" : ""}>${esc(p.name)}</option>`).join("")}`);
+    const selected = projects.find((p) => p.name === app);
+    setHtml(replicaSelect, `<option value="">All replicas</option>${Array.from({ length: selected?.replicas ?? 50 }, (_, i) => `<option value="${i + 1}"${String(i + 1) === replica ? " selected" : ""}>Replica ${i + 1}</option>`).join("")}`);
+  }
+  function render() {
+    if (disposed || !$("#co-body")) return;
+    $("#co-lock").hidden = !secret;
+    if (!secret) { setHtml($("#co-status"), ""); setHtml($("#co-body"), unlockMessage); return; }
+    const c = data?.collectors;
+    setHtml($("#co-status"), error ? `<span role="alert">${esc(error)}</span> <button type="button" class="small" data-act="visitor-refresh">Retry</button>`
+      : data ? `${plural(data.uniqueIPs, "observed IP")} · ${c.reporting}/${c.online} agents reporting · ${c.lastReport ? `latest report ${ago(Date.now() - c.lastReport)} ago` : "waiting for the first agent report"}${request ? " · refreshing…" : ""}` : "Loading connections…");
+    if (!data) { setHtml($("#co-body"), `<div class="card empty">${error ? "Connections could not be loaded." : "Loading…"}</div>`); return; }
+    const notes = `${c.reporting < c.online ? `<p class="meta">${c.online - c.reporting} servers have not reported visitor activity yet. New agent code is required on those servers.</p>` : ""}${c.dropped ? `<p class="meta">The collection limit was reached. Some observations were dropped.</p>` : ""}${data.truncated ? `<p class="meta">Showing the most recent 500 of ${data.total} app/replica/IP records. Filter by app, replica or IP to narrow the list.</p>` : ""}`;
+    const now = Date.now();
+    const rows = data.rows.map((row) => ({ cells: [
+      `<code>${esc(row.ip)}</code>`,
+      `<a href="${appHref(row.app)}">${esc(row.app)}-${row.replica}</a>`,
+      `<a href="#/machines/${row.machine}">${row.machine}</a>`,
+      `<span title="${esc(new Date(row.first).toLocaleString())}">${esc(clock(row.first))}</span>`,
+      `<span title="${esc(new Date(row.last).toLocaleString())}">${esc(ago(Math.max(0, now - row.last)))} ago</span>${now - row.last <= 60_000 ? ` <span class="pill healthy">Live</span>` : ""}`,
+    ] }));
+    setHtml($("#co-body"), notes + table(["IP address", "App / replica", "Server", "First observed", "Last seen"], rows, {
+      label: "Visitor IPs", empty: c.reporting ? "No IPs observed in this window with these filters." : "Waiting for agents to report visitor activity.",
+    }));
+  }
+  async function refresh(force = false) {
+    if (disposed || !secret || document.hidden || (request && !force)) return;
+    request?.abort();
+    const controller = new AbortController(); request = controller;
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    render();
+    try {
+      const params = new URLSearchParams({ window });
+      if (app) params.set("app", app);
+      if (replica) params.set("replica", replica);
+      if (search) params.set("q", search);
+      const response = await fetch(`/admin/api/connections?${params}`, { headers: { "x-admin-password": secret.admin }, cache: "no-store", signal: controller.signal });
+      const result = await response.json();
+      if (!response.ok) throw new ApiError(result.error || `HTTP ${response.status}`, response.status);
+      if (disposed || request !== controller) return;
+      data = result; error = null;
+    } catch (e) {
+      if (disposed || request !== controller) return;
+      error = e.name === "AbortError" ? "Connections refresh timed out" : e.message;
+      if (e.status === 401 || e.status === 429) { secret = null; data = null; }
+    } finally {
+      clearTimeout(timeout);
+      if (request === controller) { request = null; render(); }
+    }
+  }
+  function lock() { request?.abort(); request = null; secret = null; data = null; error = null; render(); }
+  const visible = () => { if (!document.hidden) refresh(); };
+  return {
+    title: "Connections",
+    html: `<div class="row"><h1 class="grow">Connections</h1><button type="button" id="co-lock" data-act="visitor-lock" hidden>Lock</button></div>
+      <p class="meta">Live means an IP was seen completing a request in the last minute. Visited shows recent activity for up to one hour.</p>
+      <div class="row wrap"><label class="f">Window <select id="co-window"><option value="1m">Live · last minute</option><option value="5m">Visited · 5 minutes</option><option value="15m">Visited · 15 minutes</option><option value="1h">Visited · 1 hour</option></select></label>
+      <label class="f">App <select id="co-app"><option value="">All apps</option></select></label><label class="f">Replica <select id="co-replica"><option value="">All replicas</option></select></label>
+      <label class="f">IP filter <input id="co-search" type="search" placeholder="IPv4 or IPv6" autocomplete="off"></label></div>
+      <p class="meta" id="co-status" role="status" aria-live="polite"></p><div id="co-body">${unlockMessage}</div>
+      <p class="meta">Refreshes every 10 seconds from the latest agent reports. Only IP and app/replica timestamps are retained, in memory, for one hour. High traffic may be sampled. Open streams appear when they finish; responses served entirely from Cloudflare cache are not observed.</p>`,
+    status() { filters(); render(); },
+    mount() {
+      filters();
+      $("#co-window").onchange = (e) => { window = e.target.value; data = null; refresh(true); };
+      $("#co-app").onchange = (e) => { app = e.target.value; replica = ""; data = null; filters(); refresh(true); };
+      $("#co-replica").onchange = (e) => { replica = e.target.value; data = null; refresh(true); };
+      $("#co-search").oninput = (e) => { search = e.target.value.trim(); clearTimeout(debounce); debounce = setTimeout(() => { data = null; refresh(true); }, 300); };
+      timer = setInterval(() => refresh(), 10_000);
+      document.addEventListener("visibilitychange", visible);
+    },
+    unmount() { disposed = true; clearInterval(timer); clearTimeout(debounce); document.removeEventListener("visibilitychange", visible); lock(); },
+    async click(e) {
+      const action = e.target.closest("button[data-act]")?.dataset.act;
+      if (action === "visitor-lock") return lock();
+      if (action === "visitor-refresh") return refresh(true);
+      if (action === "visitor-unlock") {
+        const result = await withPassword({ admin: true, why: "Visitor IPs require the fleet admin password. It is kept only while this tab is open." }, async (value) => { await api("POST", "/unlock", {}, { secret: value }); return value; });
+        if (!disposed && result) { secret = result; refresh(); }
+      }
+    },
+  };
+}
+
 function route() {
   view?.unmount?.();
   cancelSheet?.();
@@ -2512,6 +2605,7 @@ function route() {
     : a === "machines" ? vMachines()
     : a === "activity" ? vActivity()
     : a === "metrics" ? vMetrics()
+    : a === "connections" ? vConnections(q)
     : a === "fleet" ? vFleet()
     : a === "guide" ? vGuide()
     : a === "contribute" ? vContribute()
@@ -2525,7 +2619,7 @@ function route() {
     if (tr && !e.target.closest("a,button,input,select")) location.hash = tr.dataset.href;
     view.click?.(e);
   };
-  const sec = ["apps", "machines", "activity", "metrics", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
+  const sec = ["apps", "machines", "activity", "metrics", "connections", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
   for (const link of $$("nav.tabs a")) {
     if (link.dataset.nav === sec) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");

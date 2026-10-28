@@ -48,6 +48,8 @@ const control = new Control({
   },
 });
 sql.protect(control);
+const visitorCleanup = setInterval(() => control.visitors.prune(Date.now()), 30_000);
+visitorCleanup.unref();
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -179,6 +181,7 @@ function shutdown(code) {
   if (stopping) return;
   stopping = true;
   clearTimeout(timer);
+  clearInterval(visitorCleanup);
   for (const ws of wss.clients) ws.terminate();
   server.close(() => {
     sql.close();
