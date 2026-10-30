@@ -1,8 +1,22 @@
-# runner
+# Runner: control plane and agent
 
-A self-hosted control plane schedules Docker apps across your own Linux machines and optional GitHub Actions agents. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
+A self-hosted control plane schedules Docker apps across Linux machines. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
-Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Every agent has a required `SERVER_TAG` naming its origin group, or `standalone`. Tags are metadata: the CP accepts supplied servers and has no desired server counts. An explicit `START_CMD` can start that agent's own replacement during a requested handover. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. GitHub-specific setup lives in [`machine.yml`](.github/workflows/machine.yml), including its 355-minute lifetime, 330-minute backstop drain and replacement command. See [How it works](#how-it-works) for the entities and their responsibilities.
+Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Every agent has a required `SERVER_TAG` naming its origin group, or `standalone`. Tags are metadata: the CP accepts supplied servers and has no desired server counts. An explicit `START_CMD` can start that agent's own replacement during a requested handover. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. See [How it works](#how-it-works) for the entities and their responsibilities.
+
+## Modules and documentation
+
+| Module or guide | What it covers |
+| --- | --- |
+| [Control plane](control/README.md) | Controller source, configuration, deployment, operation and development. |
+| [Agent](agent/README.md) | Host agent source, installation, configuration, upgrades and removal. |
+| [Requirements](docs/requirements.md) | Software, permissions, Cloudflare credentials, network access and storage for each module. |
+| [Self-hosting guide](docs/self-hosting.md) | Bring up a controller, join hosts and deploy your first app. |
+| [VPS operations](docs/vps-control.md) | Run, back up, restore and migrate a controller on a server. |
+| [Region affinity](docs/region-affinity.md) | Place workloads using your own region labels. |
+| [Documentation index](docs/README.md) | All guides and the test reference. |
+
+Compute hosts can be VPS instances, dedicated servers or local Linux machines. The current networking implementation requires Cloudflare DNS and Tunnel. The modules communicate over the controller's HTTP/WebSocket API and share no database or host filesystem.
 
 - **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
   - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.
@@ -16,6 +30,8 @@ Run one agent on each Linux Docker host. A standalone host keeps its slot across
 You need Docker Compose, an active domain on Cloudflare and either a scoped Cloudflare API token or a Global API Key plus the account email. The setup discovers the account/zone IDs, generates fleet credentials and creates the control-plane tunnel.
 
 ```sh
+git clone https://github.com/hetp4401/runner.git
+cd runner
 cp .env.example .env
 chmod 600 .env
 # Set DOMAIN and your Cloudflare credential in .env.
@@ -28,10 +44,10 @@ docker compose up -d
 Join each Linux Docker machine using the generated join token:
 
 ```sh
-curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN='your-token' sh
+curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN='your-token' SERVER_TAG=standalone sh
 ```
 
-Installation downloads and verifies the CP's bundled agent release, then builds a local image containing the agent, Node and Docker Compose. Normal agent restarts use that local image or a verified cached release and need no code download. Agents need no Cloudflare management credential. The CP container does not need the Docker socket. See [the complete self-hosting guide](docs/self-hosting.md) for permissions, deployment access, persistence, upgrades and optional GitHub agents.
+Installation downloads and verifies the CP's bundled agent release, then builds a local image containing the agent, Node and Docker Compose. Normal agent restarts use that local image or a verified cached release and need no code download. Agents need no Cloudflare management credential. The CP container does not need the Docker socket. See [the complete self-hosting guide](docs/self-hosting.md) for permissions, deployment access, persistence and upgrades.
 
 ## Projects
 
@@ -144,7 +160,7 @@ Any Linux machine with Docker can join. Get the command, token included, from th
 curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN=<token> SERVER_TAG=standalone sh
 ```
 
-Add `LABEL=<name>` to name it on the status pages and `REGION=eu-west` (or another region slug) to label its placement region. Set `SERVER_TAG=github`, another origin group, or `standalone`. The server list and Fleet page show observed tags and connected counts, with no targets or missing-server totals.
+Add `LABEL=<name>` to name it on the status pages and `REGION=eu-west` (or another region slug) to label its placement region. Set `SERVER_TAG=vps`, another origin group, or `standalone`. The server list and Fleet page show observed tags and connected counts, with no targets or missing-server totals.
 
 The installer prints the agent container name after building its local image. The agent takes the lowest free slot and keeps it across restarts. A normal restart uses local code; an explicit roll verifies and stages a new release before restarting, retaining the running release if the download fails. Re-run the installer to update Node and Docker Compose in the image. New installations must supply `SERVER_TAG`. Existing `POOL` labels migrate as tags; legacy `POOL_SIZE` values are ignored. Known persisted standalone agents retain their identity during migration.
 
@@ -168,14 +184,14 @@ flowchart LR
 | Term | Meaning |
 | --- | --- |
 | App / project | One desired definition: Compose, source files, secrets, replica count and region constraints. |
-| Replica | A numbered instance of an app, such as `gdrive-2`. Its number and public URL survive moves. |
+| Replica | A numbered instance of an app, such as `hello-2`. Its number and public URL survive moves. |
 | Copy | A replica's placement on a machine. During a move, old and new copies can overlap until the new one is healthy. |
 | Machine / slot | The CP's numbered fleet position, with a stable tunnel identity. A replacement host can take the same slot. |
 | Agent | The host's Docker manager. Its private local state keeps its identity across restarts. |
 | Run | One incarnation of an agent. A process crash resumes it; a reboot or deliberate upgrade creates a new run. Old and new runs can overlap on a slot during handover. |
 | Server tag / region | A required tag identifies origin, including standalone. An optional region constrains app placement. Neither declares fleet size. |
 
-An app can contain several Compose services. For example, one GDrive replica includes both its app container and WARP container; those services move together.
+An app can contain several Compose services. For example, an app and its sidecar can share one replica; those services move together.
 
 ### Reports, plans and recovery
 
@@ -202,19 +218,18 @@ Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then 
 
 - A departing machine hands over to a replacement on its own slot, without downtime: with a `START_CMD` it starts one for its own slot; without, it restarts its agent.
 - If a server disappears, its workloads recover on available servers. New capacity is supplied externally; the CP never fills or trims groups to a fixed count.
-- On GitHub Actions, declared job deadlines still support orderly handovers. An agent with an explicit replacement command can replace itself; fleet-wide quantities are controlled externally, not by `/api/claim`.
-- [`watchdog.yml`](.github/workflows/watchdog.yml) is scheduled every 10 minutes and starts machines if none are left. GitHub runs scheduled workflows late or skips them when it's busy (hours apart has been seen), so it's the backstop, not the mechanism.
-- [`roll.yml`](.github/workflows/roll.yml) restarts the fleet one machine at a time when the agent changes.
+- Hosts with a known lifetime can declare a deadline and provide an explicit replacement command. The infrastructure supplying those hosts controls their quantity.
+- The Fleet page or `runnerctl roll` requests an orderly agent upgrade using the release served by the controller.
 
 ## Running the control plane
 
-Use the [self-hosting guide](docs/self-hosting.md) for Docker setup and recovery. [VPS deployment notes](docs/vps-control.md) document the existing Billy Bishop fleet. The Mac and Cloudflare scheduler implementations are inactive historical alternatives; there is no Worker, Durable Object or D1 dependency for scheduling.
+Use the [control plane module guide](control/README.md) for configuration and source entrypoints, the [self-hosting guide](docs/self-hosting.md) for Docker setup, and [VPS operations](docs/vps-control.md) for backups and recovery. Scheduling runs in the controller process with SQLite.
 
 The production server also runs locally for development:
 
 `control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` can override the bundled agent download URL (default: the controller's own `/agent/` endpoint). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. `BIND_HOST` defaults to 127.0.0.1 for direct Node execution and 0.0.0.0 in Docker; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
-The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, backups and migration. [Billy Bishop deployment notes](docs/vps-control.md) describe the existing fleet. Startup also waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
+The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, backups and migration. Startup waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
 
 ## Tests
 
@@ -222,12 +237,9 @@ The Docker setup uses a persistent data volume and private `.env` configuration.
 
 ## Setup notes
 
-- **Repo settings:** variable `CONTROL_URL` (your public controller URL) and secret `JOIN_TOKEN` (the same value as the control plane's `JOIN_TOKEN`). Optional variable `REGION` gives that repository's agents an explicit placement region. Tunnel tokens come from the control plane.
-- **Control plane secrets:** two you use, `ADMIN_PASSWORD` (the fleet owner's master password: locked apps and fleet changes need it; the web app asks for it, and `runnerctl` sends it; `FLEET_PASSWORD` and the header `x-fleet-password`, its old names, still work) and `JOIN_TOKEN` (machines join with it: `install.sh` takes it, and the GitHub repos have it as the secret `JOIN_TOKEN`), plus `CF_API_TOKEN`, which only the control plane uses: a Cloudflare token with Tunnel edit on the account and DNS edit on the zone. App passwords are kept by the control plane.
+- **Agent settings:** `CONTROL_URL` is your controller's public URL and `JOIN_TOKEN` is the fleet join token. Set a required `SERVER_TAG` and optionally `LABEL` and `REGION` on each host. Tunnel connection tokens come from the control plane.
+- **Control plane secrets:** `ADMIN_PASSWORD` authorizes fleet changes and app management; `JOIN_TOKEN` authenticates agents; `STATE_SIGNING_KEY` signs recovery receipts. `CF_API_TOKEN` authorizes the controller's DNS and tunnel management. Keep these credentials and the data volume private and backed up. App passwords are kept by the control plane.
 - **Web app:** changes sent from other sites are refused.
-- **History:** until 2026-10-03 the control plane was a Cloudflare Worker with a Durable Object, and the replica URLs went through the Worker. The Workers free plan's 100,000 requests a day (the machines' check-ins alone were 86,400) is why it moved.
 - **More servers:** start tagged agents through your provider automation or the required-tag join command. The CP schedules onto servers that connect; it never fills a target or retires extra healthy servers.
 - **Another provider or account:** assign a distinct `SERVER_TAG`, supply its servers externally and reuse the fleet join token. Tags group observed machines without pre-registering a capacity or quantity.
-- **The machines are pinned to `ubuntu-24.04`**, not `ubuntu-latest`, so a new Ubuntu release doesn't change the machines under the fleet; move the pin on purpose. The run logs show only the router's and tunnel's logs, never the apps' (the repos are public).
 - **The join token only joins.** A machine started for a slot that's live gets that slot only if the control plane asked for a machine there (a handover's replacement, or a claimed start); otherwise it's given a free slot instead, so the token alone can't take over a live machine's tunnel.
-- **Watchdog pausing:** GitHub pauses scheduled workflows in public repos after 60 days without repo activity.

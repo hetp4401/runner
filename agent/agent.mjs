@@ -8,7 +8,7 @@
 //   CONTROL_URL, JOIN_TOKEN   the control plane and the fleet's join token (required)
 //   RUNNER_DATA   where projects and the agent's ID live (default /var/lib/runner)
 //   AGENT_ID      this agent's ID (default: one made up once and kept in RUNNER_DATA, so a restart gets its slot back)
-//   SERVER_TAG    required origin group, e.g. github, or standalone (POOL is a legacy tag alias)
+//   SERVER_TAG    required origin group, e.g. vps, lab, or standalone (POOL is a legacy tag alias)
 //   MACHINE       the slot to take, when the machine was started for one
 //   LABEL         what the pages call it (optional; without one it's just its machine number)
 //   START_CMD     a shell command that starts this machine's replacement for slot $SLOT when handed over; without it, a

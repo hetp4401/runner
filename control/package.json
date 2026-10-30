@@ -18,7 +18,7 @@
     "dev:cloudflare": "wrangler dev",
     "deploy:cloudflare-archive": "wrangler deploy"
   },
-  "description": "Runner control plane on the Billy Bishop VPS with durable configuration and in-memory runtime state",
+  "description": "Self-hosted Docker workload control plane with durable configuration and in-memory runtime state",
   "devDependencies": {
     "wrangler": "^4.153.0"
   }

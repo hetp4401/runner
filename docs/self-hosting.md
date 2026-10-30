@@ -1,6 +1,6 @@
 # Run your own fleet
 
-The control plane runs in Docker on your server. Agents run on your Linux Docker machines and connect to your control plane. GitHub Actions is optional. No Cloudflare Worker, Durable Object, D1 database or connection to the author's control plane is required.
+The control plane runs in Docker on your server. Agents run on your Linux Docker machines and connect to your control plane. You provide the machines and the controller schedules workloads across them. See the [control plane module](../control/README.md), [agent module](../agent/README.md) and complete [requirements](requirements.md) for each component.
 
 ## Requirements
 
@@ -55,7 +55,7 @@ Use one agent per Docker host. `LABEL` is optional; `RUNNER_DATA` can select ano
 docker logs -f runner-agent
 ```
 
-To remove a host, stop its agent, router and tunnel, then retire its empty slot in the dashboard. App data on that host is local; this system does not replicate Docker volumes between machines.
+To remove a host, first move its apps off through the dashboard and wait for healthy replacements and an empty slot. Then stop its agent and remove only that fleet's owned router and tunnel containers before retiring the slot. App data on that host is local; this system does not replicate Docker volumes between machines. See [agent removal](../agent/README.md#persistent-data-and-removal).
 
 ## Deploy an app
 
@@ -105,6 +105,6 @@ To move an existing Node control plane into Docker, stop the old scheduler first
 
 At initialization, new Docker fleets derive a tunnel namespace from their control hostname and save it in `identity.json`, so they do not adopt another fleet's tunnels in the same Cloudflare account. Changing `CONTROL_HOST` later preserves the existing namespace; conflicting explicit namespace overrides prevent startup. Keep the agents' public CP URL stable when moving the server: agent identity and container ownership are tied to that URL, and agents refuse to reuse another controller's state. A hostname change requires a coordinated identity and workload migration. Give separate fleets separate app domains; identical app names on the same domain would need the same DNS record.
 
-## Optional GitHub Actions agents
+## Add capacity and maintain hosts
 
-Set repository variable `CONTROL_URL` to your CP URL and repository secret `JOIN_TOKEN` to its join token. Set `SERVER_TAG` to the origin group (the legacy `POOL` variable remains an alias). Supply the machines through your provider automation; the CP does not request a fixed quantity. `AGENT_REPO` optionally selects a different checkout; otherwise it uses the current repository. Forked workflows stay inactive until `CONTROL_URL` is configured. Agent code changes request a rolling restart; workflow configuration changes can be rolled manually.
+Join another Linux host with the same controller URL and join token, a required `SERVER_TAG` and an optional `REGION`. The controller uses connected capacity; tags describe a host's origin and do not request a fixed server quantity. Use the [agent guide](../agent/README.md) for configuration and upgrades, and [VPS operations](vps-control.md) for controller maintenance.
