@@ -9,8 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       machine:
-        description: Slot to take (the control plane gives slot n the tunnel runner-n)
-        required: true
+        description: Existing slot for a handover, or 0 to join as a new machine
+        required: false
+        default: "0"
 
 permissions:
   actions: write # the agent starts replacement machines

@@ -48,6 +48,7 @@ const DNS_COMMENT = "runner fleet"; // on the DNS records this makes, so they ca
 const NUMBERED = /-m?\d+$/; // <project>-<k> is replica k's URL and <project>-m<n> machine n's, so no project name ends like that
 const MAX_REPLICAS = 50; // as many as the fleet can have machines; with more replicas than machines, machines run two or more copies
 const ARRIVAL_MS = 3 * 60_000; // after a (re)start, wait this long for the fleet and its metrics before placing anything
+const REGION_LOOKUP_GRACE_MS = 3 * 60_000; // a successor with no location cannot hold regional workloads indefinitely
 const SETTLE_MS = 5 * 60_000; // after a (re)start, machines that haven't checked in yet aren't gone, and pools aren't short or oversized, for this long
 // The same grace follows a gap in check-ins longer than the liveness window: every machine going quiet at once means the
 // control plane was unreachable (its tunnel dropped, say), not that the fleet died. Without it, the first machine back
@@ -1577,8 +1578,14 @@ export class Control {
         for (const x of [...this.copiesOf(p.name)]) {
           const run = up.get(x.machine);
           const region = regionForReplica(spec.policy, x.replica);
-          // Unknown locations wait for the lookup; they aren't a different region.
-          if (x.leaving || !machineRegion(run) || machineRegion(run) === region) continue;
+          if (x.leaving || !run || machineRegion(run) === region) continue;
+          // A known non-US location has no automatic US region. A successor
+          // whose lookup failed also cannot inherit regional copies: after a
+          // short grace, move those copies to eligible hosts while the old run
+          // keeps serving. Ordinary hosts still wait for their first lookup.
+          const locationKnown = Boolean(run.region || run.location);
+          const waitingSuccessor = this.predecessorOf(run, now) && now - run.started >= REGION_LOOKUP_GRACE_MS;
+          if (!locationKnown && !waitingSuccessor) continue;
           const serving = this.liveRuns(now).some((r) => r.machine === x.machine && r.ready &&
             r.status?.[x.key]?.s === "healthy" && r.status[x.key].r !== false);
           // Copies that already have no serving VM are missing capacity, not
@@ -3305,8 +3312,11 @@ export class Control {
   retireStuckSuccessor(r, now) {
     const older = this.predecessorOf(r, now);
     if (!older || now - r.started < 25 * MIN) return;
-    const up = this.liveMachines(now);
-    const stuck = Object.entries(older.status ?? {}).find(([key, st]) => st?.s === "healthy" && st.r !== false &&
+    const desired = this.desiredFor(r.machine, r, r);
+    // Regional copies and copies moving elsewhere are deliberately absent
+    // from this successor's plan. They must not make a healthy replacement
+    // fail the build timeout and take its serving predecessor down with it.
+    const stuck = Object.entries(older.status ?? {}).find(([key, st]) => desired[key] && st?.s === "healthy" && st.r !== false &&
       !(r.status?.[key]?.s === "healthy" && r.status[key].r !== false));
     if (!stuck) return;
     r.retire = 1;

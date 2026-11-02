@@ -36,6 +36,8 @@ Departing, draining, quarantined and already-due runners remain excluded. The sc
 
 When a replacement VM reuses a slot in another region, it cannot inherit the constrained app. The control plane starts another copy in the required region and retains the old serving copy until the new one is healthy and DNS has followed. The successor's tunnel waits for that move, so it cannot replace the old machine's routes prematurely. If no replacement capacity exists, the old copy serves while its machine can stay up; its eventual hard deadline can still cause an outage.
 
+A known location outside the automatic US groups also requires this evacuation. If a successor's location is still unavailable after three minutes, the controller moves its constrained copies to eligible hosts while the predecessor keeps serving. The successor's build timeout checks only apps assigned to it; an app deliberately excluded for region placement or already moving elsewhere cannot cause both hosts to be retired.
+
 Adding or changing an app's region moves existing copies through the normal transition budget. Their URLs and replica numbers remain stable. A region change also cancels a move already headed to the wrong region. Removing the setting permits future placements throughout the fleet.
 
 Changing only the replica count or the private app environment preserves the region because it is part of the versioned Compose specification. Rollback restores the selected version's region along with its files. Existing deployment credentials apply; no agent update or additional credential is required.

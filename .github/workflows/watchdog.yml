@@ -1,28 +1,37 @@
 name: watchdog
 
-# Observe controller health. Providers supply servers without CP capacity targets.
+# Keep this repository's provider capacity supplied. The CP has no size targets.
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+  workflow_run:
+    workflows: [machine]
+    types: [completed]
 
 concurrency:
-  group: watchdog
+  group: provider-capacity
+  cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
   watchdog:
-    if: ${{ vars.CONTROL_URL != '' }}
+    if: ${{ vars.CONTROL_URL != '' && (vars.MACHINE_COUNT != '' || vars.POOL_SIZE != '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Check controller health
-        shell: bash
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.AGENT_REPO || github.repository }}
+          persist-credentials: false
+      - name: Supply missing machines
         env:
+          GH_TOKEN: ${{ github.token }}
           CONTROL_URL: ${{ vars.CONTROL_URL }}
-        run: |
-          curl -fsS --max-time 20 --retry 3 "$CONTROL_URL/api/status" |
-            jq -e '.fleetMode == "passive" and (.groups | type == "array")' >/dev/null
-          echo "Controller is accepting tagged servers."
+          MACHINE_COUNT: ${{ vars.MACHINE_COUNT || vars.POOL_SIZE }}
+          SERVER_TAG: ${{ vars.SERVER_TAG || vars.POOL || 'github' }}
+          MACHINE_REF: ${{ github.event.repository.default_branch }}
+        run: node .github/scripts/capacity.mjs

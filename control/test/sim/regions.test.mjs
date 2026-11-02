@@ -8,6 +8,7 @@ const locations = {
   west2: "San Francisco, California, US · Microsoft Azure Cloud (westus)",
   central: "Des Moines, Iowa, US · Microsoft Azure Cloud (centralus)",
   east: "Boydton, Virginia, US · Microsoft Azure Cloud (eastus)",
+  foreign: "Dublin, Leinster, IE · Cloud provider",
 };
 const app = (region = null, replicas = 1, fixed = false) => ({
   compose: `x-runner:\n  port: 8080\n  replicas: ${replicas}\n${region == null ? "" : Array.isArray(region) ? `  regions: ${JSON.stringify(region)}\n` : `  region: ${region}\n`}services:\n  web:\n    image: traefik/whoami\n    ports: ["8080:8080"]\n${fixed ? "    container_name: region-fixed\n" : ""}`,
@@ -154,6 +155,53 @@ ok("unknown and non-US locations aren't guessed", [null, "", "London, England, G
   }
   await f.run(4 * MIN);
   ok("several non-serving copies in the wrong region can recover without a budget deadlock", staying(c).length === 2 && allIn(c, "us-west") && staying(c).every((x) => c.copyHealthy("web", x, c.liveMachines(T).get(x.machine))));
+}
+
+for (const replacementLocation of ["foreign", "unknown"]) {
+  const { c, f, where } = await setup(["west", "west2"], { reportDeadline: true });
+  deploy(c, "web", app("us-west"));
+  await f.run(4 * MIN);
+  const old = f.alive().find((s) => s.machine === staying(c)[0].machine);
+  const realStart = f.start.bind(f);
+  f.start = async (pool, want) => {
+    const server = await realStart(pool, want);
+    if (server) where.set(server.agent, want === old.machine ? replacementLocation : "west");
+    return server;
+  };
+  c.drain({ agent: old.agent });
+  let dark = false;
+  await f.run(12 * MIN, () => {
+    if (!c.copiesOf("web").some((x) => f.alive().some((s) => s.machine === x.machine && s.ready && s.status[x.key]?.s === "healthy"))) dark = true;
+  });
+  const successor = f.alive().find((s) => s.machine === old.machine && s !== old);
+  ok(`${replacementLocation} successor keeps its slot and becomes ready after regional evacuation`, Boolean(successor?.ready) && !old.alive && c.fleetSize() === 2);
+  ok(`${replacementLocation} successor never loses the app's serving copy or violates affinity`, !dark && allIn(c, "us-west"));
+  if (replacementLocation === "unknown") {
+    const moves = c.recentEvents.filter((event) => event.kind === "move-start" && event.cause === "region" && event.machine === old.machine);
+    ok("unknown successor gets a location grace before regional evacuation", moves.length > 0 && moves.every((event) => event.t >= successor.started + 3 * MIN));
+  }
+}
+
+{
+  const { c, f, where } = await setup(["west", "east"], { reportDeadline: true });
+  deploy(c, "web", app("us-west"));
+  await f.run(4 * MIN);
+  const old = f.alive().find((s) => s.machine === staying(c)[0].machine);
+  const realStart = f.start.bind(f);
+  f.start = async (pool, want) => {
+    const server = await realStart(pool, want);
+    if (server) where.set(server.agent, want === old.machine ? "east" : "west");
+    return server;
+  };
+  c.drain({ agent: old.agent });
+  await f.run(38 * MIN);
+  const successor = f.alive().find((s) => s.machine === old.machine && s !== old);
+  ok("a deliberately excluded regional app cannot retire a successor after 25 minutes", Boolean(successor) && old.alive && !c.runs.get(successor.run).retire && !c.recentEvents.some((event) => event.cause === "stuck-successor"));
+  ok("a regional shortage keeps the predecessor serving", c.copiesOf("web").some((x) => x.machine === old.machine && old.status[x.key]?.s === "healthy"));
+  const added = await f.start("a", 0);
+  where.set(added.agent, "west");
+  await f.run(8 * MIN);
+  ok("new regional capacity completes the waiting handover without dropping the successor", !old.alive && successor.alive && successor.ready && allIn(c, "us-west"));
 }
 
 const threeRegions = ["us-west", "us-central", "us-east"];
