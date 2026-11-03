@@ -41,7 +41,7 @@ sudo docker logs --tail 100 -f runner-agent
 
 The agent receives a slot and a tunnel connection token. Cloudflare's management API credential stays on the controller.
 
-Numbered addresses (`hello-1.example.com`) select the assigned local copy even when its port was remapped. The controller also assigns three protected system-router replicas to separate agent hosts. Their shared ingress serves every app's automatic global address (`hello.example.com`). Agents run these required workloads through the same generic plan executor; no scheduling provider or individual app is built into the agent. See [public addresses](../docs/public-addresses.md).
+Numbered addresses (`hello-1.example.com`) select the assigned local copy even when its port was remapped. Each public app also has a shared tunnel for its automatic global address (`hello.example.com`). The agent connects that tunnel only while a local copy is healthy and ready. A failed local probe withdraws that connector so new requests can reach another replica host. App tunnel tokens stay in the private agent state and never enter app source, Compose files or app environment variables. No individual app or scheduling provider is built into the agent. See [public addresses](../docs/public-addresses.md).
 
 ## Configuration
 
@@ -90,7 +90,7 @@ To remove a host:
 
 1. Use **Move apps off** in the dashboard, or `bin/runnerctl evict <slot>` from the operator machine. Wait for healthy replacement copies and an empty slot.
 2. Stop the agent with `sudo docker stop runner-agent` and remove its container when ready.
-3. Remove only the fleet-owned router and tunnel containers. Ownership uses `io.runners.owner`; infrastructure also has `io.runners.component=router` or `tunnel`. Preserve unrelated containers and any data you still need.
+3. Remove only the fleet-owned router and tunnel containers. Ownership uses `io.runners.owner`; infrastructure also has `io.runners.component=router` or `tunnel`; app connectors use `public-tunnel` and an `io.runners.app` label. Preserve unrelated containers and any data you still need.
 4. Retire the empty slot in the dashboard or with `bin/runnerctl retire <slot>` to remove its tunnel and DNS records.
 
 ## Source and verification

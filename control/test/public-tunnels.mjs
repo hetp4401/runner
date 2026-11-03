@@ -92,7 +92,7 @@ check('connector authorization stays below the provider limit during large deplo
  const copies=c.copiesOf,live=c.liveMachines;c.copiesOf=()=>fake;c.liveMachines=()=>new Map(fake.map(x=>[x.machine,{protocol:5}]));
  assert.equal(c.publicHosts('web').size,20);c.copiesOf=copies;c.liveMachines=live;
 });
-let records=[{id:'global',type:'CNAME',name:'web.sim.example',content:'old-router.cfargotunnel.com',proxied:true,comment:'runner fleet'},
+let records=[{id:'global',type:'CNAME',name:'web.sim.example',content:[...c.slots.values()][0].tunnel+'.cfargotunnel.com',proxied:true,comment:'runner fleet'},
  {id:'external',type:'CNAME',name:'external.sim.example',content:t.id+'.cfargotunnel.com',proxied:true,comment:'external owner'}];
 let dnsWrites=0,deletes=0,denyDelete=true;
 c.cf=async(path,init={})=>{
@@ -106,7 +106,6 @@ c.cf=async(path,init={})=>{
  if(init.method==='DELETE') {if(denyDelete)throw Error('connector still active');deletes++;return {result:{}};}
  assert.match(path,/dns_records/);return {result:structuredClone(records),result_info:{total_pages:1}};
 };
-c.globalTunnel='old-router';
 await c.syncDns();
 check('cutover adopts the existing global domain while preserving external aliases',()=>{
  const r=records.find(x=>x.name==='web.sim.example');assert.equal(r.content,t.id+'.cfargotunnel.com');assert.equal(r.comment,'runner fleet');

@@ -279,7 +279,6 @@
       <a href="#/machines" data-nav="machines"><i aria-hidden="true">▤</i>Servers</a>
       <a href="#/activity" data-nav="activity"><i aria-hidden="true">↻</i>Activity</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
-      <a href="#/routing" data-nav="routing"><i aria-hidden="true">⇄</i>Routing</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
     </nav>
     <div class="spacer"></div>
@@ -425,14 +424,14 @@ async function withPassword({ app = null, admin = false, why = null }, fn) {
 
 // ======================================================================== API
 class ApiError extends Error { constructor(message, status) { super(message); this.status = status; } }
-async function api(method, path, body, { secret = {}, signal } = {}) {
+async function api(method, path, body, { secret = {} } = {}) {
   const headers = {};
   if (body) headers["content-type"] = "application/json";
   if (secret.admin) headers["x-admin-password"] = secret.admin;
   if (secret.app) headers["x-app-password"] = secret.app;
   let res;
   try {
-    res = await fetch(`/admin/api${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: "no-store", signal });
+    res = await fetch(`/admin/api${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: "no-store" });
   } catch {
     throw new ApiError("Can't reach the control plane", 0);
   }
@@ -695,7 +694,7 @@ const appUrls = (p, bold = false) => {
   const u = globalUrl(p), text = esc(u.slice(8, -1));
   return `<a href="${esc(u)}" target="_blank" rel="noopener" aria-label="Global app address">${bold ? `<b>${text}</b>` : text}</a> <span class="meta">global · ${plural(p.replicas, "replica URL")}</span>`;
 };
-const appHref = (name) => name === S.status?.infrastructure?.globalRouter?.name ? "#/routing" : `#/apps/${enc(name)}`;
+const appHref = (name) => `#/apps/${enc(name)}`;
 const machineHref = (n) => `#/machines/${n}`;
 
 function alertIsActive(a, st, runs) {
@@ -2051,7 +2050,6 @@ function vEditor(name, sample) {
     if (name) return true;
     const v = $("#ed-name").value.trim();
     const msg = !v ? "" : !NAME.test(v) ? "Lowercase letters, digits and dashes; it can't start or end with a dash"
-      : v === "global-router" ? "Reserved for required system routing"
       : /-m?\d+$/.test(v) ? "It can't end in -<number> or -m<number>: those are the URLs of replicas and servers"
       : taken(v) ? `There's already an app with this name: <a href="${appHref(v)}">open it</a> to edit it` : "";
     $("#ed-name-hint").innerHTML = msg || `Automatic addresses: https://${esc(v || "name")}.${esc(S.status?.domain ?? "…")} and https://${esc(v || "name")}-k.${esc(S.status?.domain ?? "…")} for replica k`;
@@ -2367,74 +2365,16 @@ function vMetrics() {
   };
 }
 
-function vRouting() {
-  let disposed = false, timer, controller, traffic = null, error = null;
-  const render = () => {
-    if (disposed) return;
-    const router = S.status?.infrastructure?.globalRouter;
-    if (!router) { setHtml($("#rt-state"), `<div class="card meta">Waiting for system routing status…</div>`); return; }
-    const runs = runsBy(), t = traffic?.totals ?? {};
-      setHtml($("#rt-state"), `<div class="card"><b>Required global router</b> ${appPill(router,runs)}<p class="meta">${router.replicas} managed replicas · ${router.tunnelReady ? "tunnel configured" : "tunnel starting"}. The system maintains these replicas and upgrades them one at a time.</p></div>`);
-    setHtml($("#rt-traffic"), tiles([
-      {label:"Requests / second",value:F.num(t.requestsPerSecond),sub:"across reporting router replicas"},
-      {label:"Traffic out",value:F.rate(t.bytesPerSecond),sub:"response bodies and WebSocket data"},
-      {label:"Active requests",value:F.num(t.active),sub:`${F.num(t.websockets)} WebSockets`},
-      {label:"Stream resumes",value:F.num(t.streamResumes),sub:`${F.num(t.failovers)} upstream failovers`},
-    ]) + `<p class="meta">${error ? esc(error) : traffic ? `Updated ${ago(Date.now()-traffic.now)} ago. Counters reset when a router process restarts.` : "Loading traffic metrics…"}</p>`);
-    const rows = copies(router).map(x => {
-      const report = x.machine != null ? runs.get(x.machine)?.projects[x.key ?? keyOn(router,x.machine,x.replica)] : null;
-      const sample = traffic?.replicas.find(r=>r.replica===x.replica);
-      return {cells:[`<b>${x.replica}</b>`,x.machine != null ? `<a href="${machineHref(x.machine)}">Server ${x.machine}</a>` : "Waiting",
-        pill(report ? runKind(report) : "deploying",report?.s ?? "starting"),sample?.ok ? "Reporting" : "Waiting for metrics",
-        sample?.ok ? F.num(sample.requestsPerSecond) : "–",sample?.ok ? F.rate(sample.bytesPerSecond) : "–",
-        sample?.ok ? F.num(sample.active) : "–",sample?.ok ? F.num(sample.streamResumes) : "–"]};
-    });
-    setHtml($("#rt-replicas"),table(["Replica","Server","Health","Metrics","Requests/s","Traffic out","Active","Resumes"],rows,{empty:"Waiting for fleet capacity",num:[4,5,6,7]}));
-  };
-  const load = async () => {
-    controller = new AbortController();
-    try { const result = await api("GET","/routing/metrics",null,{signal:controller.signal}); if (!disposed) {traffic=result;error=null;} }
-    catch(e) {if (!disposed) error=e.message;}
-    finally {if (!disposed) {render();timer=setTimeout(load,10000);}}
-  };
-  return {
-    title:"Routing",wantsMetrics:true,
-    html:`<h1>Routing</h1><div class="sub">System infrastructure for every app's global address. Numbered replica addresses remain independent.</div>
-      <div id="rt-state" style="margin-top:14px"></div><h2>Traffic</h2><div id="rt-traffic"></div>
-      <h2>Router replicas</h2><div id="rt-replicas"></div>
-      <h2><span class="grow">Router resource usage</span>${rangeSeg()}</h2><div class="metric-state meta" data-metrics-status></div><div id="rt-usage"></div>`,
-    mount(){load();},unmount(){disposed=true;clearTimeout(timer);controller?.abort();},status:render,
-    charts() {
-      const box=$("#rt-usage"), name=S.status?.infrastructure?.globalRouter?.name;
-      if (!box || !name) return;
-      rebuild(box,()=>{
-        const inst=liveRows().filter(r=>r.a?.[name]);
-        const total=k=>inst.length ? inst.reduce((sum,r)=>sum+(r.a[name][k]??0),0) : null;
-        box.insertAdjacentHTML("beforeend",tiles([{label:"CPU",value:F.cores(total("cpu"))},{label:"Memory",value:bytes(total("mem"))},
-          {label:"Network in",value:F.rate(total("netRx"))},{label:"Network out",value:F.rate(total("netTx"))}]));
-        const ms=machineNums(), A=k=>combine(ms.map(m=>acol(m,name,k)),"sum"), g=section(box,"Router and tunnel connectors");
-        lineChart(ccard(g,"CPU"),[{name:"CPU",values:A("cpu")}],{unit:"cores"});
-        lineChart(ccard(g,"Memory"),[{name:"memory",values:A("mem")}],{unit:"bytes"});
-        lineChart(ccard(g,"Network I/O"),[{name:"in",values:A("netRx")},{name:"out",values:A("netTx")}],{unit:"rate"});
-        lineChart(ccard(g,"Disk I/O"),[{name:"read",values:A("diskRead")},{name:"write",values:A("diskWrite")}],{unit:"rate"});
-      });
-    },
-  };
-}
-
 function vFleet() {
   return {
     title: "Fleet",
     html: `<h1>Fleet</h1><div class="sub">Servers join as they become available. Group tags describe their origin; there are no server targets.</div>
       <h2>Server groups</h2><div id="fl-groups"></div>
-      <h2>System routing</h2><div id="fl-routing"></div>
       <h2>Rebalancing</h2><div id="fl-rebalance"></div>
       <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta" id="fl-roll-text"></span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
       <h2>Add a server</h2><div id="fl-join"></div>`,
     status() {
       const st = S.status;
-      const router = st.infrastructure?.globalRouter;
-      setHtml($("#fl-routing"), router ? `<div class="card"><b>Global router</b> ${appPill(router,runsBy())}<p class="meta">Required infrastructure · ${router.replicas} replicas · ${router.tunnelReady ? "tunnel ready" : "tunnel starting"}. Managed automatically across fleet machines.</p><a class="btn" href="#/routing">Routing health and metrics →</a></div>` : `<div class="card meta">System routing status is unavailable.</div>`);
       setHtml($("#fl-groups"), table(["Tag", "Connected servers"], (st.groups ?? []).map((g) => ({ cells: [esc(g.tag), esc(g.online)] })), { empty: "No servers connected yet" }));
       setHtml($("#fl-rebalance"), `<div class="card"><div class="row"><span class="grow"><b>Automatic rebalancing</b></span>
         <button type="button" class="switch" role="switch" data-act="rebalance" aria-checked="${st.rebalance.on}" aria-pressed="${st.rebalance.on}" aria-label="Automatic rebalancing">${st.rebalance.on ? "✓ On" : "○ Off"}</button></div>${rebalanceLog(10)}</div>`);
@@ -2564,8 +2504,7 @@ function route() {
   cancelSheet?.();
   const { parts, q } = parseHash();
   const [a, b, c] = parts;
-  view = a === "apps" && b === "global-router" ? vRouting()
-    : a === "apps" && b === "new" ? vEditor(null, q.get("sample"))
+  view = a === "apps" && b === "new" ? vEditor(null, q.get("sample"))
     : a === "apps" && b && c === "edit" ? vEditor(b)
     : a === "apps" && b ? vApp(b, q)
     : a === "apps" ? vApps()
@@ -2573,7 +2512,6 @@ function route() {
     : a === "machines" ? vMachines()
     : a === "activity" ? vActivity()
     : a === "metrics" ? vMetrics()
-    : a === "routing" ? vRouting()
     : a === "fleet" ? vFleet()
     : a === "guide" ? vGuide()
     : a === "contribute" ? vContribute()
@@ -2587,8 +2525,7 @@ function route() {
     if (tr && !e.target.closest("a,button,input,select")) location.hash = tr.dataset.href;
     view.click?.(e);
   };
-  const navSection = a === "apps" && b === "global-router" ? "routing" : a;
-  const sec = ["apps", "machines", "activity", "metrics", "routing", "fleet"].includes(navSection) ? navSection : ["guide", "contribute"].includes(navSection) ? null : "";
+  const sec = ["apps", "machines", "activity", "metrics", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
   for (const link of $$("nav.tabs a")) {
     if (link.dataset.nav === sec) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");

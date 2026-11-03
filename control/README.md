@@ -4,7 +4,7 @@ The control plane accepts app definitions, schedules their replicas across conne
 
 Every public app automatically gets a global hostname and a hostname for each replica. The dashboard uses the global URL as the main link and retains numbered replica links. See [public addresses](../docs/public-addresses.md) for failover and upgrades.
 
-The controller runs independently of the agent hosts. It includes a matching agent release and the required global router. New hosts install from its `/install.sh` endpoint. Build from the repository root: the image needs `control/`, `agent/` and `gateway/`.
+The controller runs independently of the agent hosts. It includes a matching agent release. New hosts install from its `/install.sh` endpoint. Build from the repository root: the image needs `control/` and `agent/`.
 
 ## Requirements
 
@@ -63,7 +63,6 @@ The Docker package reads `.env` through the root [Compose file](../compose.yaml)
 | `REQUIRE_DEPLOY_AUTH` | `1` by default. Requires authentication for deployments and changes to unlocked apps. |
 | `AUTO_TUNNEL` | `1` by default. Starts the bundled controller connector. Set `0` to use your own proxy/tunnel. |
 | `PUBLIC_URL` | Controller's public origin; defaults to `https://<CONTROL_HOST>`. Set it explicitly with your own proxy. |
-| `GLOBAL_TUNNEL_NAME` | Saved routing tunnel namespace. Defaults to `<TUNNEL_PREFIX>-global`; preserve the exact existing name during migration. Global routing is always enabled. |
 | `CONTROL_PORT` | Host-side loopback port in Compose; defaults to `8920`. |
 | `CLIENT_IP_HEADER` | Forwarded client address header; defaults to `cf-connecting-ip`. |
 | `TRUSTED_PROXIES` | Explicit proxy IPs/CIDRs; default is loopback. Set the actual peer address when using an external proxy. |

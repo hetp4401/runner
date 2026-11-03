@@ -11,7 +11,6 @@ import { fileURLToPath } from "node:url";
 import { Control } from "./src/index.js";
 import { LocalStore } from "./src/local-store.mjs";
 import { loadAgentBundle } from "./src/agent-bundle.mjs";
-import { loadSystemRouter } from "./src/system-router.mjs";
 import { clientAddress, validateProxyConfig } from "./src/client-ip.mjs";
 
 const env = { ...process.env, RECOVER_RUNTIME: "1", RECOVER_TUNNELS: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
@@ -36,7 +35,6 @@ const bundle = loadAgentBundle(fileURLToPath(new URL("..", import.meta.url)));
 const control = new Control({
   sql,
   env,
-  systemRouter: loadSystemRouter(fileURLToPath(new URL("..", import.meta.url))),
   page: readFileSync(new URL("./src/app.html", import.meta.url), "utf8"),
   agentFile: (name) => name === "agent.mjs" ? bundle.legacyAgent : bundle.files[name],
   agentBundle: () => bundle,

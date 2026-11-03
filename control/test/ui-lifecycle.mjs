@@ -28,8 +28,7 @@ function harness(status = structuredClone(base)) {
   };
   for (const id of ['#main','#sheet','form','.err','[type=submit]','#ad-head','#ad-status','#ad-replicas',
     '#ad-versions','#ad-logs','#ad-spec','#ad-code','#ad-version','#ed-form','#ed-up','#ed-updir',
-    '#ed-compose','#ed-dockerfile','#ed-files','#ed-port','#ed-replicas','#ed-name','#ed-name-hint',
-    '#rt-state','#rt-traffic','#rt-replicas','#rt-usage','#apps-list','#apps-filter']) node(id);
+    '#ed-compose','#ed-dockerfile','#ed-files','#ed-port','#ed-replicas','#ed-name','#ed-name-hint']) node(id);
   const context = vm.createContext({ console,URLSearchParams,Request,Response,AbortController,
     setTimeout,clearTimeout,queueMicrotask,innerWidth:1365,addEventListener(){},
     localStorage:{getItem:()=>null,setItem(){}},location:{hash:'#/',search:''},
@@ -52,22 +51,6 @@ await check('the main app link is global and replica rows keep their numbered UR
   assert.match(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web\.example\.test\/"[^>]*aria-label="Global app address"/);
   assert.doesNotMatch(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web-1\.example\.test\//);
   assert.match(h.nodes.get('#ad-replicas').innerHTML,/href="https:\/\/web-1\.example\.test\/"/);
-});
-await check('system routing has its own status and metrics view without app mutation controls',()=>{
-  const h=harness();h.status.infrastructure={globalRouter:{...project,name:'global-router',system:true,required:true,tunnelReady:true}};
-  const v=h.run('view=vRouting();view.status();view');
-  assert.equal(v.title,'Routing');assert.equal(v.wantsMetrics,true);
-  assert.match(v.html,/Router resource usage/);assert.match(h.nodes.get('#rt-traffic').innerHTML,/Stream resumes/);
-  assert.doesNotMatch(v.html,/data-act="(?:disable|delete|rep|password)"/);
-  assert.equal(h.run('appHref("global-router")'),'#/routing');
-  h.run('view=vApps();view.status();');assert.doesNotMatch(h.nodes.get('#apps-list').innerHTML,/global-router/);
-});
-await check('leaving the routing view cancels polling and ignores a late metrics response',async()=>{
-  const h=harness(),d=deferred();h.context.hooks.api=()=>d.promise;
-  h.status.infrastructure={globalRouter:{...project,name:'global-router',system:true,required:true,tunnelReady:true}};
-  h.run('view=vRouting();view.mount();view.unmount();');
-  h.nodes.get('#rt-traffic').innerHTML='another page';d.resolve({now,replicas:[],totals:{requests:1}});await tick();
-  assert.equal(h.nodes.get('#rt-traffic').innerHTML,'another page');
 });
 
 await check('recovered incidents remain in history without counting as current problems',()=>{
