@@ -1,6 +1,6 @@
 // Runner agent: keeps one machine's projects in line with the control plane.
 // It joins the fleet (the control plane gives it a slot n and the token for tunnel runner-n), starts a local router
-// (each copy of a project answers its replica's public name, <project>-<k>, which DNS points at this machine's tunnel)
+// (numbered names reach their copy; each app's shared tunnel reaches a healthy local copy through its global name)
 // and the tunnel, checks in every few seconds, starts, updates and removes docker compose projects to match what it's
 // told, and restarts ones that stop answering. It doesn't know what kind of machine it's on: the settings below
 // describe it.
@@ -24,7 +24,7 @@ import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
-import { namespace, projectName, fingerprint, resumeState, resolveServerTag, ownsCompose, ownsInfrastructure, containerHealth,
+import { namespace, projectName, fingerprint, resumeState, resolveServerTag, appRoutes, PublicTunnels, ownsCompose, ownsInfrastructure, containerHealth,
   privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
@@ -55,6 +55,8 @@ let restartRequested = false;
 let wasReady = saved?.wasReady === true;
 let recovery = saved?.recovery || null;
 let cachedDesired = saved?.desired || {};
+let cachedPublicTunnels = saved?.publicTunnels || {};
+let publicOpen = false;
 // What this agent tells the control plane about its machine.
 const deadline = Number(env.LIFETIME_MIN) > 0 ? started + Number(env.LIFETIME_MIN) * 60_000 : undefined;
 const describe = () => ({
@@ -86,9 +88,9 @@ const replicaHost = (app, replica) => `${app}-${replica}.${domain}`;
 
 // GET a path (/ by default) for a hostname through the local router: { code, routed }, with code 0 if nothing answered.
 // The router's own "no such project" 404 carries X-Runner-Route: none, so it isn't mistaken for the project's.
-function probe(host, path = "/") {
+function probe(host, path = "/", timeout = 5000) {
   return new Promise((resolve) => {
-    const req = http.get({ host: "127.0.0.1", port: ROUTER_PORT, path, headers: { host }, timeout: 5000 }, (res) => {
+    const req = http.get({ host: "127.0.0.1", port: ROUTER_PORT, path, headers: { host }, timeout }, (res) => {
       res.resume();
       resolve({ code: res.statusCode, routed: res.headers["x-runner-route"] !== "none" });
     });
@@ -131,7 +133,7 @@ let stateWrites = Promise.resolve();
 function saveState() {
   const data = JSON.stringify({ v: 2, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, previousRun, restartRequested, wasReady,
     installedRevision: env.RUNNER_INSTALL_REVISION || saved?.installedRevision, domain, tag,
-    recovery, desired: cachedDesired, projects: [...projects], metrics: metrics.history() });
+    recovery, desired: cachedDesired, publicTunnels: cachedPublicTunnels, projects: [...projects], metrics: metrics.history() });
   stateWrites = stateWrites.catch(() => {}).then(async () => {
     const path = `${base}/agent-state.json`;
     const temporary = `${path}.${randomUUID()}.tmp`;
@@ -251,6 +253,7 @@ async function apply(name, want, { recreate = false } = {}) {
   Object.assign(p, { s, e, at: Date.now(), r: s === "healthy" ? await isReady(p) : undefined });
   if (p.sourceDir) await pruneDeploymentFiles(name, p, s === "healthy" ? null : before?.sourceDir).catch(() => {});
   p.busy = false;
+  await updateRouter();
   await saveState();
   wake();
   log(`${name}: v${want.v} ${s}${e ? " (details in authenticated diagnostics)" : ""}`);
@@ -281,8 +284,7 @@ async function remove(name) {
     }
     await removeDir(`${dir}/${name}`);
     await removeDir(`${deploymentsDir}/${name}`);
-    // Whatever happened to its files, its route goes: the router then answers "no such project", which tells the
-    // Worker to try another machine.
+    // Remove its numbered route and withdraw its app connector once no local copy remains.
     projects.delete(name);
     updateRouter();
     await saveState();
@@ -390,12 +392,7 @@ let routerConfig = "";
 const updateRouter = () => (routerChain = routerChain.then(loadRouter, loadRouter).catch((e) => log(`router update failed: ${e.message}`)));
 
 function routerJson() {
-  // Each copy answers its replica's public name. (stream_close_delay: a config reload would otherwise cut every
-  // websocket on the machine.)
-  const routes = [...projects.values()].filter((p) => p.port && domain).map((p) => ({
-    match: [{ host: [replicaHost(p.app, p.replica)] }],
-    handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }], flush_interval: -1, stream_close_delay: "1h" }],
-  }));
+  const routes = appRoutes(projects.values(), domain);
   routes.push({
     handle: [{
       handler: "static_response",
@@ -507,6 +504,8 @@ const metricCopy = (project) => {
 };
 const metrics = startMetrics({ appOf: (project) => metricCopy(project)?.app ?? null, copyOf: metricCopy,
   systemContainers: metricsSystem, history: saved?.metrics ?? [] });
+const publicTunnels = new PublicTunnels({owner,command:sh,configFile:`${base}/tunnel.yml`,log,changed:()=>wake(),track:name=>metricsSystem.add(name),
+  probe:app=>probe(`${app}.${domain}`,[...projects.values()].find(p=>p.app===app && p.readyPath)?.readyPath||'/',1500)});
 
 // Get a slot and its tunnel token. Keeps trying while the control plane is unreachable or every slot is taken; gives up
 // (so whatever runs this machine can start another) if the token is refused, or, for a pool member, after 10 minutes.
@@ -583,7 +582,7 @@ async function sync() {
   const t0 = Date.now();
   const edges = ready ? await tunnelEdges() : undefined;
   const disk = await diskSpace();
-  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 3, recovery };
+  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 5, publicTunnels: publicTunnels.active, recovery };
   const linked = await controlLink.report(body);
   if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); return linked; }
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
@@ -619,6 +618,7 @@ async function shutdown(reason, code = 0, { keepTunnel = false } = {}) {
   log(reason);
   // Under a supervisor (Docker's restart policy, say) the agent comes back with the same slot.
   if (!keepTunnel) {
+    await publicTunnels.withdraw().catch(e=>log(`public tunnel shutdown: ${e.message}`));
     const container = await namedContainer(tunnelName).catch(() => null);
     if (container && ownsInfrastructure(container, infrastructureOwner("tunnel"))) await sh("docker", ["stop", "-t", "10", container.Id]);
   }
@@ -717,6 +717,7 @@ async function main() {
   log(`machine ${machine}${describe().label ? `: ${describe().label}` : ""}, tag ${tag}`);
   routerName = await selectInfrastructure("router");
   tunnelName = await selectInfrastructure("tunnel");
+  await writeFile(`${base}/tunnel.yml`, `ingress:\n  - service: http://127.0.0.1:${ROUTER_PORT}\n`);
   metricsSystem.add(routerName); metricsSystem.add(tunnelName);
   // Existing owned infrastructure and containers keep serving through an agent
   // restart or host reboot. Recreate only infrastructure that is actually down.
@@ -726,6 +727,7 @@ async function main() {
       if (!router?.State?.Running) await startRouter();
       else { await privateDirectory(routerDir); await updateRouter(); }
       ready = Boolean((await namedContainer(tunnelName))?.State?.Running);
+      publicOpen = ready && wasReady;
       if (ready) wasReady = true;
       break;
     } catch (e) {
@@ -755,11 +757,16 @@ async function main() {
       // Repair an already-authorized workload even while the control plane is
       // unreachable. Placement changes and new workloads still need a plan.
       reconcile(cachedDesired, { repairOnly: true });
+      await updateRouter();
       const changed = before !== JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
       if (changed) { await saveState(); wake(); }
     } catch (error) { log(`health: ${error.message}`); }
     finally { checking = false; }
   }, 10_000).unref();
+  setInterval(()=>{
+    if(!stopping && !leaving) publicTunnels.reconcile(cachedPublicTunnels,projects,{open:publicOpen})
+      .catch(e=>log(`public tunnels: ${e.message}`));
+  },2000).unref();
   for (;;) {
     if (leaving) { // a signal handler is checking in for the last time; don't start anything meanwhile
       await sleep(1000);
@@ -779,6 +786,7 @@ async function main() {
         try { if (JSON.parse(plan.recovery.payload).run === run) previousRun = null; } catch {}
       }
       cachedDesired = plan.desired;
+      if(plan.publicTunnels) cachedPublicTunnels = plan.publicTunnels;
       await saveState(); // accept the receipt durably before executing commands
       if (plan.domain !== domain) {
         domain = plan.domain;
@@ -818,6 +826,7 @@ async function main() {
     const openNow = plan?.hold ? false : plan?.successor
       ? Array.isArray(plan.serve) && plan.serve.every(serves) && (plan.serve.length > 0 || settled(plan.desired))
       : plan && (settled(plan.desired) || Date.now() > settleBy);
+    if(openNow) publicOpen=true;
     if (!ready && plan && Date.now() >= tunnelRetryAt && openNow) {
       try {
         await startTunnel();

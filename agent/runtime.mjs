@@ -6,6 +6,121 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export const OWNER_LABEL = "io.runners.owner";
 export const COPY_LABEL = "io.runners.copy";
+
+// The machine tunnel serves numbered hosts; an app tunnel reaches only hosts
+// with that app. Neither path needs another workload between agent and app.
+export function appRoutes(projects, domain) {
+  if (!domain) return [];
+  const proxy = p => ({handler:"reverse_proxy",upstreams:[{dial:`127.0.0.1:${p.port}`}],flush_interval:-1,stream_close_delay:"1h"});
+  const apps = new Map(), routes = [];
+  for (const p of projects) {
+    if (!p.port) continue;
+    routes.push({match:[{host:[`${p.app}-${p.replica}.${domain}`]}],handle:[proxy(p)]});
+    (apps.get(p.app) ?? apps.set(p.app,[]).get(p.app)).push(p);
+  }
+  for (const [app,copies] of apps) {
+    const ready = copies.filter(p=>p.s==="healthy" && p.r!==false && !p.busy).sort((a,b)=>a.replica-b.replica)[0];
+    routes.push({match:[{host:[`${app}.${domain}`]}],handle:[ready ? proxy(ready) : {
+      handler:"static_response",status_code:503,headers:{"X-Runner-Route":["unavailable"],"Retry-After":["2"]},
+      body:"No healthy copy of this app is available on this machine\n",
+    }]});
+  }
+  return routes;
+}
+
+// Docker and health operations are injected so ownership, recovery and failure
+// withdrawal are exercised without a live provider or access to other hosts.
+export class PublicTunnels {
+  constructor({owner,command,probe,configFile,log=()=>{},changed=()=>{},track=()=>{}}) {
+    Object.assign(this,{owner,command,probe,configFile,log,changed,track});
+    this.active={};this.failures=new Map();this.connections=new Map();
+  }
+  owns(c) {
+    const l=c?.Config?.Labels;
+    return l?.[OWNER_LABEL]===this.owner && l?.['io.runners.component']==='public-tunnel';
+  }
+  name(app) {return `${this.owner}-public-${createHash('sha256').update(app).digest('hex').slice(0,16)}`;}
+  reconcile(plan,projects,{open=true}={}) {
+    this.input={plan,projects,open};
+    if (!this.job) this.job=(async()=>{
+      let input;do {input=this.input;await this.apply();} while(input!==this.input);
+      return this.active;
+    })().finally(()=>{this.job=null;});
+    return this.job;
+  }
+  async apply() {
+    const {plan,projects,open}=this.input, next={};
+    const ls=await this.command('docker',['ps','-aq','--filter',`label=${OWNER_LABEL}=${this.owner}`,'--filter','label=io.runners.component=public-tunnel']);
+    if(!ls.ok)throw new Error('cannot list public tunnel containers');
+    const ids=ls.out.trim().split(/\s+/).filter(Boolean), byName=new Map();
+    if(ids.length) {
+      const r=await this.command('docker',['inspect',...ids]);
+      if(!r.ok)throw new Error('cannot inspect public tunnel containers');
+      for(const c of JSON.parse(r.out))if(this.owns(c))byName.set(c.Name.replace(/^\//,''),c);
+    }
+    const remove=async c=>{
+      if(!this.owns(c))throw new Error('refusing to remove an unrelated public tunnel');
+      const r=await this.command('docker',['rm','-f',c.Id]);
+      if(!r.ok)throw new Error('cannot remove owned public tunnel');
+      this.connections.delete(c.Id);
+    };
+    for(const [name,c] of byName) {
+      const app=c.Config.Labels['io.runners.app'];
+      if(!Object.hasOwn(plan,app)) {await remove(c);byName.delete(name);this.failures.delete(app);}
+    }
+    for(const [app,tunnel] of Object.entries(plan)) {
+      if(!/^[a-z0-9][a-z0-9-]{0,39}$/.test(app) || typeof tunnel?.id!=='string' || !tunnel.id || typeof tunnel.token!=='string' || !tunnel.token)
+        throw new Error('invalid public tunnel authorization');
+      const name=this.name(app), revision=createHash('sha256').update(tunnel.token).digest('hex');
+      this.track(name);
+      let c=byName.get(name);
+      const eligible=open && [...projects.values()].some(p=>p.app===app && p.port && p.s==='healthy' && p.r!==false && !p.busy);
+      const health=eligible ? await this.probe(app) : null;
+      const healthy=health?.routed && health.code>0 && health.code<500;
+      this.failures.set(app,healthy ? 0 : (this.failures.get(app)||0)+1);
+      if(!healthy) {
+        if(c?.State?.Running && (!eligible || this.failures.get(app)>=2)) {
+          const r=await this.command('docker',['stop','-t','0',c.Id]);
+          if(!r.ok)throw new Error('cannot withdraw unhealthy public tunnel');
+          this.connections.delete(c.Id);
+        } else if(c?.State?.Running && this.active[app]===tunnel.id)next[app]=tunnel.id;
+        continue;
+      }
+      if(c && (c.Config.Labels['io.runners.tunnel']!==tunnel.id || c.Config.Labels['io.runners.token-revision']!==revision)) {
+        await remove(c);c=null;
+      }
+      if(!c) {
+        const collision=await this.command('docker',['inspect',name]);
+        if(collision.ok)throw new Error('public tunnel name belongs to another container');
+        if(!/No such (object|container)/i.test(collision.out))throw new Error('cannot check public tunnel ownership');
+        const r=await this.command('docker',['run','-d','--name',name,'--network','host','--restart','unless-stopped','--memory','128m',
+          '--label',`${OWNER_LABEL}=${this.owner}`,'--label','io.runners.component=public-tunnel','--label',`io.runners.app=${app}`,
+          '--label',`io.runners.tunnel=${tunnel.id}`,'--label',`io.runners.token-revision=${revision}`,
+          '-e','TUNNEL_TOKEN','-v',`${this.configFile}:/etc/cloudflared/config.yml:ro`,
+          'cloudflare/cloudflared:latest','tunnel','--no-autoupdate','--config','/etc/cloudflared/config.yml','run'],{extraEnv:{TUNNEL_TOKEN:tunnel.token}});
+        if(!r.ok){this.log(`public tunnel for ${app} could not start`);continue;}
+        c={Id:r.out.trim(),State:{Running:true,StartedAt:'new'}};
+      } else if(!c.State?.Running) {
+        const r=await this.command('docker',['start',c.Id]);
+        if(!r.ok){this.log(`public tunnel for ${app} could not restart`);continue;}
+        c.State={Running:true,StartedAt:'restarted'};
+      }
+      const key=c.State.StartedAt||'running';
+      if(this.connections.get(c.Id)!==key) {
+        const r=await this.command('docker',['logs','--tail','30',c.Id]);
+        if(!r.ok || !r.out.includes('Registered tunnel connection'))continue;
+        this.connections.set(c.Id,key);
+      }
+      next[app]=tunnel.id;
+    }
+    if(JSON.stringify(next)!==JSON.stringify(this.active)){this.active=next;this.changed();}
+    return this.active;
+  }
+  async withdraw() {
+    await this.reconcile({},new Map(),{open:false});
+  }
+}
+
 export function resolveServerTag(env, saved = null) {
   const value = env.SERVER_TAG ?? env.POOL ?? saved?.tag ?? saved?.pool ??
     (saved?.run && saved?.control === env.CONTROL_URL ? "standalone" : null);

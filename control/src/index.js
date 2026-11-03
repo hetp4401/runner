@@ -9,10 +9,10 @@
 // predecessor and successor runs can briefly share a slot during a handover. See README's "How it works".
 //
 // Agents join at /api/join, then use the outgoing /api/agent WebSocket (HTTP /api/sync remains compatible).
-// Their pool, region, lifetime and ability to start machines are reported capabilities; GitHub is optional.
+// Their group, region, lifetime and ability to replace machines are reported capabilities, independent of provider.
 // Public status/source are separate from authenticated app changes, fleet administration, secrets and diagnostics.
 // New Docker fleets require deployment authentication; REQUIRE_DEPLOY_AUTH=0 explicitly permits public deployments.
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import YAML from "yaml";
 import { REGIONS, regionOf, regionForReplica, machineRegion, validRegion } from "./regions.js";
 import { agentPlan, relativeBinds } from "./agent-plan.mjs";
@@ -550,6 +550,8 @@ export class Control {
     this.globalTunnel = null;
     this.globalToken = null;
     this.systemSecrets = [];
+    this.publicTunnels = new Map(); // app -> {id,token}; credentials exist only in controller memory
+    this.publicTunnelIds = new Set();
     for (const query of [
       `CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, version INTEGER NOT NULL, stable INTEGER,
          rollout INTEGER NOT NULL, halted TEXT, updated INTEGER NOT NULL)`,
@@ -984,6 +986,7 @@ export class Control {
     const values = [...this.appEnv.values()].flatMap((values) => [...values.values()]);
     values.push(...Object.entries(this.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|KEY/.test(key)).map(([, value]) => value));
     values.push(this.globalToken, ...this.systemSecrets);
+    values.push(...[...this.publicTunnels.values()].map(t=>t.token));
     const secrets = [...new Set(values.filter((v) => typeof v === "string").flatMap((v) => [v, ...v.split("\n")]))]
       .filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
     return secrets.reduce((out, secret) => out.split(secret).join("[hidden]"), String(text));
@@ -2905,6 +2908,8 @@ export class Control {
       this.logEvent("left", { machine: r.machine, run: r.id, cause: "leaving", detail: "the server said it's going away" });
     }
     r.protocol = Number(body.protocol) || 1;
+    r.publicTunnels = Object.fromEntries(Object.entries(isMap(body.publicTunnels) ? body.publicTunnels : {})
+      .filter(([name,id])=>this.publicTunnels.get(name)?.id===id && this.copiesOn(name,machine).length));
     this.observedRuns.add(run);
     if (receipt) {
       r.recoveryAt = Math.max(r.recoveryAt ?? 0, receipt.at);
@@ -2969,6 +2974,7 @@ export class Control {
       poll: this.pollS,
       ...(logs.length ? { logs } : {}),
       desired,
+      ...(r.protocol>=5 ? {publicTunnels:this.publicTunnelsFor(r,desired)} : {}),
       retire: Boolean(r.retire),
       handover,
       start: [], // servers are supplied externally; the CP never fills a target
@@ -3550,12 +3556,20 @@ export class Control {
     if (this.tunnelsReady) return Promise.resolve();
     if (!this.tunnelRecoveryJob) {
       this.tunnelRecoveryJob = (async () => {
-        const found = new Map(), globals = [];
+        const found = new Map(), globals = [], publicFound = new Map(), publicIds = new Set();
+        const publicNames = new Map([...this.projects.keys()].map(name=>[this.publicTunnelName(name),name]));
         for (let page = 1; ; page++) {
           const data = await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
           if (!Array.isArray(data.result)) throw new Error("Cloudflare returned an invalid tunnel listing");
           for (const tunnel of data.result) {
             if (this.systemRouter && tunnel.name === this.globalTunnelName && !tunnel.deleted_at) globals.push(tunnel);
+            if(typeof tunnel.name==='string' && tunnel.name.startsWith(`${this.tunnelPrefix}-app-`) && /^[a-f0-9]{20}$/.test(tunnel.name.slice(this.tunnelPrefix.length+5)) && !tunnel.deleted_at) {
+              if(typeof tunnel.id!=='string' || !tunnel.id)throw new Error('Cloudflare returned an invalid app tunnel');
+              const name=publicNames.get(tunnel.name);
+              if(name && publicFound.has(name))throw new Error(`multiple Cloudflare tunnels are named ${tunnel.name}`);
+              if(name)publicFound.set(name,{id:tunnel.id,token:''});
+              publicIds.add(tunnel.id);
+            }
             const prefix = `${this.tunnelPrefix}-`;
             const match = typeof tunnel?.name === "string" && tunnel.name.startsWith(prefix) ? /^([1-9]\d*)$/.exec(tunnel.name.slice(prefix.length)) : null;
             if (!match || tunnel.deleted_at) continue;
@@ -3577,6 +3591,8 @@ export class Control {
         this.sql.exec("DELETE FROM slots");
         for (const slot of found.values()) this.sql.exec("INSERT INTO slots (n,tunnel,token,created) VALUES (?,?,?,?)", slot.n, slot.tunnel, "", Date.now());
         this.slots = found;
+        this.publicTunnels = publicFound;
+        this.publicTunnelIds = publicIds;
         this.tunnelsReady = true;
         this.tunnelRecoveryError = null;
         this.scheduleDns();
@@ -3607,6 +3623,72 @@ export class Control {
     if (typeof token !== "string" || !token) throw new Error("Cloudflare returned no global routing token");
     this.globalTunnel = tunnel.id;
     this.globalToken = token;
+  }
+
+  publicTunnelName(name) {
+    return `${this.tunnelPrefix}-app-${createHash('sha256').update(name).digest('hex').slice(0,20)}`;
+  }
+
+  // Cloudflare allows 25 connectors per tunnel. Twenty distinct replica hosts
+  // leave room for overlapping host handovers; additional copies keep numbered URLs.
+  publicHosts(name,now=Date.now()) {
+    const live=this.liveMachines(now);
+    const copies=this.copiesOf(name).filter(x=>live.get(x.machine)?.protocol>=5);
+    const serving=x=>live.get(x.machine)?.publicTunnels?.[name]===this.publicTunnels.get(name)?.id;
+    copies.sort((a,b)=>Number(serving(b))-Number(serving(a)) || Boolean(a.leaving)-Boolean(b.leaving) || a.replica-b.replica || a.machine-b.machine);
+    return new Set([...new Set(copies.map(x=>x.machine))].slice(0,20));
+  }
+
+  publicTunnelsFor(run,desired) {
+    const out={};
+    for(const name of new Set(Object.values(desired).filter(p=>p.port).map(p=>p.app))) {
+      const t=this.publicTunnels.get(name);
+      if(t?.token && this.publicHosts(name).has(run.machine))out[name]={id:t.id,token:t.token};
+    }
+    return out;
+  }
+
+  ensurePublicTunnels() {
+    if(this.publicTunnelJob)return this.publicTunnelJob;
+    this.publicTunnelJob=(async()=>{
+      const errors=[];
+      for(const p of this.projects.values()) {
+        if(this.isSystem(p.name) || !this.version(p.name,p.version)?.port)continue;
+        if(this.publicTunnels.get(p.name)?.token)continue;
+        try {
+          const account=`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel`, name=this.publicTunnelName(p.name);
+          let t=this.publicTunnels.get(p.name);
+          if(!t) {
+            const matches=(await this.cf(`${account}?name=${name}&is_deleted=false`)).result.filter(x=>x.name===name && !x.deleted_at);
+            if(matches.length>1)throw new Error('duplicate shared app tunnel names');
+            t=matches[0];
+            if(!t)t=(await this.cf(account,{method:'POST',body:JSON.stringify({name,config_src:'local',tunnel_secret:btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))})})).result;
+            if(typeof t?.id!=='string' || !t.id || t.config_src && t.config_src!=='local')throw new Error('invalid shared app tunnel');
+            t={id:t.id,token:''};this.publicTunnels.set(p.name,t);this.publicTunnelIds.add(t.id);
+          }
+          const token=(await this.cf(`${account}/${t.id}/token`)).result;
+          if(typeof token!=='string' || !token)throw new Error('Cloudflare returned no app tunnel token');
+          t.token=token;
+          for(const r of this.liveRuns(Date.now()))if(this.copiesOn(p.name,r.machine).length)this.wake(r.id);
+        } catch(error){errors.push(`Shared address for ${p.name}: ${this.redact(error.message)}`);}
+      }
+      return errors;
+    })().finally(()=>{this.publicTunnelJob=null;});
+    return this.publicTunnelJob;
+  }
+
+  async collectPublicTunnels(records) {
+    const needed=new Set([...this.projects.values()].filter(p=>!this.isSystem(p.name) && this.version(p.name,p.version)?.port).map(p=>this.publicTunnels.get(p.name)?.id));
+    this.publicCleanupDue=null;
+    for(const id of this.publicTunnelIds) {
+      if(needed.has(id) || records.some(r=>r.content===`${id}.cfargotunnel.com`))continue;
+      try {
+        // No cascade: a late connector must finish withdrawing first.
+        await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel/${id}`,{method:'DELETE'});
+        this.publicTunnelIds.delete(id);
+        for(const [name,t] of this.publicTunnels)if(t.id===id){this.systemSecrets.push(t.token);this.publicTunnels.delete(name);}
+      } catch {this.publicCleanupDue=Date.now()+60_000;}
+    }
   }
 
   // Tunnel runner-<n>: reuse a discovered ID; fetch its token only when a machine
@@ -3688,7 +3770,13 @@ export class Control {
     for (const p of this.projects.values()) {
       const spec = this.version(p.name, p.version);
       if (!spec?.port) continue;
-      if (this.globalTunnel && !this.isSystem(p.name)) want.set(p.name, this.globalTunnel);
+      if(!this.isSystem(p.name)) {
+        const t=this.publicTunnels.get(p.name);
+        const expected=Math.min(3,new Set(this.copiesOf(p.name).map(x=>x.machine)).size);
+        const connected=t && expected>0 && [...newest.values()].filter(r=>r.ready && r.publicTunnels?.[p.name]===t.id).length>=expected;
+        if(t && (!this.systemRouter || connected || t.published)) {want.set(p.name,t.id);t.published=true;}
+        else if(this.globalTunnel)want.set(p.name,this.globalTunnel);
+      }
       for (let k = 1; k <= spec.replicas; k++) {
         const copies = this.copiesOf(p.name).filter((x) => x.replica === k);
         const pick = copies.find((x) => !x.leaving && healthy(p.name, x)) ?? copies.find((x) => x.leaving && healthy(p.name, x))
@@ -3961,6 +4049,7 @@ export class Control {
           handover: Boolean(r.handover),
           retiring: Boolean(r.retire),
           protocol: r.protocol ?? 1,
+          publicTunnels: r.publicTunnels ?? {},
           recoveryAt: r.recoveryAt ?? null, witnessAt: r.witnessAt ?? null,
           pool: r.pool ?? null,
           tag: r.pool || "standalone",
@@ -4021,6 +4110,7 @@ export class Control {
         this.dnsError = null;
         this.dnsSyncedAt = now;
         if (this.dnsDue === due) this.dnsDue = now + 3600_000; // re-check hourly in case something drifted
+        if(this.publicCleanupDue)this.dnsDue=Math.min(this.dnsDue,this.publicCleanupDue);
       } catch (e) {
         this.dnsError = e.message;
         console.log(`DNS sync failed: ${e.message}`);
@@ -4035,9 +4125,13 @@ export class Control {
     const domain = this.env.DOMAIN;
     const zone = this.env.ZONE;
     const now = Date.now();
+    const publicErrors=await this.ensurePublicTunnels();
     const ours = new Set([...this.slots.values()].map((x) => `${x.tunnel}.cfargotunnel.com`));
+    const shared = new Set([...this.publicTunnelIds].map(id=>`${id}.cfargotunnel.com`));
+    for(const target of shared)ours.add(target);
     const ingress = this.globalTunnel && `${this.globalTunnel}.cfargotunnel.com`;
     if (ingress) ours.add(ingress);
+    if (ingress) shared.add(ingress);
     const want = new Map([...this.dnsTargets(now)].map(([label, tunnel]) => [`${label}.${domain}`, `${tunnel}.cfargotunnel.com`]));
     const names = new Set(); // every app and replica name, with a target or not
     for (const p of this.projects.values()) {
@@ -4055,11 +4149,11 @@ export class Control {
     // A shared ingress may also serve names outside this fleet. Only records explicitly adopted for our apps
     // carry our marker; do not delete another user's aliases just because they use the same ingress tunnel.
     const deletes = existing.filter((r) => r.type === "CNAME" && ours.has(r.content) && !names.has(r.name) &&
-      (r.content !== ingress || r.comment === DNS_COMMENT));
+      (!shared.has(r.content) || r.comment === DNS_COMMENT));
     const gone = new Set(deletes.map((r) => r.id));
     const byName = new Map();
     for (const r of existing) if (!gone.has(r.id)) (byName.get(r.name) ?? byName.set(r.name, []).get(r.name)).push(r);
-    const notes = [];
+    const notes = [...publicErrors];
     const posts = [];
     const patches = [];
     const repointed = [];
@@ -4068,10 +4162,10 @@ export class Control {
       const r = rs.find((x) => x.type === "CNAME");
       if (!rs.length) posts.push({ type: "CNAME", name, content, proxied: true, comment: DNS_COMMENT });
       else if (r && r.content !== content && ours.has(r.content)) {
-        patches.push({ id: r.id, content, ...(content === ingress ? { comment: DNS_COMMENT, proxied: true } : {}) });
+        patches.push({ id: r.id, content, comment: DNS_COMMENT, proxied: true });
         repointed.push([name, content]);
       }
-      else if (r && r.content === ingress && (r.comment !== DNS_COMMENT || r.proxied === false)) {
+      else if (r && r.content === content && ours.has(r.content) && (r.comment !== DNS_COMMENT || r.proxied === false)) {
         patches.push({ id: r.id, comment: DNS_COMMENT, proxied: true });
       }
       else if (!r || !ours.has(r.content)) notes.push(`${name} is already used by another DNS record, so it can't point at its server`);
@@ -4091,5 +4185,8 @@ export class Control {
       if (m) this.logEvent("dns", { app: m[1], replica: Number(m[2]), machine: slot?.n ?? null, t: now });
     }
     this.dnsNotes = notes;
+    const remaining=existing.filter(r=>!gone.has(r.id)).map(r=>({...r,...patches.find(p=>p.id===r.id)}));
+    await this.collectPublicTunnels([...remaining,...posts]);
+    if(publicErrors.length)this.publicCleanupDue=Date.now()+60_000;
   }
 }

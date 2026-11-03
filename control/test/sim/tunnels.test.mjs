@@ -115,7 +115,8 @@ try {
   ];
   await control.syncDns();
   check("rediscovered IDs restore replica DNS and cleanup while preserving unrelated records", () => {
-    assert.deepEqual(batches, [{ deletes: [{ id: "retired-app" }], patches: [{ id: "replica", content: `${destination.tunnel}.cfargotunnel.com` }] }]);
+    assert.deepEqual(batches, [{ deletes: [{ id: "retired-app" }], patches: [{ id: "replica", content: `${destination.tunnel}.cfargotunnel.com`,comment:'runner fleet',proxied:true }],
+      posts:[{type:'CNAME',name:'web.sim.example',content:`${control.publicTunnels.get('web').id}.cfargotunnel.com`,proxied:true,comment:'runner fleet'}] }]);
   });
   const beforeToken = requests.length;
   const [first, second] = await Promise.all([control.tunnelFor(copy.machine), control.tunnelFor(copy.machine)]);
