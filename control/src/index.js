@@ -533,7 +533,7 @@ function eventText(e) {
 export class Control {
   // sql: { exec(query, ...args) -> { toArray() } } over SQLite; env: settings and secrets; alarm(at): call this.alarm()
   // at that time (replacing any earlier call); page: the web app's HTML; restart(): exit so the process is started again.
-  constructor({ sql, env, alarm, page, restart, agentFile = () => null, agentBundle = () => null }) {
+  constructor({ sql, env, alarm, page, restart, agentFile = () => null, agentBundle = () => null, systemRouter = null }) {
     this.sql = sql;
     const auth = String(env.REQUIRE_DEPLOY_AUTH ?? "0").toLowerCase();
     if (!["0", "1", "false", "true"].includes(auth)) throw new Error("REQUIRE_DEPLOY_AUTH must be 1/true or 0/false");
@@ -545,6 +545,11 @@ export class Control {
     this.agentBundle = agentBundle;
     this.tunnelPrefix = env.TUNNEL_PREFIX || "runner";
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(this.tunnelPrefix)) throw new Error("TUNNEL_PREFIX must contain 1-63 lowercase letters, digits or hyphens");
+    this.systemRouter = systemRouter;
+    this.globalTunnelName = env.GLOBAL_TUNNEL_NAME || `${this.tunnelPrefix}-global`;
+    this.globalTunnel = null;
+    this.globalToken = null;
+    this.systemSecrets = [];
     for (const query of [
       `CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, version INTEGER NOT NULL, stable INTEGER,
          rollout INTEGER NOT NULL, halted TEXT, updated INTEGER NOT NULL)`,
@@ -693,7 +698,7 @@ export class Control {
     this.agents = new Map(this.all("SELECT * FROM agents").map((a) => [a.id, a])); // agent -> the slot it last had
     this.holds = new Map(); // slot -> { agent, at }: just given out at /join, not checked in yet
     this.tunnelJobs = new Map(); // slot -> promise, while its tunnel is being looked up or created
-    this.tunnelsReady = this.env.RECOVER_TUNNELS !== "1";
+    this.tunnelsReady = !this.systemRouter && this.env.RECOVER_TUNNELS !== "1";
     this.tunnelRecoveryJob = null;
     this.tunnelRecoveryError = null;
     this.lastCleanup = 0;
@@ -703,6 +708,7 @@ export class Control {
     this.metricsCache = new Map(); // range -> { at, body }
     this.dnsError = null;
     this.dnsTargetsSeen = "";
+    if (this.systemRouter) this.ensureSystemRouter();
     this.scheduleDns(); // DNS may have drifted while this wasn't running
     if (!this.tunnelsReady) this.setAlarm(this.bootAt); // discover before agents can join or scheduling resumes
   }
@@ -814,7 +820,7 @@ export class Control {
       if (row.port) claims.add(`port ${row.port}`);
       const policy = policyOf(row.compose);
       this.versions.set(key, { compose: row.compose, port: row.port, replicas: row.replicas ?? 1, files: JSON.parse(row.files ?? "{}"), claims: [...claims],
-        nodup: dupProblem(row.compose), fixed: fixedPorts(row.compose), policy });
+        nodup: this.isSystem(name) ? "system router replicas require separate hosts" : dupProblem(row.compose), fixed: fixedPorts(row.compose), policy });
     }
     return this.versions.get(key);
   }
@@ -977,6 +983,7 @@ export class Control {
   redact(text) {
     const values = [...this.appEnv.values()].flatMap((values) => [...values.values()]);
     values.push(...Object.entries(this.env).filter(([key]) => /TOKEN|PASSWORD|SECRET|KEY/.test(key)).map(([, value]) => value));
+    values.push(this.globalToken, ...this.systemSecrets);
     const secrets = [...new Set(values.filter((v) => typeof v === "string").flatMap((v) => [v, ...v.split("\n")]))]
       .filter((v) => v.length >= 4).sort((a, b) => b.length - a.length);
     return secrets.reduce((out, secret) => out.split(secret).join("[hidden]"), String(text));
@@ -1016,6 +1023,7 @@ export class Control {
     if (method === "GET" && route === "/status") return json(this.status());
     if (method === "GET" && route === "/events") return json(this.events(url.searchParams));
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
+    if (method === "GET" && route === "/routing/metrics") return json(await this.systemRoutingMetrics());
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
     if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip,
       this.env.USE_EDGE_LOCATION === "1" ? decodeURIComponent(request.headers.get("x-runner-location") || "") : null));
@@ -1067,6 +1075,8 @@ export class Control {
       const [, name, action] = m;
       if (!action && method === "GET") return json(this.getProject(name, url.searchParams.get("version")));
       if (action === "env" && method === "GET") return json({ name, keys: this.envKeys(name) });
+      if (!["logs", "diagnostics", "unlock"].includes(action)) this.protectSystem(name);
+      else if (this.isSystem(name)) need(admin, "the admin password");
       const input = method === "PUT" ? await body() : null;
       const key = `${ip}|app:${name}`;
       // The hashing comes first, so the checks and the change below run with no await between them and no other
@@ -1133,6 +1143,90 @@ export class Control {
 
   // ---- projects ----
 
+  isSystem(name) { return Boolean(this.systemRouter && name === this.systemRouter.name); }
+
+  async systemRoutingMetrics() {
+    const now = Date.now();
+    if (!this.systemRouter) return {now,replicas:[],totals:null};
+    if (this.routingMetricsCache && now-this.routingMetricsCache.now < 5000) return this.routingMetricsCache;
+    if (this.routingMetricsJob) return this.routingMetricsJob;
+    this.routingMetricSamples ??= new Map();
+    this.routingMetricsJob = (async()=>{
+      const replicas = await Promise.all(this.copiesOf(this.systemRouter.name).filter(x=>!x.leaving).map(async x=>{
+        const row = {replica:x.replica,machine:x.machine,ok:false};
+        try {
+          const response = await fetch(`https://${this.systemRouter.name}-${x.replica}.${this.env.DOMAIN}/metrics`,{signal:AbortSignal.timeout(4000),headers:{"user-agent":"Mozilla/5.0"}});
+          if (!response.ok) return row;
+          const stats = await response.json();
+          if (typeof stats.instance !== "string" || stats.instance.length > 100) return row;
+          const values = {};
+          for (const k of ["requests","active","bytesToClients","failedResponses","upstreamFailures","failovers","streamResumes","websockets"]) {
+            if (!Number.isSafeInteger(stats[k]) || stats[k] < 0) return row;
+            values[k] = stats[k];
+          }
+          const previous = this.routingMetricSamples.get(stats.instance), elapsed = previous && (now-previous.at)/1000;
+          values.requestsPerSecond = elapsed > 0 ? Math.max(0,(values.requests-previous.requests)/elapsed) : null;
+          values.bytesPerSecond = elapsed > 0 ? Math.max(0,(values.bytesToClients-previous.bytesToClients)/elapsed) : null;
+          this.routingMetricSamples.set(stats.instance,{at:now,...values});
+          return {...row,ok:true,instance:stats.instance,uptimeSeconds:Number.isSafeInteger(stats.startedAt)?Math.max(0,(now-stats.startedAt)/1000):null,...values};
+        } catch {return row;}
+      }));
+      const totals = {}, seen = new Set();
+      for (const row of replicas.filter(r=>r.ok)) {
+        if (seen.has(row.instance)) continue;
+        seen.add(row.instance);
+        for (const [k,value] of Object.entries(row)) if (!["replica","machine","uptimeSeconds"].includes(k) && typeof value === "number") totals[k]=(totals[k]??0)+value;
+      }
+      for (const [id,sample] of this.routingMetricSamples) if(now-sample.at>3600_000) this.routingMetricSamples.delete(id);
+      this.routingMetricsCache = {now,replicas:replicas.sort((a,b)=>a.replica-b.replica),totals};
+      return this.routingMetricsCache;
+    })().finally(()=>{this.routingMetricsJob=null;});
+    return this.routingMetricsJob;
+  }
+
+  protectSystem(name) {
+    if (this.isSystem(name)) throw new HttpError(403, "global routing is required system infrastructure and is managed automatically");
+  }
+
+  ensureSystemRouter() {
+    const apply = () => {
+    const definition = this.systemRouter, prior = this.projects.get(definition.name);
+    const latest = prior && this.version(prior.name, prior.version);
+    const spec = buildSpec(definition, {trusted:true});
+    const same = latest && latest.compose === spec.compose && latest.port === spec.port && latest.replicas === spec.replicas && JSON.stringify(latest.files) === JSON.stringify(spec.files);
+    if (!same) {
+      this.putProject(definition.name, definition, {trusted:true, system:true});
+      if (prior) this.saveProject({...this.project(definition.name),stable:prior.stable ?? prior.version});
+    }
+    const p = this.project(definition.name);
+    if (!p.enabled || p.halted) this.saveProject({...p,enabled:1,halted:null});
+    const legacyToken = this.appEnv.get(definition.name)?.get("TUNNEL_TOKEN");
+    if (legacyToken) {
+      this.systemSecrets.push(legacyToken);
+      this.appEnv.get(definition.name).delete("TUNNEL_TOKEN");
+      this.sql.exec("DELETE FROM app_env WHERE name = ? AND key = 'TUNNEL_TOKEN'",definition.name);
+    }
+    if (this.appPasswords.has(definition.name)) {
+      this.appPasswords.delete(definition.name);
+      this.sql.exec("DELETE FROM app_passwords WHERE name = ?",definition.name);
+    }
+    };
+    return this.sql.mutate ? this.sql.mutate(apply) : apply();
+  }
+
+  // Keep two copies serving while the required router upgrades one replica at a time.
+  systemVersion(p, copy, now) {
+    if (!this.isSystem(p.name) || p.stable === p.version || !this.version(p.name,p.stable)) return p.version;
+    const runs = this.liveRuns(now);
+    const reports = x => runs.filter(r => r.machine === x.machine).map(r => r.status?.[x.key]).filter(Boolean);
+    const ready = x => reports(x).some(s => s.v === p.version && s.s === "healthy" && s.r !== false);
+    const serving = x => reports(x).some(s => s.s === "healthy" && s.r !== false);
+    const copies = this.copiesOf(p.name).filter(x => !x.leaving).sort((a,b) => a.replica-b.replica);
+    const changing = copies.find(x => !ready(x) && reports(x).some(s => s.v === p.version));
+    const next = changing ?? copies.find(x => !ready(x) && !serving(x)) ?? copies.find(x => !ready(x));
+    return ready(copy) || copy.replica === next?.replica ? p.version : p.stable;
+  }
+
   describe(p) {
     const latest = this.version(p.name, p.version);
     const placed = this.copiesOf(p.name).map((x) => ({ machine: x.machine, replica: x.replica, region: regionForReplica(latest?.policy, x.replica), key: x.key, since: x.since, reason: x.reason, cause: x.cause, leaving: x.leaving, moved: Boolean(x.ports) }))
@@ -1140,10 +1234,11 @@ export class Control {
     const staying = placed.filter((x) => !x.leaving).length;
     return {
       name: p.name,
+      system: this.isSystem(p.name),
       version: p.version,
       stable: p.stable,
       port: latest?.port ?? null,
-      globalUrl: latest?.port ? `https://${p.name}.${this.env.DOMAIN}/` : null,
+      globalUrl: !this.isSystem(p.name) && latest?.port ? `https://${p.name}.${this.env.DOMAIN}/` : null,
       replicas: latest?.replicas ?? 1,
       region: latest?.policy.region ?? null,
       regions: latest?.policy.regions ?? [],
@@ -1185,7 +1280,8 @@ export class Control {
   }
 
   // A new spec becomes a new version, which goes to every machine at once.
-  putProject(name, body, { trusted = false } = {}) {
+  putProject(name, body, { trusted = false, system = false } = {}) {
+    if (!system) this.protectSystem(name);
     if (!NAME.test(name)) throw new HttpError(400, "app names are lowercase letters, digits and dashes");
     if (!this.projects.has(name) && ["control", "runners", this.env.CONTROL_HOST?.split(".")[0]].includes(name)) {
       throw new HttpError(400, "that name is reserved for the control plane's public addresses");
@@ -1233,6 +1329,7 @@ export class Control {
 
   // Disabled projects stay in the list with their versions, but no machine runs them.
   setEnabled(name, enabled) {
+    this.protectSystem(name);
     const p = this.project(name);
     this.saveProject({ ...p, enabled: enabled ? 1 : 0, updated: Date.now() });
     this.place(Date.now());
@@ -1273,6 +1370,7 @@ export class Control {
   }
 
   putEnv(name, body) {
+    this.protectSystem(name);
     const p = this.project(name);
     if (!isMap(body) || !Object.keys(body).length) throw new HttpError(400, 'send {"KEY": "value"} to set a variable and {"KEY": null} to remove one');
     const t = Date.now();
@@ -1305,12 +1403,20 @@ export class Control {
     ];
     // SQLite reloads keys in sorted order. Keep hot edits in that same order so
     // a controller restart cannot change a copy's content revision on its own.
-    const variables = [...(this.appEnv.get(name) ?? [])].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    const values = new Map(this.appEnv.get(name) ?? []);
+    if (this.isSystem(name)) {
+      values.set("DOMAIN", this.env.DOMAIN);
+      values.set("STATUS_URL", `${this.env.PUBLIC_URL || `https://${this.env.CONTROL_HOST || `runners.${this.env.DOMAIN}`}`}/api/status`);
+      values.set("TUNNEL_TOKEN", this.globalToken);
+      values.set("ROUTES_FALLBACK", values.get("ROUTES_FALLBACK") || "{}");
+    }
+    const variables = [...values].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
     for (const [k, val] of variables) lines.push(`${k}=${quote(val)}`);
     return `${lines.join("\n")}\n`;
   }
 
   deleteProject(name) {
+    this.protectSystem(name);
     this.project(name);
     this.projects.delete(name);
     this.sql.exec("DELETE FROM projects WHERE name = ?", name);
@@ -1373,10 +1479,11 @@ export class Control {
     const out = {};
     for (const p of this.projects.values()) {
       if (!p.enabled) continue;
-      const v = p.halted ? p.stable : p.version;
-      if (v == null) continue;
-      const spec = this.version(p.name, v);
+      if (this.isSystem(p.name) && !this.globalToken) continue;
       for (const x of this.copiesOn(p.name, machine)) {
+        const v = this.isSystem(p.name) ? this.systemVersion(p,x,Date.now()) : p.halted ? p.stable : p.version;
+        if (v == null) continue;
+        const spec = this.version(p.name,v);
         // A successor doesn't build copies that are moving off the machine.
         if (successor && x.leaving) continue;
         // Keep a serving copy during a region change, while its replacement
@@ -3443,11 +3550,12 @@ export class Control {
     if (this.tunnelsReady) return Promise.resolve();
     if (!this.tunnelRecoveryJob) {
       this.tunnelRecoveryJob = (async () => {
-        const found = new Map();
+        const found = new Map(), globals = [];
         for (let page = 1; ; page++) {
           const data = await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=1000&page=${page}`);
           if (!Array.isArray(data.result)) throw new Error("Cloudflare returned an invalid tunnel listing");
           for (const tunnel of data.result) {
+            if (this.systemRouter && tunnel.name === this.globalTunnelName && !tunnel.deleted_at) globals.push(tunnel);
             const prefix = `${this.tunnelPrefix}-`;
             const match = typeof tunnel?.name === "string" && tunnel.name.startsWith(prefix) ? /^([1-9]\d*)$/.exec(tunnel.name.slice(prefix.length)) : null;
             if (!match || tunnel.deleted_at) continue;
@@ -3462,6 +3570,10 @@ export class Control {
           if (pages ? page >= pages : data.result.length < perPage) break;
           if (!data.result.length) throw new Error("Cloudflare returned an incomplete tunnel listing");
         }
+        if (this.systemRouter) {
+          if (globals.length > 1) throw new Error(`multiple Cloudflare tunnels are named ${this.globalTunnelName}`);
+          await this.provisionGlobalTunnel(globals[0]);
+        }
         this.sql.exec("DELETE FROM slots");
         for (const slot of found.values()) this.sql.exec("INSERT INTO slots (n,tunnel,token,created) VALUES (?,?,?,?)", slot.n, slot.tunnel, "", Date.now());
         this.slots = found;
@@ -3474,6 +3586,27 @@ export class Control {
       }).finally(() => { this.tunnelRecoveryJob = null; });
     }
     return this.tunnelRecoveryJob;
+  }
+
+  async provisionGlobalTunnel(existing) {
+    const account = this.env.ACCOUNT_ID;
+    let tunnel = existing;
+    if (!tunnel) {
+      const secret = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))));
+      tunnel = (await this.cf(`/accounts/${account}/cfd_tunnel`, {method:"POST",
+        body:JSON.stringify({name:this.globalTunnelName,config_src:"cloudflare",tunnel_secret:secret})})).result;
+    }
+    if (typeof tunnel?.id !== "string" || !tunnel.id) throw new Error("Cloudflare returned an invalid global routing tunnel");
+    const path = `/accounts/${account}/cfd_tunnel/${tunnel.id}`;
+    const current = (await this.cf(`${path}/configurations`)).result?.config;
+    const config = {ingress:[{service:"http://app:18278"}]};
+    if (JSON.stringify(current?.ingress) !== JSON.stringify(config.ingress)) {
+      await this.cf(`${path}/configurations`, {method:"PUT",body:JSON.stringify({config})});
+    }
+    const token = (await this.cf(`${path}/token`)).result;
+    if (typeof token !== "string" || !token) throw new Error("Cloudflare returned no global routing token");
+    this.globalTunnel = tunnel.id;
+    this.globalToken = token;
   }
 
   // Tunnel runner-<n>: reuse a discovered ID; fetch its token only when a machine
@@ -3544,8 +3677,7 @@ export class Control {
     return { retired: n, tunnel: slot?.tunnel ?? null };
   }
 
-  // Every public app has a global name as well as its numbered names. The global name follows a healthy copy;
-  // it uses the existing machine tunnel and needs no additional connector or per-app routing setting.
+  // Every public app has a global name through the required system router and numbered names through its agents.
   // Where each replica's public name should point: the tunnel of the machine running that copy. While a replica is
   // being moved (two copies), the new one once it's healthy, else the old one. Replicas with no copy yet have no
   // target (their names are left as they are).
@@ -3553,18 +3685,10 @@ export class Control {
     const want = new Map(); // "<project>" or "<project>-<k>" -> tunnel id
     const newest = this.liveMachines(now);
     const healthy = (name, x) => newest.get(x.machine)?.status[this.keyOn(name, x.machine, x.replica)]?.s === "healthy";
-    // During an upgrade old and new connectors can share a slot. Wait for every live connector in that slot to
-    // understand global hosts; otherwise Cloudflare could send a global request to an older replica-only router.
-    const legacySlots = new Set([...this.runs.values()].filter((r) => this.live(r, now) && r.ready && !(r.protocol >= 4)).map((r) => r.machine));
     for (const p of this.projects.values()) {
       const spec = this.version(p.name, p.version);
       if (!spec?.port) continue;
-      const global = p.enabled && this.copiesOf(p.name).filter((x) => {
-        const r = newest.get(x.machine), s = r?.status[this.keyOn(p.name, x.machine, x.replica)];
-        return r?.protocol >= 4 && r.ready && r.edges !== 0 && !legacySlots.has(x.machine) && s?.s === "healthy" && s.r !== false;
-      }).sort((a, b) => Boolean(a.leaving) - Boolean(b.leaving) || a.replica - b.replica || a.machine - b.machine)[0];
-      const globalTunnel = global && this.slots.get(global.machine)?.tunnel;
-      if (globalTunnel) want.set(p.name, globalTunnel);
+      if (this.globalTunnel && !this.isSystem(p.name)) want.set(p.name, this.globalTunnel);
       for (let k = 1; k <= spec.replicas; k++) {
         const copies = this.copiesOf(p.name).filter((x) => x.replica === k);
         const pick = copies.find((x) => !x.leaving && healthy(p.name, x)) ?? copies.find((x) => x.leaving && healthy(p.name, x))
@@ -3769,7 +3893,7 @@ export class Control {
     }
     return Response.json({
       now, range: rangeName, servers: this.fleetSize(now),
-      projects: [...this.projects.values()].map((p) => this.describe(p)).sort((a, b) => a.name.localeCompare(b.name)),
+      projects: [...this.projects.values()].filter(p => !this.isSystem(p.name)).map((p) => this.describe(p)).sort((a, b) => a.name.localeCompare(b.name)),
       live: this.liveNow(now), ...c.history,
     }, { headers: { "cache-control": "no-store" } });
   }
@@ -3785,6 +3909,8 @@ export class Control {
         machines: [...this.liveMachines(now).values()].filter((r) => machineRegion(r) === name).length,
       })),
       fleetMode: "passive",
+      infrastructure: this.systemRouter ? {globalRouter:{...this.describe(this.project(this.systemRouter.name)),required:true,
+        tunnelReady:Boolean(this.globalTunnel && this.globalToken)}} : {},
       groups: this.groups(now),
       servers: this.fleetSize(now),
       dnsError: this.dnsError,
@@ -3821,7 +3947,7 @@ export class Control {
         ...[...this.runs.values()].filter((r) => now - r.seen < 3600_000).map((r) => r.machine),
         ...[...this.starts].filter(([, at]) => now - at < START_WAIT_MS).map(([n]) => n),
       ])].sort((a, b) => a - b),
-      projects: [...this.projects.values()].sort((a, b) => a.name.localeCompare(b.name)).map((p) => this.describe(p)),
+      projects: [...this.projects.values()].filter(p => !this.isSystem(p.name)).sort((a, b) => a.name.localeCompare(b.name)).map((p) => this.describe(p)),
       runs: [...this.runs.values()]
         .filter((r) => now - r.seen < 3600_000)
         .sort((a, b) => a.machine - b.machine || a.started - b.started)
@@ -3910,12 +4036,14 @@ export class Control {
     const zone = this.env.ZONE;
     const now = Date.now();
     const ours = new Set([...this.slots.values()].map((x) => `${x.tunnel}.cfargotunnel.com`));
+    const ingress = this.globalTunnel && `${this.globalTunnel}.cfargotunnel.com`;
+    if (ingress) ours.add(ingress);
     const want = new Map([...this.dnsTargets(now)].map(([label, tunnel]) => [`${label}.${domain}`, `${tunnel}.cfargotunnel.com`]));
     const names = new Set(); // every app and replica name, with a target or not
     for (const p of this.projects.values()) {
       const spec = this.version(p.name, p.version);
       if (!spec?.port) continue;
-      names.add(`${p.name}.${domain}`);
+      if (!this.isSystem(p.name)) names.add(`${p.name}.${domain}`);
       for (let k = 1; k <= spec.replicas; k++) names.add(`${p.name}-${k}.${domain}`);
     }
     const existing = [];
@@ -3924,7 +4052,10 @@ export class Control {
       existing.push(...data.result);
       if (page >= (data.result_info?.total_pages ?? 1)) break;
     }
-    const deletes = existing.filter((r) => r.type === "CNAME" && ours.has(r.content) && !names.has(r.name));
+    // A shared ingress may also serve names outside this fleet. Only records explicitly adopted for our apps
+    // carry our marker; do not delete another user's aliases just because they use the same ingress tunnel.
+    const deletes = existing.filter((r) => r.type === "CNAME" && ours.has(r.content) && !names.has(r.name) &&
+      (r.content !== ingress || r.comment === DNS_COMMENT));
     const gone = new Set(deletes.map((r) => r.id));
     const byName = new Map();
     for (const r of existing) if (!gone.has(r.id)) (byName.get(r.name) ?? byName.set(r.name, []).get(r.name)).push(r);
@@ -3937,8 +4068,11 @@ export class Control {
       const r = rs.find((x) => x.type === "CNAME");
       if (!rs.length) posts.push({ type: "CNAME", name, content, proxied: true, comment: DNS_COMMENT });
       else if (r && r.content !== content && ours.has(r.content)) {
-        patches.push({ id: r.id, content });
+        patches.push({ id: r.id, content, ...(content === ingress ? { comment: DNS_COMMENT, proxied: true } : {}) });
         repointed.push([name, content]);
+      }
+      else if (r && r.content === ingress && (r.comment !== DNS_COMMENT || r.proxied === false)) {
+        patches.push({ id: r.id, comment: DNS_COMMENT, proxied: true });
       }
       else if (!r || !ours.has(r.content)) notes.push(`${name} is already used by another DNS record, so it can't point at its server`);
     }

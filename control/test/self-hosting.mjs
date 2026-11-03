@@ -60,7 +60,8 @@ try {
       identity(legacy, { persistNamespace: true });
       const file = join(legacyDirectory, "identity.json");
       const saved = JSON.parse(readFileSync(file, "utf8"));
-      assert.deepEqual(Object.keys(saved).sort(), ["CONTROLLER_TUNNEL_NAME", "TUNNEL_PREFIX"]);
+      assert.deepEqual(Object.keys(saved).sort(), ["CONTROLLER_TUNNEL_NAME", "GLOBAL_TUNNEL_NAME", "TUNNEL_PREFIX"]);
+      assert.equal(saved.GLOBAL_TUNNEL_NAME, "runner-global");
       assert.equal(saved.TUNNEL_PREFIX, "runner");
       assert.equal(statSync(file).mode & 0o777, 0o600);
       const before = statSync(file).mtimeMs;

@@ -80,3 +80,7 @@ curl -fsS https://runners.example.com/healthz
 ```
 
 The Docker host type must be `linux` for an agent. Successful HTTP health alone does not prove scheduling is ready; also check Docker health and the controller's recovery/tunnel status. Continue with the [control plane guide](../control/README.md), [agent guide](../agent/README.md) or complete [self-hosting sequence](self-hosting.md).
+
+## System routing capacity
+
+The controller automatically maintains three global-router copies on distinct agent hosts. Provide at least three healthy Linux Docker hosts for full routing redundancy. Each copy includes a Node routing process and cloudflared connector, with container memory limits of 192 MiB and 128 MiB respectively. With fewer hosts, available copies serve while the remaining copies wait for capacity. Global routing uses one shared tunnel regardless of the number of apps. See [public addresses](public-addresses.md) for the failure and recovery behavior.

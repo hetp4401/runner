@@ -113,7 +113,9 @@ try {
   const body = { agent: "test-agent", machine: agent.machine, run: "test-run", pool: "test", poolSize: 1, started, protocol: 2, ready: true, status: {}, metrics: { live: { t: started, h: { cpu: 5, memUsed: 100, memTotal: 1000 }, a: {} } } };
   await connect();
   let plan = await sync(body);
-  assert.equal(Object.keys(plan.desired).length, 2);
+  assert.equal(Object.values(plan.desired).filter(p => p.app !== "global-router").length, 2);
+  assert.equal(Object.values(plan.desired).filter(p => p.app === "global-router").length, 1);
+  assert.equal((await request("/status")).infrastructure.globalRouter.replicas, 3);
   body.status = Object.fromEntries(Object.entries(plan.desired).map(([key, p]) => [key, { v: p.v, s: "healthy", r: true, t0: started, n: 0 }]));
   body.recovery = plan.recovery;
   plan = await sync(body);
@@ -146,13 +148,13 @@ try {
   assert.equal(ready.controlPlane.tunnelStorage, "memory");
   assert.equal(ready.controlPlane.tunnelsReady, true);
   assert.equal(ready.controlPlane.tunnelsDiscovered, 1);
-  assert.equal(createdTunnels, 1);
-  assert.equal(tokenRequests, 1);
-  console.log("ok restart discovers the existing tunnel without recreating it or fetching its token");
+  assert.equal(createdTunnels, 2);
+  assert.equal(tokenRequests, 3);
+  console.log("ok restart reuses both tunnels and refreshes only the required routing token");
   plan = await sync(body);
   assert.equal(plan.hold, undefined);
   assert.equal(plan.retire, false);
-  assert.deepEqual(Object.keys(plan.desired), ["web"]);
+  assert.deepEqual(Object.keys(plan.desired).filter(key => plan.desired[key].app !== "global-router"), ["web"]);
   assert.equal(plan.desired.web.v, changed.version);
   assert.match(plan.desired.web.files[".env"], /updated-durable-secret/);
   console.log("ok recovery keeps the known replica, applies current config and removes the deleted app");

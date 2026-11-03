@@ -5,7 +5,7 @@ import { Control } from "./index.js";
 import { LocalStore } from "./local-store.mjs";
 
 const IDENTITY_KEYS = ["ADMIN_PASSWORD", "JOIN_TOKEN", "STATE_SIGNING_KEY"];
-const NAMESPACE_KEYS = ["TUNNEL_PREFIX", "CONTROLLER_TUNNEL_NAME"];
+const NAMESPACE_KEYS = ["TUNNEL_PREFIX", "CONTROLLER_TUNNEL_NAME", "GLOBAL_TUNNEL_NAME"];
 const hostname = (value, label) => {
   const text = String(value || "").toLowerCase().replace(/\.$/, "");
   if (text.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(text)) throw new Error(`${label} must be a DNS hostname, without a scheme or path`);
@@ -22,6 +22,7 @@ function flag(value, name, fallback) {
 function namespace(env, saved = {}) {
   const suffix = createHash("sha256").update(env.CONTROL_HOST).digest("hex").slice(0, 12);
   const defaults = { TUNNEL_PREFIX: `runner-${suffix}`, CONTROLLER_TUNNEL_NAME: `control-${suffix}` };
+  defaults.GLOBAL_TUNNEL_NAME = `${saved.TUNNEL_PREFIX || env.TUNNEL_PREFIX || defaults.TUNNEL_PREFIX}-global`;
   const out = {};
   for (const key of NAMESPACE_KEYS) {
     if (Object.hasOwn(saved, key) && (typeof saved[key] !== "string" || !saved[key])) throw new Error(`invalid ${key} in saved fleet identity`);
@@ -30,6 +31,8 @@ function namespace(env, saved = {}) {
   }
   if (typeof out.TUNNEL_PREFIX !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(out.TUNNEL_PREFIX)) throw new Error("invalid TUNNEL_PREFIX");
   if (typeof out.CONTROLLER_TUNNEL_NAME !== "string" || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(out.CONTROLLER_TUNNEL_NAME)) throw new Error("invalid CONTROLLER_TUNNEL_NAME");
+  if (typeof out.GLOBAL_TUNNEL_NAME !== "string" || !/^[a-z0-9][a-z0-9-]{0,99}$/.test(out.GLOBAL_TUNNEL_NAME)) throw new Error("invalid GLOBAL_TUNNEL_NAME");
+  if (out.GLOBAL_TUNNEL_NAME === out.CONTROLLER_TUNNEL_NAME || out.GLOBAL_TUNNEL_NAME.startsWith(`${out.TUNNEL_PREFIX}-`) && /^\d+$/.test(out.GLOBAL_TUNNEL_NAME.slice(out.TUNNEL_PREFIX.length+1))) throw new Error("global routing must have its own tunnel namespace");
   if (out.CONTROLLER_TUNNEL_NAME.startsWith(`${out.TUNNEL_PREFIX}-`) && /^[1-9]\d*$/.test(out.CONTROLLER_TUNNEL_NAME.slice(out.TUNNEL_PREFIX.length + 1))) throw new Error("the controller tunnel name must not overlap the agent tunnel namespace");
   return out;
 }

@@ -75,7 +75,7 @@ http.createServer(async(req,res)=>{
   let result=[];
   if(url.pathname.endsWith('/token')) result='fake-controller-token';
   else if(url.pathname.includes('/cfd_tunnel')) {
-    if(req.method==='POST') {const tunnel={...body,id:'controller-id'};tunnels.push(tunnel);result=tunnel;}
+    if(req.method==='POST') {const tunnel={...body,id:'tunnel-'+tunnels.length};tunnels.push(tunnel);result=tunnel;}
     else result=tunnels;
   } else if(url.pathname.includes('/dns_records')) {
     if(req.method==='POST') {const record={...body,id:'controller-record'};records.push(record);result=record;}

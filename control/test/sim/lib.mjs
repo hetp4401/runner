@@ -20,10 +20,10 @@ class SimControl extends Control {
   }
 }
 
-export function makeControl(env = {}, db = new DatabaseSync(":memory:")) {
+export function makeControl(env = {}, db = new DatabaseSync(":memory:"), dependencies = {}) {
   const sql = { exec(q, ...a) { const rows = db.prepare(q).all(...a); return { toArray: () => rows }; } };
   const control = new SimControl({
-    sql, page: "", alarm() {}, restart() {},
+    sql, page: "", alarm() {}, restart() {}, ...dependencies,
     env: { DOMAIN: "sim.example", JOIN_TOKEN: "node", ADMIN_PASSWORD: "adm", DNS: "off", POLL_S: "20", ...env },
   });
   control.db = db;

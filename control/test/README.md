@@ -76,8 +76,8 @@ In separate terminals, run `node test/cloudflare-mock.mjs` (port 8790) and `npx 
 
 For the archived Cloudflare-only mode, substitute `test/wrangler.cloudflare.jsonc` and a fresh `/tmp/runner-cloudflare-test` state directory in both Wrangler commands, then run `node test/hybrid-live.mjs --cloudflare`. This verifies that authenticated external schedulers are refused, the DO handles plans and configuration directly, and cold recovery preserves the encrypted configuration without persisting agent health.
 
-## Automatic public addresses
+## Required routing and public addresses
 
-Run `node control/test/sim/global-domains.test.mjs` from the repository root for DNS creation, failover, mixed-agent upgrades, moves, recovery, conflicts and deletion. `node control/test/ui-lifecycle.mjs` verifies that the main app link is global and numbered replica links remain.
+From the repository root, run `node control/test/sim/global-domains.test.mjs` for required infrastructure provisioning, API protection, placement, rolling upgrades, metrics, DNS ownership and lifecycle. `node control/test/ui-lifecycle.mjs` covers the separate Routing view, polling cancellation, global main links and numbered replica links.
 
-On Linux, run `python3 control/test/global-routing-docker.py runner-agent:local` after building the agent image. This uses real Caddy with disposable local origins and verifies mapped ports, readiness changes, request forwarding, streaming and WebSocket upgrades without changing Cloudflare.
+Run `node --test gateway/test/*.test.mjs` for real HTTP and WebSocket routing, mid-stream disconnection, multiple upstream failures, byte-range continuation, stale-file protection, stalled origins, client cancellation and public counters. Docker smoke tests verify that the controller image bundles the required routing source and enforces its API protection.

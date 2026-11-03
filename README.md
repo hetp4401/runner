@@ -10,6 +10,7 @@ Run one agent on each Linux Docker host. A standalone host keeps its slot across
 | --- | --- |
 | [Control plane](control/README.md) | Controller source, configuration, deployment, operation and development. |
 | [Agent](agent/README.md) | Host agent source, installation, configuration, upgrades and removal. |
+| [System router](gateway/README.md) | Required global ingress, replica failover, stream recovery and routing metrics. |
 | [Requirements](docs/requirements.md) | Software, permissions, Cloudflare credentials, network access and storage for each module. |
 | [Self-hosting guide](docs/self-hosting.md) | Bring up a controller, join hosts and deploy your first app. |
 | [VPS operations](docs/vps-control.md) | Run, back up, restore and migrate a controller on a server. |
@@ -51,7 +52,7 @@ Installation downloads and verifies the CP's bundled agent release, then builds 
 
 ## Projects
 
-A project is a Docker Compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Every public app automatically gets a global URL, `https://<project>.example.com`, plus `https://<project>-<k>.example.com` for each replica *k*, numbered from 1. The global address follows a healthy copy; numbered addresses follow their replicas across moves. Both are always provided, with no routing option to set. The dashboard shows the global URL as the main app link and keeps individual replica links. See [public addresses](docs/public-addresses.md) for failover and upgrades. The port comes from the `port` field, or from `x-runner.port` in the compose file.
+A project is a Docker Compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Every public app automatically gets a global URL, `https://<project>.example.com`, plus `https://<project>-<k>.example.com` for each replica *k*, numbered from 1. The global address uses the required system router to reach a healthy copy; numbered addresses follow their replicas across moves. Both are always provided, with no routing option to set. The dashboard shows the global URL as the main app link and keeps individual replica links. The required router has its own Routing section and metrics, separate from user apps. See [public addresses](docs/public-addresses.md) for failover and upgrades. The port comes from the `port` field, or from `x-runner.port` in the compose file.
 
 - **Compose only:** services use published images.
 

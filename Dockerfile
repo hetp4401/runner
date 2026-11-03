@@ -11,6 +11,7 @@ COPY control/src ./src
 COPY control/server.mjs control/docker-entrypoint.mjs control/healthcheck.mjs control/agent.Dockerfile control/agent-launcher.mjs ./
 COPY --chmod=755 control/docker-entrypoint.sh ./
 COPY agent /app/agent
+COPY gateway /app/gateway
 RUN mkdir -p /data /run/runner && chown node:node /data /run/runner
 USER node
 VOLUME ["/data"]

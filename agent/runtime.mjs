@@ -6,29 +6,6 @@ import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export const OWNER_LABEL = "io.runners.owner";
 export const COPY_LABEL = "io.runners.copy";
-
-// Numbered hosts always select their own copy. The global host selects the first
-// ready local copy, deterministically, including when ports were remapped.
-export function appRoutes(projects, domain) {
-  if (!domain) return [];
-  const proxy = (p) => ({ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }],
-    flush_interval: -1, stream_close_delay: "1h" });
-  const apps = new Map(), routes = [];
-  for (const p of projects) {
-    if (!p.port) continue;
-    routes.push({ match: [{ host: [`${p.app}-${p.replica}.${domain}`] }], handle: [proxy(p)] });
-    (apps.get(p.app) ?? apps.set(p.app, []).get(p.app)).push(p);
-  }
-  for (const [app, copies] of apps) {
-    const ready = copies.filter((p) => p.s === "healthy" && p.r !== false && !p.busy).sort((a, b) => a.replica - b.replica)[0];
-    routes.push({ match: [{ host: [`${app}.${domain}`] }], handle: [ready ? proxy(ready) : {
-      handler: "static_response", status_code: 503, headers: { "X-Runner-Route": ["unavailable"], "Retry-After": ["2"] },
-      body: "No healthy copy of this app is available on this machine\n",
-    }] });
-  }
-  return routes;
-}
-
 export function resolveServerTag(env, saved = null) {
   const value = env.SERVER_TAG ?? env.POOL ?? saved?.tag ?? saved?.pool ??
     (saved?.run && saved?.control === env.CONTROL_URL ? "standalone" : null);
