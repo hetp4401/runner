@@ -22,14 +22,14 @@ Use the official [Docker Engine installation guide](https://docs.docker.com/engi
 
 ## Cloudflare account and DNS
 
-Use an active DNS zone, such as `example.com`, in your Cloudflare account. Set `DOMAIN=example.com`. The default controller hostname is `runners.example.com`; app replicas receive names such as `hello-1.example.com`.
+Use an active DNS zone, such as `example.com`, in your Cloudflare account. Set `DOMAIN=example.com`. The default controller hostname is `runners.example.com`; public apps receive `hello.example.com` plus replica names such as `hello-1.example.com`, automatically. These hostnames must be available.
 
 Create an API token scoped to that account and zone:
 
 | Scope | Permission | Used for |
 | --- | --- | --- |
 | Account | Cloudflare Tunnel: Edit | Creating, discovering and managing the fleet's tunnels. |
-| Zone | DNS: Edit | Creating and updating controller and replica DNS records. |
+| Zone | DNS: Edit | Creating and updating controller, global app and replica DNS records. |
 | Zone | Zone: Read | Discovering account/zone IDs from `DOMAIN`. Optional if both `ACCOUNT_ID` and `ZONE` are supplied. |
 
 Set `CF_API_TOKEN` only on the controller. The alternative is a Global API Key with both `CF_API_KEY` and `CF_API_EMAIL`. See Cloudflare's [API token permissions](https://developers.cloudflare.com/fundamentals/api/reference/permissions/).

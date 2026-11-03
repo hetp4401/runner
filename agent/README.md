@@ -41,6 +41,8 @@ sudo docker logs --tail 100 -f runner-agent
 
 The agent receives a slot and a tunnel connection token. Cloudflare's management API credential stays on the controller.
 
+The local router serves both automatic global app addresses (`hello.example.com`) and numbered replica addresses (`hello-1.example.com`). Global requests use a ready local copy; numbered requests select that replica even when its port was remapped. No routing flag or additional connector is needed. See [public addresses](../docs/public-addresses.md).
+
 ## Configuration
 
 | Setting | Purpose |

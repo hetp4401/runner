@@ -45,6 +45,14 @@ const spec = v => ({name:'web',version:v,compose:`version ${v}`,files:{},port:80
 let passed=0;
 async function check(name,fn) { await fn(); console.log('PASS:',name); passed++; }
 
+await check('the main app link is global and replica rows keep their numbered URLs',()=>{
+  const h=harness(); h.context.hooks.spec=(_name,v)=>Promise.resolve(spec(v));
+  h.run('view=vApp("web"); view.status();');
+  assert.match(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web\.example\.test\/"[^>]*aria-label="Global app address"/);
+  assert.doesNotMatch(h.nodes.get('#ad-head').innerHTML,/href="https:\/\/web-1\.example\.test\//);
+  assert.match(h.nodes.get('#ad-replicas').innerHTML,/href="https:\/\/web-1\.example\.test\/"/);
+});
+
 await check('recovered incidents remain in history without counting as current problems',()=>{
   const h=harness();
   h.status.alerts=[{cause:'fails-everywhere',app:'web',t:now-20000,text:'web version 2 failed'},

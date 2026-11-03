@@ -2,6 +2,8 @@
 
 The control plane accepts app definitions, schedules their replicas across connected agents, manages public DNS and tunnels, and exposes the dashboard and API. Run one controller per fleet.
 
+Every public app automatically gets a global hostname and a hostname for each replica. The dashboard uses the global URL as the main link and retains numbered replica links. See [public addresses](../docs/public-addresses.md) for failover and upgrades.
+
 The controller runs independently of the agent hosts. It includes a matching agent release so new hosts can install directly from its `/install.sh` endpoint. Build the image from the repository root: it needs both `control/` and `agent/`.
 
 ## Requirements

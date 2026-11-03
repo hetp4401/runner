@@ -688,11 +688,11 @@ function appFailures(p, runs) {
 }
 const upCount = () => [...runsBy().values()].filter((r) => r.ready).length;
 const replicaUrl = (p, k) => `https://${p.name}-${k}.${S.status.domain}/`;
-// An app's URLs, one per replica: replica 1's as a link, and the range when there are more.
+const globalUrl = (p) => p.globalUrl ?? `https://${p.name}.${S.status.domain}/`;
+// The global URL is the main link; replica chips and rows retain numbered links.
 const appUrls = (p, bold = false) => {
-  const u = replicaUrl(p, 1), text = esc(u.slice(8, -1));
-  return `<a href="${esc(u)}" target="_blank" rel="noopener">${bold ? `<b>${text}</b>` : text}</a>${p.replicas > 1
-    ? ` <span class="meta">… ${esc(p.name)}-${p.replicas}: one URL per replica</span>` : ""}`;
+  const u = globalUrl(p), text = esc(u.slice(8, -1));
+  return `<a href="${esc(u)}" target="_blank" rel="noopener" aria-label="Global app address">${bold ? `<b>${text}</b>` : text}</a> <span class="meta">global · ${plural(p.replicas, "replica URL")}</span>`;
 };
 const appHref = (name) => `#/apps/${enc(name)}`;
 const machineHref = (n) => `#/machines/${n}`;
@@ -1889,7 +1889,7 @@ function vApp(name, q = new URLSearchParams()) {
       document.title = `${name} · Runners`;
       setHtml($("#ad-head"), `<div class="row"><h1 class="grow">${esc(name)}</h1>${appPill(p, runs)}</div>
         <div class="sub">v${p.version} · ${p.port ? `port ${p.port}` : "no port"}${p.region ? ` · region ${esc(p.region)}` : p.regions?.length ? ` · regions ${p.regions.map(esc).join(" / ")}` : ""} · updated ${ago(S.status.now - p.updated)} ago · ${p.files.length ? "built from files" : "published images"}</div>
-        ${p.port ? `<div class="url" style="margin-top:4px">${p.enabled ? appUrls(p, true) : `<span class="meta">Disabled: its URLs answer 503 until it's enabled again.</span>`}</div>` : ""}
+        ${p.port ? `<div class="url" style="margin-top:4px">${appUrls(p, true)}${!p.enabled ? ` <span class="meta">Disabled: its URLs become available when enabled again.</span>` : ""}</div>` : ""}
         <div class="actions"><a class="btn primary" href="#/apps/${enc(name)}/edit">Edit</a>
           <button type="button" data-act="${p.enabled ? "disable" : "enable"}">${p.enabled ? "Disable" : "Enable"}</button>
           <button type="button" class="danger" data-act="delete">Delete</button>
@@ -2052,7 +2052,7 @@ function vEditor(name, sample) {
     const msg = !v ? "" : !NAME.test(v) ? "Lowercase letters, digits and dashes; it can't start or end with a dash"
       : /-m?\d+$/.test(v) ? "It can't end in -<number> or -m<number>: those are the URLs of replicas and servers"
       : taken(v) ? `There's already an app with this name: <a href="${appHref(v)}">open it</a> to edit it` : "";
-    $("#ed-name-hint").innerHTML = msg || `Replica k will be at https://${esc(v || "name")}-k.${esc(S.status?.domain ?? "…")}`;
+    $("#ed-name-hint").innerHTML = msg || `Automatic addresses: https://${esc(v || "name")}.${esc(S.status?.domain ?? "…")} and https://${esc(v || "name")}-k.${esc(S.status?.domain ?? "…")} for replica k`;
     $("#ed-name-hint").className = "hint" + (msg ? " bad" : "");
     return !msg && Boolean(v);
   }
@@ -2463,7 +2463,7 @@ function vGuide() {
       const adminHeader = privateDeploys ? ' -H "x-admin-password: $ADMIN_PASSWORD"' : "";
       $("#guide").innerHTML = `
       <p>An app is a <b>Docker Compose file</b>, a <b>Dockerfile</b>, or both, plus any text files the build needs. It runs as many <b>replicas</b> as it asks for (1 to ${MAX_REPLICAS}, 1 by default), spread over the servers with the most free CPU and memory, one per server while there are servers without one; with more replicas than servers, some servers run two copies (the second one's ports are moved aside for it).
-        Each replica has its own URL: replica <i>k</i> is always at <code>https://&lt;name&gt;-<i>k</i>.${d}</code>, whichever server it's on. There's no shared URL that spreads visitors across replicas, so hand out the replica URL you want people on. WebSockets work there too with nothing to set (<code>wss://&lt;name&gt;-<i>k</i>.${d}/…</code>, any path, on the app's port); Cloudflare closes one that's silent for 100 s, so ping more often.
+        Every app with a public port automatically gets a global URL, <code>https://&lt;name&gt;.${d}</code>, which follows a healthy copy, plus <code>https://&lt;name&gt;-<i>k</i>.${d}</code> for each replica <i>k</i>, whichever server it's on. Both address types are always provided, with no routing option to set. WebSockets work at both addresses (<code>wss://&lt;name&gt;.${d}/…</code> or a numbered replica, any path, on the app's port); Cloudflare closes one that's silent for 100 s, so ping more often.
         Each deploy is a new version, and every replica switches to it at once. If it fails, it stays failing (the app's page shows each server's error) until you deploy a fix or roll back.</p>
       <h3>From this site</h3>
       <ol><li>Open <a href="#/apps/new">New app</a>, or start from one of its examples.</li>

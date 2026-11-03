@@ -397,6 +397,7 @@ const GENERATED = /^(?:x-runner:\n(?:  port: \d+\n)?(?:  replicas: \d+\n)?)?serv
 // with the admin password (trusted), anything that would reach outside the app's container (sandboxProblems).
 function buildSpec(body, { trusted = false } = {}) {
   if (!isMap(body)) throw new HttpError(400, "send a JSON object");
+  if (Object.hasOwn(body, "routing")) throw new HttpError(400, "global and replica addresses are automatic; remove routing");
   let { compose = "", dockerfile = null, files = {}, port = null, replicas = null } = body;
   if (typeof compose !== "string") throw new HttpError(400, "compose must be the compose file as text");
   if (!isMap(files)) throw new HttpError(400, "files must be an object of path: content");
@@ -465,6 +466,7 @@ function buildSpec(body, { trusted = false } = {}) {
   port ??= declared;
   replicas ??= parseReplicas(doc["x-runner"]?.replicas, "x-runner.replicas") ?? 1;
   const xr = isMap(doc["x-runner"]) ? doc["x-runner"] : {};
+  if (Object.hasOwn(xr, "routing")) throw new HttpError(400, "global and replica addresses are automatic; remove x-runner.routing");
   if (xr.ready != null && !(typeof xr.ready === "string" && /^\/[\x21-\x7e]{0,199}$/.test(xr.ready))) throw new HttpError(400, "x-runner.ready is a path, like /healthz");
   if (xr.region != null && !validRegion(xr.region)) {
     throw new HttpError(400, "x-runner.region must be a region label: 1-32 lowercase letters, digits or hyphens, starting with a letter");
@@ -1141,6 +1143,7 @@ export class Control {
       version: p.version,
       stable: p.stable,
       port: latest?.port ?? null,
+      globalUrl: latest?.port ? `https://${p.name}.${this.env.DOMAIN}/` : null,
       replicas: latest?.replicas ?? 1,
       region: latest?.policy.region ?? null,
       regions: latest?.policy.regions ?? [],
@@ -1184,6 +1187,9 @@ export class Control {
   // A new spec becomes a new version, which goes to every machine at once.
   putProject(name, body, { trusted = false } = {}) {
     if (!NAME.test(name)) throw new HttpError(400, "app names are lowercase letters, digits and dashes");
+    if (!this.projects.has(name) && ["control", "runners", this.env.CONTROL_HOST?.split(".")[0]].includes(name)) {
+      throw new HttpError(400, "that name is reserved for the control plane's public addresses");
+    }
     if (!this.projects.has(name) && NUMBERED.test(name)) {
       throw new HttpError(400, "an app name can't end in -<number> or -m<number>: those are the URLs of its replicas and servers");
     }
@@ -3538,16 +3544,27 @@ export class Control {
     return { retired: n, tunnel: slot?.tunnel ?? null };
   }
 
+  // Every public app has a global name as well as its numbered names. The global name follows a healthy copy;
+  // it uses the existing machine tunnel and needs no additional connector or per-app routing setting.
   // Where each replica's public name should point: the tunnel of the machine running that copy. While a replica is
   // being moved (two copies), the new one once it's healthy, else the old one. Replicas with no copy yet have no
   // target (their names are left as they are).
   dnsTargets(now) {
-    const want = new Map(); // "<project>-<k>" -> tunnel id
+    const want = new Map(); // "<project>" or "<project>-<k>" -> tunnel id
     const newest = this.liveMachines(now);
     const healthy = (name, x) => newest.get(x.machine)?.status[this.keyOn(name, x.machine, x.replica)]?.s === "healthy";
+    // During an upgrade old and new connectors can share a slot. Wait for every live connector in that slot to
+    // understand global hosts; otherwise Cloudflare could send a global request to an older replica-only router.
+    const legacySlots = new Set([...this.runs.values()].filter((r) => this.live(r, now) && r.ready && !(r.protocol >= 4)).map((r) => r.machine));
     for (const p of this.projects.values()) {
       const spec = this.version(p.name, p.version);
       if (!spec?.port) continue;
+      const global = p.enabled && this.copiesOf(p.name).filter((x) => {
+        const r = newest.get(x.machine), s = r?.status[this.keyOn(p.name, x.machine, x.replica)];
+        return r?.protocol >= 4 && r.ready && r.edges !== 0 && !legacySlots.has(x.machine) && s?.s === "healthy" && s.r !== false;
+      }).sort((a, b) => Boolean(a.leaving) - Boolean(b.leaving) || a.replica - b.replica || a.machine - b.machine)[0];
+      const globalTunnel = global && this.slots.get(global.machine)?.tunnel;
+      if (globalTunnel) want.set(p.name, globalTunnel);
       for (let k = 1; k <= spec.replicas; k++) {
         const copies = this.copiesOf(p.name).filter((x) => x.replica === k);
         const pick = copies.find((x) => !x.leaving && healthy(p.name, x)) ?? copies.find((x) => x.leaving && healthy(p.name, x))
@@ -3559,7 +3576,7 @@ export class Control {
     return want;
   }
 
-  // A DNS sync whenever a replica's name should point somewhere else than it did.
+  // A DNS sync whenever an app or replica name should point somewhere else than it did.
   followCopies(now) {
     const seen = JSON.stringify([...this.dnsTargets(now)].sort());
     if (seen === this.dnsTargetsSeen) return;
@@ -3841,7 +3858,8 @@ export class Control {
   }
 
   // ---- DNS ----
-  // For every project with a port: <project>-<k>.DOMAIN (k from 1 to its replica count) is a proxied CNAME to the tunnel
+  // For every project with a port: <project>.DOMAIN and <project>-<k>.DOMAIN are proxied CNAMEs to machine tunnels.
+  // The global address follows a healthy copy. Each numbered address points at the tunnel
   // of the machine running replica k, moved when the copy moves. Names whose replica has no copy yet keep their record,
   // if any. Our records are the CNAMEs pointing at our tunnels: the ones no longer wanted (a removed replica) are
   // deleted. Records that aren't ours are left alone and noted.
@@ -3893,10 +3911,11 @@ export class Control {
     const now = Date.now();
     const ours = new Set([...this.slots.values()].map((x) => `${x.tunnel}.cfargotunnel.com`));
     const want = new Map([...this.dnsTargets(now)].map(([label, tunnel]) => [`${label}.${domain}`, `${tunnel}.cfargotunnel.com`]));
-    const names = new Set(); // every replica name, with a target or not
+    const names = new Set(); // every app and replica name, with a target or not
     for (const p of this.projects.values()) {
       const spec = this.version(p.name, p.version);
       if (!spec?.port) continue;
+      names.add(`${p.name}.${domain}`);
       for (let k = 1; k <= spec.replicas; k++) names.add(`${p.name}-${k}.${domain}`);
     }
     const existing = [];

@@ -67,7 +67,7 @@ export ADMIN_PASSWORD='your-admin-password'
 bin/runnerctl apply examples/hello hello --port 9000 --replicas 1
 ```
 
-The app is published at `https://hello-1.example.com`. The CP schedules its container on a connected agent. Change `--replicas` to run more copies; region constraints in the app spec limit where those copies can run.
+The app is published at both `https://hello.example.com` and `https://hello-1.example.com`, automatically. The CP schedules its container on a connected agent. Change `--replicas` to add copies and their numbered addresses; the global hostname stays the same. See [public addresses](public-addresses.md) for failover. Region constraints in the app spec limit where those copies can run.
 
 The CLI also reads its URL from `~/.config/runnerctl/url` and its password from `~/.config/runnerctl/admin-password`. It has no default fleet address.
 

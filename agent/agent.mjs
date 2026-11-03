@@ -1,6 +1,6 @@
 // Runner agent: keeps one machine's projects in line with the control plane.
 // It joins the fleet (the control plane gives it a slot n and the token for tunnel runner-n), starts a local router
-// (each copy of a project answers its replica's public name, <project>-<k>, which DNS points at this machine's tunnel)
+// (each copy answers <project>-<k>, and a ready copy also answers <project>, through this machine's tunnel)
 // and the tunnel, checks in every few seconds, starts, updates and removes docker compose projects to match what it's
 // told, and restarts ones that stop answering. It doesn't know what kind of machine it's on: the settings below
 // describe it.
@@ -24,7 +24,7 @@ import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
-import { namespace, projectName, fingerprint, resumeState, resolveServerTag, ownsCompose, ownsInfrastructure, containerHealth,
+import { namespace, projectName, fingerprint, resumeState, resolveServerTag, appRoutes, ownsCompose, ownsInfrastructure, containerHealth,
   privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
@@ -251,6 +251,7 @@ async function apply(name, want, { recreate = false } = {}) {
   Object.assign(p, { s, e, at: Date.now(), r: s === "healthy" ? await isReady(p) : undefined });
   if (p.sourceDir) await pruneDeploymentFiles(name, p, s === "healthy" ? null : before?.sourceDir).catch(() => {});
   p.busy = false;
+  await updateRouter();
   await saveState();
   wake();
   log(`${name}: v${want.v} ${s}${e ? " (details in authenticated diagnostics)" : ""}`);
@@ -390,12 +391,7 @@ let routerConfig = "";
 const updateRouter = () => (routerChain = routerChain.then(loadRouter, loadRouter).catch((e) => log(`router update failed: ${e.message}`)));
 
 function routerJson() {
-  // Each copy answers its replica's public name. (stream_close_delay: a config reload would otherwise cut every
-  // websocket on the machine.)
-  const routes = [...projects.values()].filter((p) => p.port && domain).map((p) => ({
-    match: [{ host: [replicaHost(p.app, p.replica)] }],
-    handle: [{ handler: "reverse_proxy", upstreams: [{ dial: `127.0.0.1:${p.port}` }], flush_interval: -1, stream_close_delay: "1h" }],
-  }));
+  const routes = appRoutes(projects.values(), domain);
   routes.push({
     handle: [{
       handler: "static_response",
@@ -583,7 +579,8 @@ async function sync() {
   const t0 = Date.now();
   const edges = ready ? await tunnelEdges() : undefined;
   const disk = await diskSpace();
-  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 3, recovery };
+  // Protocol 4 also serves the automatic global app hostname.
+  const body = { machine, run, previousRun, agent, ...describe(), started, ready, status, inventory, leaving, metrics: sent, rtt, edges, disk, protocol: 4, recovery };
   const linked = await controlLink.report(body);
   if (linked) { rtt = Date.now() - t0; metrics.confirm(sent); return linked; }
   const res = await fetch(`${env.CONTROL_URL}/api/sync`, {
@@ -755,6 +752,7 @@ async function main() {
       // Repair an already-authorized workload even while the control plane is
       // unreachable. Placement changes and new workloads still need a plan.
       reconcile(cachedDesired, { repairOnly: true });
+      await updateRouter(); // Also retry a previous reload failure without restarting healthy apps.
       const changed = before !== JSON.stringify([...projects].map(([k, p]) => [k, p.s, p.r, p.n]));
       if (changed) { await saveState(); wake(); }
     } catch (error) { log(`health: ${error.message}`); }

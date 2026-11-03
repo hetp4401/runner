@@ -10,6 +10,7 @@ Start with the [requirements](requirements.md) and [self-hosting guide](self-hos
 | [Self-hosting](self-hosting.md) | Initialize a controller, connect hosts, deploy an app and configure a reverse proxy. |
 | [VPS operations](vps-control.md) | Service checks, backups, restore, upgrades and migration. |
 | [Region affinity](region-affinity.md) | Custom labels and regional replica placement. |
+| [Public addresses](public-addresses.md) | Automatic global and replica URLs, failover and upgrades. |
 | [Root reference](../README.md#projects) | Workload definitions, placement, authentication, API, CLI and recovery architecture. |
 | [Tests](../control/test/README.md) | Simulations, local integration and Linux Docker checks. |
 

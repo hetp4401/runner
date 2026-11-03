@@ -51,7 +51,7 @@ Installation downloads and verifies the CP's bundled agent release, then builds 
 
 ## Projects
 
-A project is a Docker Compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Each replica has its own URL and there's no shared one in front of them: replicas are numbered from 1, and replica *k* is at `https://<project>-<k>.example.com`, a DNS name the control plane points at the tunnel of whichever machine runs that copy (and moves when the copy moves), so these URLs only change when the replica count does. The port comes from the `port` field, or from `x-runner.port` in the compose file.
+A project is a Docker Compose file, optionally with Dockerfiles and other files its builds need, plus a replica count: how many copies of it run (from 1 to 50, default 1), spread over the machines with the most room; with more replicas than machines, some machines run two or more copies. Every public app automatically gets a global URL, `https://<project>.example.com`, plus `https://<project>-<k>.example.com` for each replica *k*, numbered from 1. The global address follows a healthy copy; numbered addresses follow their replicas across moves. Both are always provided, with no routing option to set. The dashboard shows the global URL as the main app link and keeps individual replica links. See [public addresses](docs/public-addresses.md) for failover and upgrades. The port comes from the `port` field, or from `x-runner.port` in the compose file.
 
 - **Compose only:** services use published images.
 
@@ -67,7 +67,7 @@ A project is a Docker Compose file, optionally with Dockerfiles and other files 
   ```
 
 - **Dockerfile only:** a custom image. The control plane wraps it in a one-service compose file (`build: .`) that publishes the port. The app should listen on that port.
-- **WebSockets:** nothing to set: every app's replica URLs take WebSocket connections on the app's port like its HTTP (`wss://<project>-<k>.example.com/...`, any path, through Cloudflare's tunnel and the machine's router). Cloudflare closes a WebSocket that's silent for 100 s, so ping more often than that; a client should reconnect when one closes (a copy moving or handing over ends its connections), and a router reload (another app changing on the machine) keeps open ones for up to an hour.
+- **WebSockets:** nothing to set: every app's global and replica URLs take WebSocket connections on the app's port like its HTTP (`wss://<project>-<k>.example.com/...`, any path, through Cloudflare's tunnel and the machine's router). Cloudflare closes a WebSocket that's silent for 100 s, so ping more often than that; a client should reconnect when one closes (a copy moving or handing over ends its connections), and a router reload (another app changing on the machine) keeps open ones for up to an hour.
 - **Readiness:** `x-runner.ready: /path` makes the agent ask each copy for that path; a copy counts as healthy (for moves, DNS, handovers) only while it answers 2xx. The agent never restarts a copy for not being ready; one unready for 10 minutes while ready elsewhere is moved like a failing one.
 - **Compose plus files:** files sit next to the compose file, so `build: .` or `build: ./web` (with `web/Dockerfile`) find them. You can also include whatever the Dockerfiles `COPY`, as long as it's text. Every machine builds the image when the version changes.
 
