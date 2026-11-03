@@ -2587,7 +2587,8 @@ function route() {
     if (tr && !e.target.closest("a,button,input,select")) location.hash = tr.dataset.href;
     view.click?.(e);
   };
-  const sec = ["apps", "machines", "activity", "metrics", "fleet"].includes(a) ? a : ["guide", "contribute"].includes(a) ? null : "";
+  const navSection = a === "apps" && b === "global-router" ? "routing" : a;
+  const sec = ["apps", "machines", "activity", "metrics", "routing", "fleet"].includes(navSection) ? navSection : ["guide", "contribute"].includes(navSection) ? null : "";
   for (const link of $$("nav.tabs a")) {
     if (link.dataset.nav === sec) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
