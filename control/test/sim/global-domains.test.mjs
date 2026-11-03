@@ -71,14 +71,20 @@ cold.cf=async(path,init={})=>{
  return {result:[{id:tunnel.id,name:cold.publicTunnelName('web'),config_src:'local'}],result_info:{total_pages:1}};
 };
 await cold.recoverTunnels();
-check('cold discovery reuses app tunnel IDs without fetching tokens or making writes',()=>{
- assert.equal(cold.publicTunnels.get('web').id,tunnel.id);assert.equal(cold.publicTunnels.get('web').token,'');assert.ok(calls.every(r=>r.method==='GET'&&!r.path.endsWith('/token')));
+check('cold discovery resolves app keys before releasing plans and makes no provider writes',()=>{
+ assert.equal(cold.publicTunnels.get('web').id,tunnel.id);assert.equal(cold.publicTunnels.get('web').token,'rotated-private-app-token');assert.ok(calls.every(r=>r.method==='GET'));
 });
 await cold.ensurePublicTunnels();
 check('restart retrieves the current app token without exposing or persisting it',()=>{
  assert.equal(cold.publicTunnels.get('web').token,'rotated-private-app-token');
  assert.ok(!JSON.stringify(cold.status()).includes('rotated-private-app-token'));assert.ok(!JSON.stringify(cold.getProject('web')).includes('rotated-private-app-token'));
  assert.equal(cold.all('SELECT * FROM app_env').length,0);assert.equal(cold.redact('rotated-private-app-token'),'[hidden]');
+});
+const blocked=makeControl({RECOVER_TUNNELS:'1'},c.db);
+blocked.cf=async(path,init={})=>{if(path.endsWith('/token'))throw Error('provider token lookup failed');return cold.cf(path,init);};
+await assert.rejects(blocked.recoverTunnels(),/provider token lookup failed/);
+check('a failed app token lookup keeps cold plans on hold without publishing partial credentials',()=>{
+ assert.equal(blocked.tunnelsReady,false);assert.equal(blocked.publicTunnels.size,0);
 });
 c.deleteProject('web');await c.syncDns();
 check('deletion removes app addresses while preserving outside aliases',()=>{assert.ok(!record('web')&&!record('web-1'));assert.ok(record('external'));});

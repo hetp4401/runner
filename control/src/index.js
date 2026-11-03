@@ -3460,6 +3460,7 @@ export class Control {
           for (const tunnel of data.result) {
             if(typeof tunnel.name==='string' && tunnel.name.startsWith(`${this.tunnelPrefix}-app-`) && /^[a-f0-9]{20}$/.test(tunnel.name.slice(this.tunnelPrefix.length+5)) && !tunnel.deleted_at) {
               if(typeof tunnel.id!=='string' || !tunnel.id)throw new Error('Cloudflare returned an invalid app tunnel');
+              if(tunnel.config_src && tunnel.config_src!=='local')throw new Error('shared app tunnels must use local agent ingress');
               const name=publicNames.get(tunnel.name);
               if(name && publicFound.has(name))throw new Error(`multiple Cloudflare tunnels are named ${tunnel.name}`);
               if(name)publicFound.set(name,{id:tunnel.id,token:''});
@@ -3478,6 +3479,16 @@ export class Control {
           const pages = Number(info.total_pages) || Math.ceil(Number(info.total_count) / perPage);
           if (pages ? page >= pages : data.result.length < perPage) break;
           if (!data.result.length) throw new Error("Cloudflare returned an incomplete tunnel listing");
+        }
+        // Existing app connectors keep serving from their saved authorization
+        // during recovery. Resolve active apps' keys before publishing plans,
+        // so a cold controller never revokes them with an empty token cache.
+        for(const [name,tunnel] of publicFound) {
+          const p=this.projects.get(name);
+          if(!p?.enabled || !this.version(name,p.version)?.port)continue;
+          const token=(await this.cf(`/accounts/${this.env.ACCOUNT_ID}/cfd_tunnel/${tunnel.id}/token`)).result;
+          if(typeof token!=='string' || !token)throw new Error(`Cloudflare returned no app tunnel token for ${name}`);
+          tunnel.token=token;
         }
         this.sql.exec("DELETE FROM slots");
         for (const slot of found.values()) this.sql.exec("INSERT INTO slots (n,tunnel,token,created) VALUES (?,?,?,?)", slot.n, slot.tunnel, "", Date.now());
