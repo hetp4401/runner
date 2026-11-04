@@ -18,6 +18,25 @@ const port = Number(env.PORT) || 8920;
 const host = env.BIND_HOST || "127.0.0.1";
 const dataDir = env.DATA_DIR || ".";
 const MAX_BODY = 1_000_000; // bytes; a spec is at most 250 KB, plus JSON quoting
+// Aggregate counts stay in RAM. No URLs, credentials, bodies or per-message
+// records are retained; a separate sampler can checkpoint these occasionally.
+const usage = {
+  startedAt: new Date().toISOString(),
+  http: { requestsIn: 0, responsesOut: 0, upgradesIn: 0, healthChecksIn: 0, usageReadsIn: 0 },
+  externalHttp: { requestsOut: 0, responsesIn: 0, errorResponses: 0, transportErrors: 0 },
+  agent: { messagesIn: 0, messagesOut: 0, syncIn: 0, plansOut: 0, wakesOut: 0, errorsOut: 0 },
+  logs: { messagesIn: 0, messagesOut: 0 },
+};
+const nativeFetch = globalThis.fetch;
+globalThis.fetch = async (...args) => {
+  usage.externalHttp.requestsOut++;
+  try {
+    const response = await nativeFetch(...args);
+    usage.externalHttp.responsesIn++;
+    if (!response.ok) usage.externalHttp.errorResponses++;
+    return response;
+  } catch (error) { usage.externalHttp.transportErrors++; throw error; }
+};
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 validateProxyConfig(env);
 
@@ -48,8 +67,14 @@ const control = new Control({
   },
 });
 sql.protect(control);
+control.usage = () => ({ enabled: true, startedAt: usage.startedAt,
+  http: { ...usage.http }, externalHttp: { ...usage.externalHttp }, agent: { ...usage.agent }, logs: { ...usage.logs } });
 
 const server = http.createServer(async (req, res) => {
+  usage.http.requestsIn++;
+  if (req.url === "/healthz") usage.http.healthChecksIn++;
+  if (req.url?.split("?", 1)[0].match(/^\/(?:admin\/)?api\/usage$/)) usage.http.usageReadsIn++;
+  res.once("finish", () => { usage.http.responsesOut++; });
   try {
     if (sql.failed) throw new Error("configuration storage is unavailable");
     if (req.method === "GET" && req.url === "/healthz") {
@@ -107,33 +132,46 @@ control.status = () => ({ ...status(), controlPlane: {
   recoveryUntil: control.recoveringUntil, recoveryMissing: [...control.recoveryMissing],
 } });
 const originalWake = control.wake.bind(control);
+function sendAgent(ws, message) {
+  ws.send(JSON.stringify(message));
+  usage.agent.messagesOut++;
+  if (message.type === "plan") usage.agent.plansOut++;
+  else if (message.type === "wake") usage.agent.wakesOut++;
+  else if (message.type === "error") usage.agent.errorsOut++;
+}
 control.wake = (run) => {
   const ws = agentSockets.get(run);
-  if (ws?.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "wake" }));
+  if (ws?.readyState === ws.OPEN) sendAgent(ws, { type: "wake" });
   originalWake(run);
 };
 server.on("upgrade", (req, socket, head) => {
+  usage.http.requestsIn++;
+  usage.http.upgradesIn++;
   const refuse = (status) => {
     socket.end(`HTTP/1.1 ${status} ${http.STATUS_CODES[status]}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n`);
+    usage.http.responsesOut++;
   };
   try {
     const url = new URL(req.url, "http://localhost");
     if (url.pathname === "/api/agent") {
       if (!control.isJoinToken(req.headers.authorization)) return refuse(401);
       return wss.handleUpgrade(req, socket, head, (ws) => {
+        usage.http.responsesOut++;
         let run = null;
         ws.on("message", (raw) => {
+          usage.agent.messagesIn++;
           let message;
           try {
             if (sql.failed) throw new Error("configuration storage is unavailable");
             message = JSON.parse(raw);
             if (message.type !== "sync" || !Number.isSafeInteger(message.id)) throw new Error("invalid report");
+            usage.agent.syncIn++;
             run = message.body?.run;
             if (run) agentSockets.set(run, ws);
             control.setPace(Date.now());
             const plan = control.sync(message.body, clientAddress(req, env));
-            ws.send(JSON.stringify({ type: "plan", id: message.id, plan }));
-          } catch (error) { ws.send(JSON.stringify({ type: "error", id: message?.id, error: error.message })); }
+            sendAgent(ws, { type: "plan", id: message.id, plan });
+          } catch (error) { sendAgent(ws, { type: "error", id: message?.id, error: error.message }); }
         });
         ws.on("close", () => { if (agentSockets.get(run) === ws) agentSockets.delete(run); });
         ws.on("error", () => {});
@@ -143,11 +181,11 @@ server.on("upgrade", (req, socket, head) => {
     if (viewer) {
       const origin = req.headers.origin;
       if (origin && new URL(origin).host !== req.headers.host) return refuse(403); // another site's page
-      return wss.handleUpgrade(req, socket, head, (ws) => control.attachLogViewer(viewer[1], adapt(ws)));
+      return wss.handleUpgrade(req, socket, head, (ws) => { usage.http.responsesOut++; control.attachLogViewer(viewer[1], adapt(ws)); });
     }
     if (url.pathname === "/api/logs/stream") {
       if (!control.isJoinToken(req.headers.authorization)) return refuse(401);
-      return wss.handleUpgrade(req, socket, head, (ws) => control.attachLogAgent(url.searchParams.get("session"), url.searchParams.get("run"), adapt(ws)));
+      return wss.handleUpgrade(req, socket, head, (ws) => { usage.http.responsesOut++; control.attachLogAgent(url.searchParams.get("session"), url.searchParams.get("run"), adapt(ws)); });
     }
     refuse(404);
   } catch (e) {
@@ -163,12 +201,12 @@ function adapt(ws) {
   ws.on("error", () => {});
   return {
     send(text) {
-      if (ws.readyState === ws.OPEN && ws.bufferedAmount < 2_000_000) ws.send(text);
+      if (ws.readyState === ws.OPEN && ws.bufferedAmount < 2_000_000) { ws.send(text); usage.logs.messagesOut++; }
     },
     close(code = 1000, reason = "") {
       try { ws.close(code, reason); } catch { ws.terminate(); }
     },
-    onMessage: (fn) => ws.on("message", (data, binary) => fn(binary ? data : data.toString())),
+    onMessage: (fn) => ws.on("message", (data, binary) => { usage.logs.messagesIn++; fn(binary ? data : data.toString()); }),
     onClose: (fn) => ws.on("close", () => fn()),
   };
 }

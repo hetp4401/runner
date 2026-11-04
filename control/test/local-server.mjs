@@ -92,6 +92,14 @@ try {
   await start(true);
   assert.equal((await fetch(`${origin}/api/events?limit=1.5`)).status, 400);
   assert.equal((await fetch(`${origin}/healthz`)).status, 200);
+  assert.equal((await fetch(`${origin}/api/usage`)).status, 401);
+  const usageBeforeHttp = await request("/usage");
+  await request("/status");
+  const usageAfterHttp = await request("/usage");
+  assert.equal(usageAfterHttp.http.requestsIn - usageBeforeHttp.http.requestsIn, 2);
+  assert.equal(usageAfterHttp.http.responsesOut - usageBeforeHttp.http.responsesOut, 2);
+  assert.ok(usageAfterHttp.externalHttp.requestsOut > 0);
+  console.log("ok authenticated usage counters include HTTP and outgoing API requests without request contents");
   const passwordAttempt = (ip, password, extra = {}) => fetch(`${origin}/api/settings`, { method: "PUT",
     headers: { "content-type": "application/json", "x-forwarded-for": ip, "x-admin-password": password, ...extra }, body: "{}" });
   for (let i = 0; i < 5; i++) assert.equal((await passwordAttempt("198.51.100.10", "wrong")).status, 401);
@@ -112,6 +120,7 @@ try {
   const started = Date.now();
   const body = { agent: "test-agent", machine: agent.machine, run: "test-run", pool: "test", poolSize: 1, started, protocol: 2, ready: true, status: {}, metrics: { live: { t: started, h: { cpu: 5, memUsed: 100, memTotal: 1000 }, a: {} } } };
   await connect();
+  const usageBeforeSync = await request("/usage");
   let plan = await sync(body);
   assert.equal(Object.keys(plan.desired).length, 2);
   body.status = Object.fromEntries(Object.entries(plan.desired).map(([key, p]) => [key, { v: p.v, s: "healthy", r: true, t0: started, n: 0 }]));
@@ -119,6 +128,10 @@ try {
   plan = await sync(body);
   body.recovery = plan.recovery;
   assert.ok(body.recovery.signature);
+  const usageAfterSync = await request("/usage");
+  assert.equal(usageAfterSync.agent.syncIn - usageBeforeSync.agent.syncIn, 2);
+  assert.equal(usageAfterSync.agent.plansOut - usageBeforeSync.agent.plansOut, 2);
+  assert.equal(usageAfterSync.agent.messagesIn - usageBeforeSync.agent.messagesIn, 2);
   console.log("ok HTTP deploy and WebSocket plans include durable secrets and recovery receipts");
   await request("/projects/web/env", { method: "PUT", body: { TOKEN: "updated-durable-secret" } });
   const changed = await request("/projects/web");
@@ -164,7 +177,7 @@ try {
     invalid.on("open", () => { invalid.terminate(); reject(new Error("unauthenticated agent accepted")); });
   });
   console.log("ok agent authentication remains enforced");
-  console.log("8 local server checks passed");
+  console.log("Local server, recovery, and usage counter checks passed");
 } finally {
   await stop();
   mock.closeAllConnections();

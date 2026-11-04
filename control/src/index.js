@@ -896,7 +896,7 @@ export class Control {
         const ip = request.headers.get("x-runner-client-ip") ?? request.headers.get("cf-connecting-ip") ?? "unknown";
         // Passwords are only looked at where they count (fleet changes, changes to apps), so an address refused for
         // wrong guesses can still see everything.
-        const fleet = /^\/(unlock|settings|roll|join-token|machines\/\d+\/evict|slots\/\d+)$/.test(route);
+        const fleet = /^\/(unlock|settings|roll|join-token|usage|machines\/\d+\/evict|slots\/\d+)$/.test(route);
         const appChange = request.method !== "GET" && route.startsWith("/projects/");
         const password = adminPassword(request);
         const admin = (fleet || appChange) && password != null && await this.checkPassword(password, ip);
@@ -1022,6 +1022,7 @@ export class Control {
     if (method === "GET" && route === "/status") return json(this.status());
     if (method === "GET" && route === "/events") return json(this.events(url.searchParams));
     if (method === "GET" && route === "/metrics") return this.metricsResponse(url.searchParams.get("range") ?? "1h");
+    if (method === "GET" && route === "/usage") return need(admin), json(this.usage?.() ?? { enabled: false });
     if (method === "POST" && route === "/join") return need(node, "the join token"), json(await this.join(await body()));
     if (method === "POST" && route === "/sync") return need(node, "the join token"), json(this.sync(await body(), ip,
       this.env.USE_EDGE_LOCATION === "1" ? decodeURIComponent(request.headers.get("x-runner-location") || "") : null));
