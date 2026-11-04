@@ -25,6 +25,7 @@ import { durableSetting, obsoleteSetting } from "./state-policy.js";
 const CHECKINS_PER_DAY = 100_000; // on its own server this is comfortable; it was 30,000 under the Workers free plan
 const MIN_POLL_S = 20;
 const MAX_POLL_S = 300;
+const MAX_STARTING_COPIES = 3; // Bound builds per host while replacement capacity is still arriving.
 const PASSWORD_TRIES = 5; // wrong passwords from one address (per app, and for the fleet) before it's refused for PASSWORD_LOCKOUT_MS
 const PASSWORD_LOCKOUT_MS = 15 * 60_000;
 const APP_PASSWORD_MIN = 6;
@@ -1849,6 +1850,10 @@ export class Control {
       if (!regional.size) return `replica ${replica} is waiting for a server in ${region}; no live server has a known matching region`;
       up = regional;
     }
+    const starting = this.startingCounts(up);
+    if (up.size && [...up.keys()].every((m) => (starting.get(m) ?? 0) >= MAX_STARTING_COPIES)) {
+      return scope + `waiting for deployment capacity: servers already have ${MAX_STARTING_COPIES} or more copies starting`;
+    }
     const empty = [...up.keys()].filter((m) => !this.copiesOn(name, m).length);
     if (empty.length) {
       const clash = empty.map((m) => this.clash(name, m)).find(Boolean);
@@ -1922,6 +1927,7 @@ export class Control {
     for (const x of this.copiesOf(name)) if (!x.leaving) inPool.set(this.poolOf(x.machine, up), (inPool.get(this.poolOf(x.machine, up)) ?? 0) + 1);
     const runsOnSlot = new Map();
     for (const r of this.liveRuns(now)) runsOnSlot.set(r.machine, (runsOnSlot.get(r.machine) ?? 0) + 1);
+    const starting = this.startingCounts(up);
     const cands = [];
     for (const r of up.values()) {
       if (region && machineRegion(r) !== region) continue;
@@ -1929,6 +1935,7 @@ export class Control {
       if (this.clash(name, r.machine) || (doubling && spec?.nodup)) continue;
       if (r.drain || r.handover || r.retire || r.evict || (runsOnSlot.get(r.machine) ?? 0) > 1) continue;
       if ((r.quarantine ?? 0) > now || this.failedHere(name, r.machine, now)) continue;
+      if ((starting.get(r.machine) ?? 0) >= MAX_STARTING_COPIES) continue;
       const due = this.dueAt(r);
       if (due && now >= due) continue;
       const pool = this.poolOf(r.machine, up);
@@ -1955,6 +1962,25 @@ export class Control {
   placementCounts() {
     const counts = new Map();
     for (const list of this.copies.values()) for (const x of list) if (!x.leaving) counts.set(x.machine, (counts.get(x.machine) ?? 0) + 1);
+    return counts;
+  }
+
+  startingCounts(up) {
+    const counts = new Map();
+    for (const [name, list] of this.copies) for (const x of list) {
+      const run = up.get(x.machine);
+      const project = this.projects.get(name);
+      if (!project?.enabled || (project.halted && project.stable == null)) continue;
+      const version = project?.halted ? project.stable : project?.version;
+      const report = run?.status?.[x.key];
+      // A completed failure must not reserve a build slot forever and starve
+      // unrelated apps. Missing reports and version changes reserve a slot
+      // before the agent receives the next plan, as do active builds.
+      const pending = !report || report.v !== version || !["healthy", "failed"].includes(report.s);
+      if (run && !x.leaving && pending) {
+        counts.set(x.machine, (counts.get(x.machine) ?? 0) + 1);
+      }
+    }
     return counts;
   }
 
