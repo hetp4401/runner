@@ -17,6 +17,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import uuid
@@ -76,6 +77,31 @@ def container(config, env):
     return ids[0]
 
 
+def export_snapshot(identity, remote, destination, env):
+    # docker cp cannot read files on some tmpfs mounts. Stream from the running
+    # container's mount namespace, accepting only the three expected plain files.
+    archive = destination / ".snapshot.tar"
+    try:
+        with archive.open("xb") as output:
+            result = subprocess.run(["docker", "exec", identity, "tar", "-C", remote,
+                                     "-cf", "-", "control.db", "identity.json", "manifest.json"],
+                                    env=env, stdout=output, stderr=subprocess.PIPE, timeout=180)
+        if result.returncode:
+            raise RuntimeError("snapshot export failed")
+        with tarfile.open(archive) as source:
+            members = source.getmembers()
+            if (len(members) != 3 or {m.name for m in members} != {"control.db", "identity.json", "manifest.json"}
+                    or not all(m.isfile() for m in members)):
+                raise ValueError("unexpected backup archive contents")
+            for member in members:
+                path = destination / member.name
+                with path.open("xb") as output, source.extractfile(member) as content:
+                    shutil.copyfileobj(content, output)
+                path.chmod(0o600)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
 def backup(config, env, destination=None):
     root = Path(config["backups"])
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -89,7 +115,7 @@ def backup(config, env, destination=None):
     identity = container(config, env)
     try:
         command(["docker", "exec", identity, "node", "backup.mjs", remote], env)
-        command(["docker", "cp", identity + ":" + remote + "/.", str(temporary)], env)
+        export_snapshot(identity, remote, temporary, env)
         manifest = json.loads((temporary / "manifest.json").read_text())
         for name, digest in manifest["files"].items():
             if name not in ("control.db", "identity.json") or hashlib.sha256((temporary / name).read_bytes()).hexdigest() != digest:

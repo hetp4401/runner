@@ -1,6 +1,8 @@
 """Build first, then run: python3 control/test/docker-smoke.py runner-control:local"""
 import concurrent.futures
+import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -89,7 +91,7 @@ http.createServer(async(req,res)=>{
 """)
     mock_file.chmod(0o644)
     docker('run', '-d', '--name', mock_name, '--network', network, '--network-alias', 'cloudflare', '-v', str(mock_file) + ':/mock.mjs:ro', '--entrypoint', 'node', image, '/mock.mjs')
-    docker('run', '-d', '--name', name, '--init', '--network', network, '-p', '127.0.0.1::8920', '-v', volume + ':/data', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '-e', 'DOMAIN=example.test', '-e', 'CF_API_TOKEN=fake-key', '-e', 'ACCOUNT_ID=test-account', '-e', 'ZONE=test-zone', '-e', 'AUTO_TUNNEL=0', '-e', 'RECOVERY_MS=0', '-e', 'CF_API_BASE=http://cloudflare:8080', image)
+    docker('run', '-d', '--name', name, '--init', '--network', network, '-p', '127.0.0.1::8920', '-v', volume + ':/data', '--tmpfs', '/tmp:uid=1000,gid=1000,mode=1777', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '-e', 'DOMAIN=example.test', '-e', 'CF_API_TOKEN=fake-key', '-e', 'ACCOUNT_ID=test-account', '-e', 'ZONE=test-zone', '-e', 'AUTO_TUNNEL=0', '-e', 'RECOVERY_MS=0', '-e', 'CF_API_BASE=http://cloudflare:8080', image)
     port = docker('inspect', '--format', '{{(index (index .NetworkSettings.Ports "8920/tcp") 0).HostPort}}', name).stdout.strip()
     origin = 'http://127.0.0.1:' + port
     status = ready()
@@ -138,6 +140,17 @@ http.createServer(async(req,res)=>{
     assert backup_state == {'secret': True, 'version': version, 'identity': True, 'private': True, 'manifest': 1}, backup_state
     assert docker('exec', name, 'node', 'backup.mjs', snapshot, ok=False).returncode != 0
     check('online SQLite backup preserves WAL-backed configuration, identity and private permissions without overwriting a snapshot')
+    module = importlib.util.spec_from_file_location('mac_docker', pathlib.Path(__file__).resolve().parents[1] / 'mac-docker.py')
+    helper = importlib.util.module_from_spec(module)
+    module.loader.exec_module(helper)
+    exported = directory / 'exported'
+    exported.mkdir(mode=0o700)
+    helper.export_snapshot(name, snapshot, exported, os.environ.copy())
+    import hashlib
+    manifest = json.loads((exported / 'manifest.json').read_text())
+    assert all(hashlib.sha256((exported / file).read_bytes()).hexdigest() == digest for file, digest in manifest['files'].items())
+    assert all(file.stat().st_mode & 0o077 == 0 for file in exported.iterdir())
+    check('a tmpfs snapshot exports outside the Docker VM with matching checksums and private files')
 
     missing = docker('run', '--rm', '-e', 'DOMAIN=example.test', '-e', 'ADMIN_PASSWORD=fake', '-e', 'JOIN_TOKEN=fake', '-e', 'STATE_SIGNING_KEY=fake', image, ok=False)
     assert missing.returncode != 0 and 'control.db is missing' in missing.stderr
