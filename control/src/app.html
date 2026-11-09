@@ -2551,7 +2551,7 @@ function renderChrome() {
   const n = items.filter((x) => x.kind === "failed" || x.kind === "gone").length;
   const pending = items.filter((x) => x.kind === "deploying").length;
   const cp = S.status.controlPlane;
-  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? "Mac controller" : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
+  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? `Mac controller${cp.runtime === "docker" ? " (Docker)" : ""}` : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
   setHtml($("#summary"), `${controller}${pill(n ? "failed" : pending ? "deploying" : "healthy", `${upCount()} up${n ? ` · ${plural(n, "problem")}` : pending ? ` · ${pending} pending` : ""}`)}`);
 }
 

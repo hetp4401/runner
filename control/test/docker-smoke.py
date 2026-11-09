@@ -16,7 +16,9 @@ agent_image = sys.argv[2] if len(sys.argv) > 2 else None
 name = 'runner-check-' + uuid.uuid4().hex[:10]
 auto_name = name + '-auto'
 volume, network, mock_name = name + '-data', name + '-net', name + '-api'
-directory = pathlib.Path(tempfile.mkdtemp(prefix='runner-docker-check-'))
+# Colima shares the user's home, but macOS's /var/folders temporary directories
+# are not mounted in its VM. Keep bind-mounted fixtures on the shared filesystem.
+directory = pathlib.Path(tempfile.mkdtemp(prefix='runner-docker-check-', dir=pathlib.Path.home() if sys.platform == 'darwin' else None))
 checks = 0
 
 
@@ -44,7 +46,7 @@ def api(path, method='GET', body=None, headers=None):
 
 
 def ready():
-    for _ in range(50):
+    for _ in range(150):
         try:
             code, status = api('/api/status')
             if code == 200 and status['controlPlane']['tunnelsReady']:
@@ -91,6 +93,8 @@ http.createServer(async(req,res)=>{
     port = docker('inspect', '--format', '{{(index (index .NetworkSettings.Ports "8920/tcp") 0).HostPort}}', name).stdout.strip()
     origin = 'http://127.0.0.1:' + port
     status = ready()
+    assert status['controlPlane']['runtime'] == 'docker'
+    assert status['controlPlane']['mode'] == 'docker-v1'
     assert status['requireDeployAuth'] is True
     assert api('/healthz')[0] == 200
     check('the non-root container listens through Docker networking and recovers tunnel inventory')
@@ -127,6 +131,13 @@ http.createServer(async(req,res)=>{
     assert state['uid'] == 1000 and not state['socket'] and state['secret'] and state['ca'], state
     assert state['tables'] == ['app_env', 'app_passwords', 'projects', 'settings', 'versions']
     check('SIGKILL preserves specs and secrets, with only five tables and no Docker socket')
+
+    snapshot = '/tmp/docker-smoke-backup'
+    docker('exec', name, 'node', 'backup.mjs', snapshot)
+    backup_state = json.loads(docker('exec', name, 'node', '-e', "const fs=require('fs');const {DatabaseSync}=require('node:sqlite');const p='/tmp/docker-smoke-backup';const d=new DatabaseSync(p+'/control.db',{readOnly:true});console.log(JSON.stringify({secret:d.prepare(\"select value from app_env where key='TOKEN'\").get().value==='durable-test-value',version:d.prepare(\"select version from projects where name='web'\").get().version,identity:fs.readFileSync(p+'/identity.json','utf8')===fs.readFileSync('/data/identity.json','utf8'),private:(fs.statSync(p+'/control.db').mode&63)===0,manifest:JSON.parse(fs.readFileSync(p+'/manifest.json','utf8')).projects.length}));").stdout)
+    assert backup_state == {'secret': True, 'version': version, 'identity': True, 'private': True, 'manifest': 1}, backup_state
+    assert docker('exec', name, 'node', 'backup.mjs', snapshot, ok=False).returncode != 0
+    check('online SQLite backup preserves WAL-backed configuration, identity and private permissions without overwriting a snapshot')
 
     missing = docker('run', '--rm', '-e', 'DOMAIN=example.test', '-e', 'ADMIN_PASSWORD=fake', '-e', 'JOIN_TOKEN=fake', '-e', 'STATE_SIGNING_KEY=fake', image, ok=False)
     assert missing.returncode != 0 and 'control.db is missing' in missing.stderr

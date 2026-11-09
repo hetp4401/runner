@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { settings, identity, initialize, resolveCloudflare, controllerTunnel } from "./src/bootstrap.mjs";
 
 process.umask(0o077);
@@ -41,9 +42,9 @@ try {
     let token;
     if (env.AUTO_TUNNEL === "1") token = await controllerTunnel(env);
     if (stopping) process.exit(0);
-    launch(process.execPath, ["server.mjs"], env);
+    launch(process.execPath, [fileURLToPath(new URL("server.mjs", import.meta.url))], env);
     if (token) {
-      const directory = "/run/runner";
+      const directory = env.RUNTIME_DIR || "/run/runner";
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       const file = join(directory, "ingress.yml");
       writeFileSync(file, `ingress:\n  - hostname: ${JSON.stringify(env.CONTROL_HOST)}\n    service: http://127.0.0.1:${env.PORT}\n  - service: http_status:404\n`, { mode: 0o600 });

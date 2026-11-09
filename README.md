@@ -11,12 +11,20 @@ Run one agent on each Linux Docker host. A standalone host keeps its slot across
 | [Control plane](control/README.md) | Controller source, configuration, deployment, operation and development. |
 | [Agent](agent/README.md) | Host agent source, installation, configuration, upgrades and removal. |
 | [Requirements](docs/requirements.md) | Software, permissions, Cloudflare credentials, network access and storage for each module. |
+| [Architecture](docs/architecture.md) | Dashboard, controller, Linux agents, networking, durable state and provider boundaries. |
+| [Mac Docker operations](docs/mac-control.md) | Colima, login startup, native-to-Docker migration, backups and rollback. |
+| [Provider adapters](docs/providers.md) | GitHub machine supply, multiple accounts, watchdogs and host replacement. |
 | [Self-hosting guide](docs/self-hosting.md) | Bring up a controller, join hosts and deploy your first app. |
 | [VPS operations](docs/vps-control.md) | Run, back up, restore and migrate a controller on a server. |
 | [Region affinity](docs/region-affinity.md) | Place workloads using your own region labels. |
 | [Documentation index](docs/README.md) | All guides and the test reference. |
 
 Compute hosts can be VPS instances, dedicated servers or local Linux machines. The current networking implementation requires Cloudflare DNS and Tunnel. The modules communicate over the controller's HTTP/WebSocket API and share no database or host filesystem.
+
+The controller can run on a Linux server or in Docker on a Mac. On macOS, Docker
+Engine lives in a Linux VM; the Mac does not become an agent or run the fleet's
+apps. The [Mac guide](docs/mac-control.md) includes startup supervision and a
+consistent backup/export path. Keep the controller awake and online.
 
 - **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
   - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.

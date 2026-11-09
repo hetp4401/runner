@@ -4,6 +4,18 @@ The agent manages Docker workloads on one Linux host. It connects to the control
 
 Run one agent per Docker host. The controller chooses placements; the agent applies its approved plan locally and can keep existing workloads running while the controller is unreachable.
 
+The controller may itself run in Docker on a Mac; agents still run on Linux.
+Keeping the public controller URL and fleet identity unchanged during that move
+lets existing agents reconnect without reinstallation. Signed receipts restore
+observed inventory after a controller restart; the controller's database remains
+the authority for app definitions, versions and secrets. See the
+[architecture](../docs/architecture.md) and [Mac migration](../docs/mac-control.md).
+
+Provider-specific machine creation and quotas belong in
+[provider adapters](../docs/providers.md). The agent only receives a tag,
+optional lifetime and optional replacement command. It contains no GitHub
+account credentials or account-specific pool targets in its source.
+
 ## Requirements
 
 - A Linux Docker host with a running Docker Engine, the default `/var/run/docker.sock`, and permission to manage it.

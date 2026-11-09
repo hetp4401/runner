@@ -6,7 +6,7 @@ The system has two modules: one control plane per fleet, and one agent on each D
 
 | Requirement | Control plane host | Agent host |
 | --- | --- | --- |
-| Operating system | A server capable of running the provided Linux containers. | Linux; the installer rejects other Docker host types. |
+| Operating system | Linux, or macOS with a Linux Docker VM (see [Mac setup](mac-control.md)). | Linux; the installer rejects other Docker host types. |
 | Docker | Running Docker Engine and Compose v2. | Running Docker Engine with `/var/run/docker.sock` accessible. |
 | Host permissions | Permission to build/run the controller and manage its data volume. | Root for installation; Docker socket and host networking for the agent. |
 | Host tools | Git for cloning the source. | `curl`, `tar`, `sha256sum` and `flock`, plus a POSIX shell and standard shell tools. |
@@ -15,6 +15,13 @@ The system has two modules: one control plane per fleet, and one agent on each D
 | Persistent storage | `control-data` volume and private `.env`. | Absolute host directory, default `/var/lib/runner`, plus workload volumes/images. |
 
 For direct source execution and tests, use Node.js 24. The controller uses `node:sqlite`; Node 14 and 20 cannot run it. Run `npm ci --omit=dev` in `control/` for controller runtime dependencies. A directly executed agent also needs Docker Compose v2 on its Linux host.
+
+The provided Mac supervisor requires Python 3, Colima and Docker CLI/Compose.
+Its Apple Silicon profile uses Apple's virtualization framework, 2 CPUs, 2 GiB
+RAM, a 10 GiB Docker data disk and an 8 GiB root disk. Disk images grow as used;
+allow space for the VM, image builds, source history and exported backups.
+LaunchAgents start after login. Sleep, lid closure and loss of connectivity still
+interrupt the controller; containers do not remove those host dependencies.
 
 Docker access allows the agent to manage the host's workloads. Keep agent join credentials, controller credentials and persisted state private. The controller container runs as UID 1000 and does not need the Docker socket.
 

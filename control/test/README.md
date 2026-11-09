@@ -60,6 +60,14 @@ node control/test/legacy-agent-compat.mjs # existing four-file installers still 
 
 For the Docker package, build from the repository root with `docker build -t runner-control:local .` and `docker build -f control/agent.Dockerfile -t runner-agent:local .`, then run `python3 control/test/docker-smoke.py runner-control:local runner-agent:local`. This uses disposable containers, a private Docker network, fake Cloudflare credentials and a temporary volume. It verifies initialization, HTTP authorization, bundles, SIGKILL recovery, five-table persistence, volume locking, missing-volume refusal, the automatic-tunnel supervisor and offline agent startup. The connector is simulated; this test makes no real Cloudflare changes.
 
+The Docker checks also verify runtime metadata and consistent online backups
+including app secrets, fleet identity, private permissions and overwrite refusal.
+On Colima, select the intended context explicitly, for example
+`DOCKER_CONTEXT=colima-runners python3 control/test/docker-smoke.py runner-control:local`.
+The native macOS integration check is
+`python3 control/test/native-service.py --node /absolute/path/to/node24`;
+it uses disposable state and removes its temporary LaunchAgent.
+
 Run `python3 control/test/agent-docker.py runner-agent:local` on a Linux Docker host for real Compose/build/bind-mount integration. It creates a unique test namespace and fake CP/router/tunnel, verifies nonroot build-source permissions, stable app data, colocated CP isolation and background-worker repair, and removes only its labeled test resources. The Linux-only FD-anchored filesystem checks in `agent-runtime.mjs` must also run in the agent image; the macOS invocation skips those checks.
 
 ## Archived hybrid integration

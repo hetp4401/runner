@@ -13,6 +13,10 @@ The controller runs independently of the agent hosts. It includes a matching age
 - Outbound HTTPS and Cloudflare Tunnel connectivity.
 - Node.js 24 and npm only when running directly or developing outside Docker. The image includes its runtime and dependencies.
 
+For a controller on a Mac, use the [Docker operations guide](../docs/mac-control.md)
+for Colima, launchd startup, migration and backups. The [native alternative](../docs/native-control.md)
+uses Node.js 24, Python 3 and `cloudflared` directly. Both run the same controller.
+
 See [requirements](../docs/requirements.md) for exact credential scopes, ports and host tools. The controller container runs as UID 1000 and does not mount the Docker socket.
 
 ## Start a new fleet
@@ -64,6 +68,10 @@ The Docker package reads `.env` through the root [Compose file](../compose.yaml)
 | `AUTO_TUNNEL` | `1` by default. Starts the bundled controller connector. Set `0` to use your own proxy/tunnel. |
 | `PUBLIC_URL` | Controller's public origin; defaults to `https://<CONTROL_HOST>`. Set it explicitly with your own proxy. |
 | `CONTROL_PORT` | Host-side loopback port in Compose; defaults to `8920`. |
+| `CONTROL_ENV_FILE` | Host-side path to a private environment file; Compose defaults to `.env`. |
+| `CONTROLLER_KIND`, `CONTROLLER_NAME` | Host identity in status/dashboard; use `mac` and your host name on macOS. |
+| `CONTROLLER_RUNTIME` | Reported execution runtime; the Docker image sets `docker`, the native launcher sets `native`. |
+| `CONTROLLER_TUNNEL_NAME` | Existing controller tunnel name when migrating. Preserve alongside `TUNNEL_PREFIX`. |
 | `CLIENT_IP_HEADER` | Forwarded client address header; defaults to `cf-connecting-ip`. |
 | `TRUSTED_PROXIES` | Explicit proxy IPs/CIDRs; default is loopback. Set the actual peer address when using an external proxy. |
 | `MEMORY_HISTORY_MIN` | Cached metrics window; defaults to `360` minutes. |
@@ -103,6 +111,8 @@ Back up the data volume and `.env` together. Agents continue serving their appro
 | [`src/agent-bundle.mjs`](src/agent-bundle.mjs) | Agent release packaging and hashes. |
 | [`src/app.html`](src/app.html) | Dashboard. |
 | [`docker-entrypoint.mjs`](docker-entrypoint.mjs) | Container startup and connector supervision. |
+| [`backup.mjs`](backup.mjs) | Consistent online SQLite and identity snapshot inside the container. |
+| [`mac-docker.py`](mac-docker.py) | Colima/Compose supervision, private backup export and launchd installation. |
 
 With Node.js 24, run from `control/`:
 

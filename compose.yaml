@@ -4,7 +4,7 @@ services:
     image: runner-control:local
     init: true
     restart: unless-stopped
-    env_file: .env
+    env_file: ${CONTROL_ENV_FILE:-.env}
     volumes:
       - control-data:/data
     tmpfs:

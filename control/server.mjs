@@ -124,7 +124,9 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
 const agentSockets = new Map();
 const status = control.status.bind(control);
 control.status = () => ({ ...status(), controlPlane: {
-  mode: "vps-v1", owner: "vps", name: env.CONTROLLER_NAME || "VPS",
+  mode: env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
+  runtime: env.CONTROLLER_RUNTIME || "native",
+  owner: env.CONTROLLER_KIND || "vps", name: env.CONTROLLER_NAME || "VPS",
   configStorage: "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
   runtimeStorage: "memory", metricsHistoryMinutes: Number(env.MEMORY_HISTORY_MIN),
   tunnelStorage: "memory", tunnelsReady: control.tunnelsReady, tunnelsDiscovered: control.slots.size,
