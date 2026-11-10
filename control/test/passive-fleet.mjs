@@ -122,12 +122,11 @@ async function tests() {
     assert.equal(resolveServerTag({CONTROL_URL:'https://cp.example'},{control:'https://cp.example',run:'existing'}),'standalone');
     assert.equal(resolveServerTag({},{tag:'school',run:'existing'}),'school');
   });
-  await check('old size settings are backed up and removed from durable configuration',()=>{
+  await check('old size settings are removed from durable configuration',()=>{
     const legacy=make();
     legacy.store.db.prepare("INSERT INTO main.settings(key,value) VALUES('pools',?)").run(JSON.stringify({rafael:18,yohan:18}));
     legacy.close();
     const restored=make(legacy.filename);
-    assert.ok(restored.store.backupPath&&existsSync(restored.store.backupPath));
     assert.equal(restored.store.db.prepare("SELECT 1 FROM main.settings WHERE key='pools'").get(),undefined);
     assert.deepEqual(restored.control.status().groups,[]);
   });

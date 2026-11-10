@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, createHmac } from "node:crypto";
@@ -59,18 +59,12 @@ try {
   source.setSetting("roll_99", T);
   source.setSetting("last_hot_move", T);
   const desiredVersion = source.projects.get("web").version;
-  const originalCredentials = source.all("SELECT * FROM slots");
-  const legacyRuns = source.all("SELECT * FROM runs").length;
   source.db.close();
 
   let { store, control } = open();
-  check("migration retains a private full database backup", () => {
-    assert.ok(store.backupPath);
-    assert.equal(statSync(store.backupPath).mode & 0o777, 0o600);
-    const backup = new DatabaseSync(store.backupPath, { readOnly: true });
-    assert.equal(backup.prepare("SELECT count(*) AS n FROM runs").get().n, legacyRuns);
-    assert.deepEqual(backup.prepare("SELECT * FROM slots").all(), originalCredentials);
-    backup.close();
+  check("migration keeps only the live SQLite files and the empty test fixture", () => {
+    const allowed = new Set(['control.db', 'control.db-wal', 'control.db-shm', 'empty.db']);
+    assert.deepEqual(readdirSync(dir).filter(name => !allowed.has(name)), []);
   });
   check("only configuration tables remain on disk", () => assert.deepEqual(schema(store.db), [...CONFIG_TABLES].sort()));
   check("all observation tables are in the in-memory TEMP database", () => {
@@ -159,7 +153,6 @@ try {
   store.close();
   ({ store, control } = open());
   check("a second restart retains configuration but no runtime tables", () => {
-    assert.equal(store.backupPath, undefined);
     assert.deepEqual(snapshot(store.db), saved);
     assert.equal(control.runs.size, 0);
     assert.equal(control.copies.size, 0);

@@ -8,10 +8,10 @@ Start with the [requirements](requirements.md) and [self-hosting guide](self-hos
 | [Agent module](../agent/README.md) | Host requirements, installer, environment variables, upgrades, data, removal and source map. |
 | [Requirements](requirements.md) | Software, permissions, Cloudflare scopes, networking, storage and preflight checks. |
 | [Architecture](architecture.md) | Web app, controller, agents, storage, networking and recovery. |
-| [Mac Docker operations](mac-control.md) | Colima, startup supervision, migration, backup, restore and rollback. |
+| [Mac Docker operations](mac-control.md) | Colima, startup supervision, persistence and migration. |
 | [Provider adapters](providers.md) | Independent GitHub capacity, multiple accounts and watchdog fallback. |
 | [Self-hosting](self-hosting.md) | Initialize a controller, connect hosts, deploy an app and configure a reverse proxy. |
-| [VPS operations](vps-control.md) | Service checks, backups, restore, upgrades and migration. |
+| [VPS operations](vps-control.md) | Service checks, persistence, upgrades and migration. |
 | [Native Mac control](native-control.md) | Run the same controller under launchd, migrate a fleet, and verify crash recovery. |
 | [Region affinity](region-affinity.md) | Custom labels and regional replica placement. |
 | [Public addresses](public-addresses.md) | Automatic global and replica URLs, failover and upgrades. |

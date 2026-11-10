@@ -45,32 +45,38 @@ docker compose logs --tail 100 control
 
 Keep the same `.env`, data volume, public controller URL and tunnel namespace. Do not rerun `init`. The updated image also serves the matching agent release; use the [agent upgrade procedure](../agent/README.md#upgrade-and-restart) to update hosts.
 
-## Back up
+## Persisted state
 
-Back up both the complete data volume and `.env` to private storage. The database contains app definitions, source versions, app secrets/password hashes and fleet settings. `identity.json` and environment credentials preserve the join token, admin password, signing key and tunnel namespace.
+The data volume contains the live SQLite database and fleet identity. Configuration
+changes commit immediately. The database stores app definitions, source versions,
+app secrets/password hashes and fleet settings. `identity.json` and the private
+`.env` preserve credentials and the tunnel namespace. Keep the same data volume
+and environment across upgrades. Do not run `docker compose down -v` when retaining
+fleet state.
 
-For a consistent filesystem backup:
+Runtime observations, metrics, events and tunnel tokens are held in controller
+memory. After a restart, agents provide signed receipts and current inventory
+while Cloudflare supplies tunnel identities. App source versions and operator
+settings remain authoritative in SQLite. Application data stays on agent hosts.
 
-1. Record the checkout's source commit and the Compose project/volume names.
-2. Stop the controller with `docker compose stop control`; leave the agents running.
-3. Archive the complete `control-data` volume and copy `.env` into private backup storage. Include `identity.json` and any database WAL files present.
-4. Start the same controller with `docker compose start control` and check service health.
-
-For online database backups use SQLite's backup API. Copying only a live `control.db` can miss committed data in its WAL. The private identity and environment still need their own backups. The [Docker volume backup guide](https://docs.docker.com/engine/storage/volumes/#back-up-restore-or-migrate-data-volumes) explains how to archive a named volume.
-
-Keep agent/app storage backups separately. Controller recovery reconstructs desired workloads and placements, not application data stored on another machine. Do not run `docker compose down -v` when retaining fleet state.
-
-## Restore or migrate
+## Migrate
 
 1. Stop the old scheduler and prevent it from restarting during cutover.
-2. Restore the matching checkout, `.env` and complete data volume on the destination host. Preserve existing identity credentials and tunnel namespace. Do not initialize a new fleet.
-3. Ensure the restored volume is writable by container UID/GID `1000:1000`. Retain private permissions on identity and configuration files.
-4. Preserve the controller's public URL. If you use an external proxy, point it at the new controller, support WebSockets, and configure its actual peer address in `TRUSTED_PROXIES`.
-5. Start with `docker compose up -d`. Verify health, tunnel discovery, agent reconnection, current app versions, region assignments and replica readiness before retiring the old host.
+2. Transfer the matching checkout, private `.env` and complete stopped data volume
+   to the destination host. Include any remaining SQLite WAL files. Preserve
+   existing identity credentials and the tunnel namespace. Do not initialize a
+   new fleet.
+3. Ensure the volume is writable by container UID/GID `1000:1000`. Retain private
+   permissions on identity and configuration files.
+4. Preserve the controller's public URL. If you use an external proxy, point it at
+   the new controller, support WebSockets, and configure its actual peer address
+   in `TRUSTED_PROXIES`.
+5. Start with `docker compose up -d`. Verify health, tunnel discovery, agent
+   reconnection, current app versions, region assignments and replica readiness.
 
-Keep the original backup until recovery is verified. Agents bind their identity and Docker ownership namespace to the controller URL; changing that URL requires a coordinated migration. A missing or incomplete database prevents startup instead of creating an empty fleet.
-
-Runtime observations, metrics, events and tunnel tokens are held in controller memory. After a restart, agents provide signed receipts and current inventory while Cloudflare supplies tunnel identities. App source versions and operator settings remain authoritative in SQLite.
+Agents bind their identity and Docker ownership namespace to the controller URL;
+changing that URL requires a coordinated migration. A missing or incomplete
+database prevents startup instead of creating an empty fleet.
 
 ## Provider refill fallback
 
@@ -96,7 +102,7 @@ enabling the supervisor.
 
 | Symptom | Check |
 | --- | --- |
-| Startup refuses a missing database | Restore the correct volume; use `init` only for a new fleet. |
+| Startup refuses a missing database | Mount the existing volume; use `init` only for a new fleet. |
 | Permission error under `/data` | Volume ownership and file permissions for UID/GID 1000. |
 | Controller lock cannot be acquired | Another controller may be using the same volume. Do not delete a live lock file. |
 | Tunnel discovery never becomes ready | Account/zone IDs, API permissions, tunnel namespace and outbound API access. |

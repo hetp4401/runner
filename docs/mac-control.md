@@ -23,9 +23,8 @@ See the [Colima project](https://github.com/abiosoft/colima) and
 [configuration reference](https://colima.run/docs/configuration/).
 
 Use a dedicated `runners` profile. Its sparse disks hold Docker images and named
-volumes; exported backups must live outside that VM. The defaults above reserve
-2 GiB RAM while the VM is running. Monitor free disk space as builds and backups
-accumulate. Keep the installed release outside Desktop/Documents, for example
+volumes. The defaults above reserve 2 GiB RAM while the VM is running. Monitor
+free disk space as builds and source history accumulate. Keep the installed release outside Desktop/Documents, for example
 `~/.local/share/runners-control/releases/<revision>`, so launchd can read it after
 login without depending on interactive document access permissions.
 
@@ -59,24 +58,23 @@ follow the migration procedure instead. Never run `init` on a replacement fleet.
    scheduler for testing.
 2. Disable and stop the old controller, its connector and all automatic startup
    paths. For launchd, use `launchctl disable gui/$(id -u)/<label>` and `bootout`,
-   and archive its plist outside `~/Library/LaunchAgents`. Retire the old backup
-   schedule too so it cannot keep backing up a stale database. An unreachable
-   VPS is not proof its old scheduler is stopped.
-3. Make a final consistent SQLite snapshot and copy `identity.json` plus private
-   configuration. The native helper is `python3 control/backup-native.py --config
-   /absolute/environment.json --destination /absolute/backups/before-docker`.
+   and remove its plist from `~/Library/LaunchAgents`. An unreachable VPS is not
+   proof its old scheduler is stopped.
+3. Transfer the stopped controller's current SQLite files, `identity.json` and
+   private configuration together, including any remaining database WAL files.
    Preserve source versions, app passwords/environment, admin/join credentials,
    signing key, domain, public URL, tunnel prefix, controller tunnel name and
-   deployment-auth policy. Keep this snapshot for rollback.
+   deployment-auth policy.
 4. Create the Docker data volume without starting the controller:
    `docker compose create control`. Get its container ID with
-   `docker compose ps --all --quiet control`. Use `docker cp` to copy only the
-   snapshot's `control.db` and `identity.json` into that container's `/data/`.
+   `docker compose ps --all --quiet control`. Use `docker cp` to transfer the
+   stopped controller's SQLite files and `identity.json` into that container's
+   `/data/`.
    Use a one-off container with the same volume and `--user 0 --entrypoint sh`
    to set ownership to UID/GID 1000, directory mode 0700 and file mode 0600.
    Do not copy a live WAL/database pair separately or a stale runtime directory.
 5. Verify the copied database's integrity, project/version counts and canonical
-   contents of all five durable tables against the final snapshot. Preserve the
+   contents of all five durable tables against the stopped source database. Preserve the
    existing named controller tunnel; no DNS or provider URL change is needed.
 6. Start the Docker service, then allow its recovery window and agent reconnects.
    Verify localhost and public health, container health, admin authentication,
@@ -86,7 +84,7 @@ follow the migration procedure instead. Never run `init` on a replacement fleet.
 SQLite stays on the Linux named volume, not a macOS shared bind mount. A local
 Linux lock cannot fence a native process or an old VPS; retirement is explicit.
 
-## Login startup and backups
+## Login startup
 
 Create a mode-0600 service JSON outside the source checkout, using absolute paths:
 
@@ -96,8 +94,7 @@ Create a mode-0600 service JSON outside the source checkout, using absolute path
   "project": "runners",
   "source": "/Users/you/.local/share/runners-control/releases/your-revision",
   "environment_file": "/Users/you/.config/runners-control/docker.env",
-  "logs": "/Users/you/.local/share/runners-control/logs",
-  "backups": "/Users/you/.local/share/runners-control/backups"
+  "logs": "/Users/you/.local/share/runners-control/logs"
 }
 ```
 
@@ -108,30 +105,15 @@ python3 control/mac-docker.py check --config /absolute/service.json
 python3 control/mac-docker.py install --config /absolute/service.json
 # Activate only after the old controller is retired and data is restored.
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/io.runners.docker.plist"
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/io.runners.docker.backup.plist"
 ```
 
-The first service starts Colima when necessary and ensures the existing Compose
+The service starts Colima when necessary and ensures the existing Compose
 service is up. It never initializes a fleet, builds an image or deletes a volume.
 Docker restarts the controller on process failure; launchd restarts the Mac
-supervisor. A graceful supervisor stop also stops the controller. The second
-LaunchAgent exports a backup at 04:15 local time when the user session is active.
-Backups are retained until the operator removes them; monitor disk usage.
+supervisor. A graceful supervisor stop also stops the controller. Configuration
+changes commit immediately to SQLite on the persistent Docker volume.
 
-Run an on-demand backup with:
-
-```sh
-python3 control/mac-docker.py backup --config /absolute/service.json
-```
-
-`backup.mjs` uses SQLite's online backup API inside the running container,
-including committed WAL content. The Mac helper exports the snapshot and fleet
-identity, validates checksums and SQLite integrity, and adds the private Docker
-environment and service configuration. Every output directory/file is private.
-Copy verified backups to a separate device or private storage to survive loss of
-the Mac. A local export alone is not disaster recovery.
-
-## Checks, upgrades and rollback
+## Checks and upgrades
 
 ```sh
 launchctl print gui/$(id -u)/io.runners.docker
@@ -144,17 +126,15 @@ Status reports `controlPlane.owner=mac`, `runtime=docker`, and `mode=docker-v1`.
 The dashboard shows **Mac controller (Docker)**. A healthy HTTP server alone does
 not prove fleet recovery; inspect agent groups and app readiness too.
 
-Before upgrades, export a backup and build/test the new image. Point the private
-service JSON to the staged release, restart the LaunchAgent and verify recovery.
-Keep the same profile, project and volume. Never use `docker compose down -v` or
-delete Colima's data disk while retaining the fleet.
+Before upgrades, build and test the new image. Point the private service JSON to
+the staged release, restart the LaunchAgent and verify recovery. Keep the same
+profile, project and volume. Never use `docker compose down -v` or delete Colima's
+data disk while retaining the fleet.
 
-For rollback, disable/boot out the Docker LaunchAgent and stop the Compose
-controller before starting any native/VPS service. If Docker accepted any config
-changes, export a **current** snapshot first and restore it to the fallback host;
-do not silently discard them by restoring the pre-cutover database. Preserve
-credentials and namespaces, verify data, and then enable exactly one scheduler.
-If configuration is unchanged, the verified pre-cutover snapshot can be used.
+When moving back to a native or VPS controller, stop and disable the Docker
+LaunchAgent first, then transfer the current stopped database and private
+configuration using the migration procedure above. Preserve credentials and
+namespaces, verify data, and enable exactly one scheduler.
 
 The Mac must stay logged in, awake and connected. The supervisor prevents idle
 system sleep on AC power; it cannot prevent lid/manual sleep or run at the

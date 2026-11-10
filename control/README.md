@@ -14,7 +14,7 @@ The controller runs independently of the agent hosts. It includes a matching age
 - Node.js 24 and npm only when running directly or developing outside Docker. The image includes its runtime and dependencies.
 
 For a controller on a Mac, use the [Docker operations guide](../docs/mac-control.md)
-for Colima, launchd startup, migration and backups. The [native alternative](../docs/native-control.md)
+for Colima, launchd startup and migration. The [native alternative](../docs/native-control.md)
 uses Node.js 24, Python 3 and `cloudflared` directly. Both run the same controller.
 
 See [requirements](../docs/requirements.md) for exact credential scopes, ports and host tools. The controller container runs as UID 1000 and does not mount the Docker socket.
@@ -96,7 +96,7 @@ docker compose up -d
 
 Adjust the local URL if you changed `CONTROL_PORT`. `/healthz` confirms HTTP liveness and reports `tunnelsReady`; Docker's health check also requires tunnel discovery and, with the bundled connector, a ready connection. Scheduling waits for recovery before placing workloads.
 
-Back up the data volume and `.env` together. Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for backup and restore procedures.
+Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to SQLite. Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
 
 ## Source and development
 
@@ -111,8 +111,7 @@ Back up the data volume and `.env` together. Agents continue serving their appro
 | [`src/agent-bundle.mjs`](src/agent-bundle.mjs) | Agent release packaging and hashes. |
 | [`src/app.html`](src/app.html) | Dashboard. |
 | [`docker-entrypoint.mjs`](docker-entrypoint.mjs) | Container startup and connector supervision. |
-| [`backup.mjs`](backup.mjs) | Consistent online SQLite and identity snapshot inside the container. |
-| [`mac-docker.py`](mac-docker.py) | Colima/Compose supervision, private backup export and launchd installation. |
+| [`mac-docker.py`](mac-docker.py) | Colima/Compose supervision and launchd installation. |
 
 With Node.js 24, run from `control/`:
 

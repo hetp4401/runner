@@ -19,7 +19,7 @@ For direct source execution and tests, use Node.js 24. The controller uses `node
 The provided Mac supervisor requires Python 3, Colima and Docker CLI/Compose.
 Its Apple Silicon profile uses Apple's virtualization framework, 2 CPUs, 2 GiB
 RAM, a 10 GiB Docker data disk and an 8 GiB root disk. Disk images grow as used;
-allow space for the VM, image builds, source history and exported backups.
+allow space for the VM, image builds, source history.
 LaunchAgents start after login. Sleep, lid closure and loss of connectivity still
 interrupt the controller; containers do not remove those host dependencies.
 

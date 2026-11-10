@@ -1,7 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import { CONFIG_TABLES, durableSetting } from "./state-policy.js";
 
 const RUNTIME_TABLES = new Set(["runs", "copies", "starts", "agents", "events", "geo", "metrics_1m", "metrics_10m", "metrics_1h", "slots"]);
@@ -18,7 +17,7 @@ export class LocalStore {
     this.sequence = 0;
     this.mutationDepth = 0;
     if (!existsSync(filename) && !initialize) {
-      throw new Error("control.db is missing; restore the configuration backup (INIT_CONTROL_DB=1 is only for a new fleet)");
+      throw new Error("control.db is missing; mount the existing configuration database (INIT_CONTROL_DB=1 is only for a new fleet)");
     }
     mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(filename);
@@ -34,16 +33,11 @@ export class LocalStore {
       const obsolete = tables.filter((name) => RUNTIME_TABLES.has(name) || name === "placements");
       const volatile = tables.includes("settings") ? this.db.prepare("SELECT key FROM main.settings").all().filter((r) => !durableSetting(r.key)) : [];
       if (obsolete.length || volatile.length) {
-        const directory = join(dirname(filename), "backups");
-        mkdirSync(directory, { recursive: true, mode: 0o700 });
-        this.backupPath = join(directory, `before-memory-${new Date().toISOString().replaceAll(":", "-")}-${randomUUID()}.db`);
-        this.db.prepare("VACUUM main INTO ?").run(this.backupPath);
-        chmodSync(this.backupPath, 0o600);
         this.atomic(() => {
           for (const name of obsolete) this.db.exec(`DROP TABLE main.${name}`);
           for (const { key } of volatile) this.db.prepare("DELETE FROM main.settings WHERE key=?").run(key);
         });
-        // Reclaim the old metric/history pages once, after the full private backup.
+        // Reclaim obsolete runtime pages after the migration commits.
         this.db.exec("VACUUM main");
       }
     } catch (error) {

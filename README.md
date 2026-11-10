@@ -12,10 +12,10 @@ Run one agent on each Linux Docker host. A standalone host keeps its slot across
 | [Agent](agent/README.md) | Host agent source, installation, configuration, upgrades and removal. |
 | [Requirements](docs/requirements.md) | Software, permissions, Cloudflare credentials, network access and storage for each module. |
 | [Architecture](docs/architecture.md) | Dashboard, controller, Linux agents, networking, durable state and provider boundaries. |
-| [Mac Docker operations](docs/mac-control.md) | Colima, login startup, native-to-Docker migration, backups and rollback. |
+| [Mac Docker operations](docs/mac-control.md) | Colima, login startup, native-to-Docker migration and upgrades. |
 | [Provider adapters](docs/providers.md) | GitHub machine supply, multiple accounts, watchdogs and host replacement. |
 | [Self-hosting guide](docs/self-hosting.md) | Bring up a controller, join hosts and deploy your first app. |
-| [VPS operations](docs/vps-control.md) | Run, back up, restore and migrate a controller on a server. |
+| [VPS operations](docs/vps-control.md) | Run, upgrade and migrate a controller on a server. |
 | [Region affinity](docs/region-affinity.md) | Place workloads using your own region labels. |
 | [Documentation index](docs/README.md) | All guides and the test reference. |
 
@@ -23,8 +23,7 @@ Compute hosts can be VPS instances, dedicated servers or local Linux machines. T
 
 The controller can run on a Linux server or in Docker on a Mac. On macOS, Docker
 Engine lives in a Linux VM; the Mac does not become an agent or run the fleet's
-apps. The [Mac guide](docs/mac-control.md) includes startup supervision and a
-consistent backup/export path. Keep the controller awake and online.
+apps. The [Mac guide](docs/mac-control.md) includes startup supervision, persistent fleet data and migration procedures. Keep the controller awake and online.
 
 - **Web app:** `https://runners.<your-domain>`, one page with views for an overview (what needs attention first), apps, machines, metrics, fleet settings and a deploy guide. It works on phones too, with a bottom tab bar. `/admin` and `/metrics` redirect to it, and their old links still land in the right place.
   - **Public views:** apps, source, machines, metrics and deployment status. New self-hosted fleets require the admin password for new deployments and changes to apps without their own password. `REQUIRE_DEPLOY_AUTH=0` enables public deployments explicitly.
@@ -231,13 +230,13 @@ Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then 
 
 ## Running the control plane
 
-Use the [control plane module guide](control/README.md) for configuration and source entrypoints, the [self-hosting guide](docs/self-hosting.md) for Docker setup, and [VPS operations](docs/vps-control.md) for backups and recovery. Scheduling runs in the controller process with SQLite.
+Use the [control plane module guide](control/README.md) for configuration and source entrypoints, the [self-hosting guide](docs/self-hosting.md) for Docker setup, and [VPS operations](docs/vps-control.md) for service operation and migration. Scheduling runs in the controller process with SQLite.
 
 The production server also runs locally for development:
 
 `control/server.mjs` needs Node 24 (for `node:sqlite`) and `npm install` in `control/` (the `yaml` and `ws` packages). Settings and secrets come from the environment: `PORT` (8920), `DATA_DIR` (where `control.db` lives), `DOMAIN`, `CONTROL_HOST`, `ZONE`, `ACCOUNT_ID`, `MAX_SLOTS`, `ADMIN_PASSWORD`, `JOIN_TOKEN`, `STATE_SIGNING_KEY` (a persistent random secret for agent recovery receipts), and `CF_API_TOKEN` (a token with DNS edit on the zone and Cloudflare Tunnel edit on the account; or `CF_API_KEY` plus `CF_API_EMAIL`). Use `INIT_CONTROL_DB=1` only when starting a new fleet, then remove it; a missing or incomplete database otherwise prevents startup. Recovery holds workloads for `RECOVERY_MS` (default three minutes) while agents reconnect. `MEMORY_HISTORY_MIN` bounds cached metrics (default 360). `AGENT_URL` can override the bundled agent download URL (default: the controller's own `/agent/` endpoint). `DNS=off` stops it touching DNS (for a copy you're trying things on). `ALERT_WEBHOOK` gets alerts. For tests, `QUIET_MS` (the quiet period after a restart, default 10 minutes) and `YOUNG_MS` (how old a copy must be before it's moved automatically, default 10 minutes) shorten the waits. `BIND_HOST` defaults to 127.0.0.1 for direct Node execution and 0.0.0.0 in Docker; a Cloudflare tunnel (`cloudflared tunnel run`, ingress `runners.<domain>` → `http://127.0.0.1:8920`) gives it its name.
 
-The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, backups and migration. Startup waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
+The Docker setup uses a persistent data volume and private `.env` configuration. [Self-hosting instructions](docs/self-hosting.md) cover initialization, networking, persistence and migration. Startup waits for a complete Cloudflare tunnel listing before scheduling or changing DNS. Failed listings retry every minute; existing agents keep their workloads while the controller recovers. Tokens are fetched only when machines join and retained in RAM until restart. `GET /api/export` and `POST /api/import` (admin password) move server state; stop scheduling before importing a final snapshot.
 
 ## Tests
 
@@ -246,7 +245,7 @@ The Docker setup uses a persistent data volume and private `.env` configuration.
 ## Setup notes
 
 - **Agent settings:** `CONTROL_URL` is your controller's public URL and `JOIN_TOKEN` is the fleet join token. Set a required `SERVER_TAG` and optionally `LABEL` and `REGION` on each host. Tunnel connection tokens come from the control plane.
-- **Control plane secrets:** `ADMIN_PASSWORD` authorizes fleet changes and app management; `JOIN_TOKEN` authenticates agents; `STATE_SIGNING_KEY` signs recovery receipts. `CF_API_TOKEN` authorizes the controller's DNS and tunnel management. Keep these credentials and the data volume private and backed up. App passwords are kept by the control plane.
+- **Control plane secrets:** `ADMIN_PASSWORD` authorizes fleet changes and app management; `JOIN_TOKEN` authenticates agents; `STATE_SIGNING_KEY` signs recovery receipts. `CF_API_TOKEN` authorizes the controller's DNS and tunnel management. Keep these credentials and the data volume private. App passwords are kept by the control plane.
 - **Web app:** changes sent from other sites are refused.
 - **More servers:** start tagged agents through your provider automation or the required-tag join command. The CP schedules onto servers that connect; it never fills a target or retires extra healthy servers.
 - **Another provider or account:** assign a distinct `SERVER_TAG`, supply its servers externally and reuse the fleet join token. Tags group observed machines without pre-registering a capacity or quantity.

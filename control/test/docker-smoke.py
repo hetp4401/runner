@@ -1,6 +1,5 @@
 """Build first, then run: python3 control/test/docker-smoke.py runner-control:local"""
 import concurrent.futures
-import importlib.util
 import json
 import os
 import pathlib
@@ -133,24 +132,6 @@ http.createServer(async(req,res)=>{
     assert state['uid'] == 1000 and not state['socket'] and state['secret'] and state['ca'], state
     assert state['tables'] == ['app_env', 'app_passwords', 'projects', 'settings', 'versions']
     check('SIGKILL preserves specs and secrets, with only five tables and no Docker socket')
-
-    snapshot = '/tmp/docker-smoke-backup'
-    docker('exec', name, 'node', 'backup.mjs', snapshot)
-    backup_state = json.loads(docker('exec', name, 'node', '-e', "const fs=require('fs');const {DatabaseSync}=require('node:sqlite');const p='/tmp/docker-smoke-backup';const d=new DatabaseSync(p+'/control.db',{readOnly:true});console.log(JSON.stringify({secret:d.prepare(\"select value from app_env where key='TOKEN'\").get().value==='durable-test-value',version:d.prepare(\"select version from projects where name='web'\").get().version,identity:fs.readFileSync(p+'/identity.json','utf8')===fs.readFileSync('/data/identity.json','utf8'),private:(fs.statSync(p+'/control.db').mode&63)===0,manifest:JSON.parse(fs.readFileSync(p+'/manifest.json','utf8')).projects.length}));").stdout)
-    assert backup_state == {'secret': True, 'version': version, 'identity': True, 'private': True, 'manifest': 1}, backup_state
-    assert docker('exec', name, 'node', 'backup.mjs', snapshot, ok=False).returncode != 0
-    check('online SQLite backup preserves WAL-backed configuration, identity and private permissions without overwriting a snapshot')
-    module = importlib.util.spec_from_file_location('mac_docker', pathlib.Path(__file__).resolve().parents[1] / 'mac-docker.py')
-    helper = importlib.util.module_from_spec(module)
-    module.loader.exec_module(helper)
-    exported = directory / 'exported'
-    exported.mkdir(mode=0o700)
-    helper.export_snapshot(name, snapshot, exported, os.environ.copy())
-    import hashlib
-    manifest = json.loads((exported / 'manifest.json').read_text())
-    assert all(hashlib.sha256((exported / file).read_bytes()).hexdigest() == digest for file, digest in manifest['files'].items())
-    assert all(file.stat().st_mode & 0o077 == 0 for file in exported.iterdir())
-    check('a tmpfs snapshot exports outside the Docker VM with matching checksums and private files')
 
     missing = docker('run', '--rm', '-e', 'DOMAIN=example.test', '-e', 'ADMIN_PASSWORD=fake', '-e', 'JOIN_TOKEN=fake', '-e', 'STATE_SIGNING_KEY=fake', image, ok=False)
     assert missing.returncode != 0 and 'control.db is missing' in missing.stderr

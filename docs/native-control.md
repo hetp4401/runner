@@ -14,9 +14,8 @@ entire repository, including `agent/`, in a stable local directory.
 
 1. Stop and disable the original controller, including any service that restarts
    it. An unreachable host is not proof that its controller cannot return.
-2. Copy a consistent, current `control.db`, `identity.json`, and the private
-   environment configuration. For an online database use SQLite's backup API;
-   copying a live database without its WAL is insufficient. Preserve app source,
+2. Transfer the stopped controller's `control.db`, `identity.json`, any remaining
+   SQLite WAL files, and the private environment configuration together. Preserve app source,
    passwords, environment variables, the join token, signing key, public URL,
    `TUNNEL_PREFIX`, and `CONTROLLER_TUNNEL_NAME`.
 3. Put restored state in a directory readable only by its owner. Create a
@@ -33,10 +32,10 @@ entire repository, including `agent/`, in a stable local directory.
    writes the definition for activation at the next login.
 6. Verify localhost health, the public dashboard, agent reconnections, app
    versions, passwords, environment keys, replica readiness, and each provider's
-   refill settings. Keep the original consistent backup until recovery passes.
+   refill settings.
 
-Never initialize an empty replacement controller or substitute an old backup
-without reconciling later configuration changes. Agent receipts restore runtime
+Never initialize an empty replacement controller or use stale configuration
+when moving the fleet. Agent receipts restore runtime
 inventory; they do not contain authoritative app definitions or credentials.
 The local advisory lock does not fence a controller running on another computer.
 
@@ -58,12 +57,6 @@ restart under launchd, which also manages the supervisor's child process group.
 Provider credentials and machine-count targets stay in provider adapters. The
 three GitHub pools need no controller URL change when the public hostname is
 preserved. Their existing watchdogs can keep supplying hosts after the move.
-
-Create a consistent backup while the controller is running with
-`python3 control/backup-native.py --config /absolute/environment.json
---destination /absolute/backups/unique-name`. It snapshots SQLite through the
-backup API, includes the private environment and identity, and records hashes.
-Keep a copy on a separate device or private storage to survive loss of the Mac.
 
 The macOS integration check runs only disposable local state and a fake
 Cloudflare API:

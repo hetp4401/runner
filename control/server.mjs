@@ -47,7 +47,6 @@ const sql = new LocalStore(`${dataDir}/control.db`, { initialize: env.INIT_CONTR
   log("configuration storage failed; restarting before issuing more plans");
   setImmediate(() => shutdown(1));
 } });
-if (sql.backupPath) log(`configuration-only storage migration complete; previous database backed up at ${sql.backupPath}`);
 
 let timer = null;
 const bundle = loadAgentBundle(fileURLToPath(new URL("..", import.meta.url)));

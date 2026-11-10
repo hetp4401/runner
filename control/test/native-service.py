@@ -7,7 +7,6 @@ from pathlib import Path
 import re
 import signal
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -113,24 +112,6 @@ def main():
             wait_for(status)
             assert after != before
             print("ok launchd cleans up a crashed supervisor and restarts a healthy controller", flush=True)
-            # Keep a WAL connection open so copying only control.db would miss
-            # this committed fixture. The backup must use SQLite's online API.
-            writer = sqlite3.connect(root / "data/control.db")
-            writer.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('rebalance','false')")
-            writer.commit()
-            try:
-                subprocess.run([sys.executable, str(control / "backup-native.py"), "--config", str(config),
-                                "--destination", str(root / "backup")], check=True, capture_output=True, text=True)
-                snapshot = sqlite3.connect(root / "backup/control.db")
-                try:
-                    assert snapshot.execute("SELECT value FROM settings WHERE key='rebalance'").fetchone()[0] == "false"
-                finally:
-                    snapshot.close()
-                assert (root / "backup/identity.json").read_bytes() == (root / "data/identity.json").read_bytes()
-                assert all(p.stat().st_mode & 0o077 == 0 for p in (root / "backup").iterdir())
-            finally:
-                writer.close()
-            print("ok online backup includes committed WAL changes, identity, and private permissions", flush=True)
         finally:
             subprocess.run(["launchctl", "bootout", service], capture_output=True)
             plist.unlink(missing_ok=True)

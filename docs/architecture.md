@@ -35,7 +35,7 @@ A lock prevents concurrent controllers using the same Linux data volume.
 
 On a Mac, `control/mac-docker.py` runs under launchd and starts the dedicated
 Colima engine and Compose service. Docker owns the Node/connector processes.
-The wrapper holds an AC-power idle-sleep assertion and exports daily backups.
+The wrapper holds an AC-power idle-sleep assertion and supervises the controller.
 The [Mac runbook](mac-control.md) covers service operation and availability.
 
 ## State and recovery
@@ -44,7 +44,7 @@ The [Mac runbook](mac-control.md) covers service operation and availability.
 `projects`, `versions`, `settings`, `app_passwords` and `app_env`. They contain the
 authoritative app definitions, source history, operator settings and secrets.
 `identity.json` and the private controller environment preserve fleet identity
-and Cloudflare access. Back up all of these together.
+and Cloudflare access. Preserve these files together when moving the controller.
 
 Machine reports, scheduling observations, metrics and tunnel credentials remain
 in controller memory. Agents retain their approved plans, inventory and signed
@@ -56,7 +56,7 @@ The default recovery hold is three minutes.
 Run exactly one controller for a fleet. A local volume lock cannot fence another
 computer or another volume. Before migration, disable the old scheduler and its
 automatic startup, preserve the public origin, join token, signing key and tunnel
-namespace, and transfer a consistent SQLite backup. Never initialize a new empty
+namespace, and transfer the current SQLite files after stopping the old controller. Never initialize a new empty
 fleet as an outage-recovery shortcut.
 
 ## Agents and providers
