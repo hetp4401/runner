@@ -1,5 +1,5 @@
-// Each repository's scheduled workflow owns its machine supply. No controller
-// request or process outside GitHub is needed to plan or launch capacity.
+// Each repository's serialized workflow owns launch accounting. It can be
+// woken by its schedule or by the optional replicated provider application.
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
@@ -76,10 +76,22 @@ export async function reconcileCapacity(env, { api, now = Date.now, log = consol
   if (!/^[a-z0-9][a-z0-9-]{0,29}$/.test(tag)) throw new Error("invalid SERVER_TAG");
   const ref = env.MACHINE_REF || env.GITHUB_REF_NAME;
   if (!ref || /[\r\n\0]/.test(ref)) throw new Error("MACHINE_REF is required");
-  // Manual workflow runs and local checks only preview. Launches belong to
-  // GitHub schedule events; each launch carries that run's ID for verification.
-  const dry = env.CAPACITY_DRY_RUN === "1" || env.GITHUB_EVENT_NAME !== "schedule";
+  const scheduled = env.GITHUB_EVENT_NAME === "schedule" && env.CAPACITY_TRIGGER !== "provider";
+  const provider = env.CAPACITY_TRIGGER === "provider" && env.GITHUB_EVENT_NAME === "workflow_dispatch" &&
+    env.GITHUB_WORKFLOW === "Machine schedule" && Boolean(env.CAPACITY_SLOT) &&
+    env.GITHUB_WORKFLOW_REF === `${repo}/.github/workflows/watchdog.yml@refs/heads/${ref}`;
+  const dry = env.CAPACITY_DRY_RUN === "1" || !(scheduled || provider);
   if (!dry && !/^[1-9]\d*$/.test(env.GITHUB_RUN_ID || "")) throw new Error("scheduled GITHUB_RUN_ID is required");
+  if (!dry && env.GITHUB_RUN_ATTEMPT && env.GITHUB_RUN_ATTEMPT !== "1") {
+    log("A capacity rerun cannot repeat a host request.");
+    return { target, launched: 0, duplicate: true };
+  }
+  if (provider && !dry) {
+    const phase = env.CAPACITY_PHASE_MIN || "2", slot = Number(env.CAPACITY_SLOT);
+    if (!/^[0-9]$/.test(phase) || !/^[1-9]\d{12}$/.test(env.CAPACITY_SLOT) ||
+        slot % LAUNCH_SPACING_MS !== Number(phase) * 60_000 || slot > now() || now() - slot >= LAUNCH_SPACING_MS)
+      throw new Error("provider refill slot is stale, in the future, or has the wrong phase");
+  }
   api ||= githubClient(env.GH_TOKEN, env.GITHUB_API_URL);
   const endpoint = `/repos/${repo}/actions/workflows/machine.yml`;
   const active = (await Promise.all(ACTIVE_STATUSES.map(async (state) => {

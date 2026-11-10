@@ -24,7 +24,7 @@ for(let id=1;id<=7;id++){
 const env={...process.env,CP_CLUSTER_ID:'memory-test-cluster-generation',CP_CLUSTER_TOKEN:token,CP_MEMBERS:JSON.stringify(members),CP_RAFT_TICK_MS:'100',CP_RAFT_ELECTION_TICKS:'15',CP_RAFT_HEARTBEAT_TICKS:'2'};
 async function start(id,key=id){
  const address=await port();if(key===id)endpoints.set(id,address);
- const child=spawn('/tmp/runners-raft-memory-test',[],{env:{...env,CP_NODE_ID:String(id),CP_RAFT_PORT:String(address)},stdio:['ignore','ignore','pipe']});
+ const child=spawn(process.env.RAFT_TEST_BINARY||'/tmp/runners-raft-memory-test',[],{env:{...env,CP_NODE_ID:String(id),CP_RAFT_PORT:String(address)},stdio:['ignore','ignore','pipe']});
  const item={id,key,address,child};processes.set(key,item);logs.set(key,'');child.stderr.on('data',b=>logs.set(key,(logs.get(key)+b).slice(-9000)));return item;
 }
 async function request(target,path,body){
@@ -46,15 +46,28 @@ try{
  check('four voters elect and authorize exactly one primary',()=>assert.equal(first.quorum,4));
  for(const id of [5,6,7])assert.ok(await request(id,'/bootstrap',manifest));
  await until(async()=>(await views()).every(v=>v?.leaderNode===first.leaderNode));
+ if(process.env.CP_RAFT_ALLOW_CLAIMS==='1'){
+  const attempts=await Promise.all(Array.from({length:8},()=>request(first.id,'/claim',{key:'account/runner',sequence:100,term:first.term})));
+  check('simultaneous work claims commit exactly one accepted attempt',()=>assert.equal(attempts.filter(r=>r?.accepted).length,1));
+  assert.equal((await request(first.id,'/claim',{key:'account/runner',sequence:99,term:first.term})).accepted,false);
+ }
  isolated=new Set([first.id,...members.filter(m=>m.id!==first.id).slice(0,2).map(m=>m.id)]);
  const second=await until(async()=>{for(const p of processes.values()){if(isolated.has(p.id))continue;const v=await request(p,'/verify');if(v?.term>first.term)return v}return null});
  assert.equal(await request(first.id,'/verify'),null);
  check('a partitioned former primary loses authority when a new quorum elects',()=>assert.ok(second.term>first.term));
+ if(process.env.CP_RAFT_ALLOW_CLAIMS==='1'){
+  const duplicate=await request(second.id,'/claim',{key:'account/runner',sequence:100,term:second.term});
+  check('a new primary preserves committed work and rejects a duplicate',()=>assert.equal(duplicate.accepted,false));
+  assert.equal((await request(second.id,'/claim',{key:'account/runner',sequence:101,term:second.term})).accepted,true);
+  assert.equal(await request(second.id,'/claim',{key:'account/runner',sequence:102,term:first.term}),null);
+  assert.equal(await request(first.id,'/claim',{key:'account/runner',sequence:102,term:first.term}),null);
+ }
  isolated=new Set();await until(async()=>(await views()).every(v=>v?.leaderNode===second.leaderNode));
  const replace=members.find(m=>m.id!==second.id).id,old=(await request(replace,'/status')).node;
  await stop(replace);await start(replace);
  const renewed=await until(async()=>{const s=await request(replace,'/status');return s?.identityValid&&!s.outgoing.length&&s});
  check('restart joins as a new learner and replaces its old voter through consensus',()=>{assert.notEqual(renewed.node,old);assert.equal(renewed.voters.length,7);assert.ok(!renewed.voters.includes(old))});
+ if(process.env.CP_RAFT_ALLOW_CLAIMS==='1')check('a replacement recovers latest claims from the memory snapshot',()=>assert.equal(renewed.registry.claims['account/runner'].sequence,101));
  const current=await leader();
  for(const id of [1,2,3])await stop(id);
  await until(()=>request((current.id>3?current.id:4),'/status'));

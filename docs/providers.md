@@ -9,15 +9,16 @@ provider adapters. The same controller and agent work with other Linux providers
 
 Each participating repository has `machine.yml` and `watchdog.yml` workflows.
 The latter appears as **Machine schedule** in the Actions UI.
-Only scheduled watchdog runs launch machines. The watchdog reads its own
+By default, scheduled watchdog runs launch machines. The watchdog reads its own
 repository's Actions inventory and target; it does not call the control plane.
 Manual watchdog runs are previews, and machine completion does not trigger a
-refill. There is no external provider service on a Mac or VPS.
+refill. An optional [replicated provider app](replicated-provider.md) can own the
+timer instead; it runs as an ordinary fleet app and needs no Mac service.
 
 `machine.yml` starts one Ubuntu Docker host and runs the generic agent directly
 in the job. Apps still run in Docker. Machine jobs verify the requesting
-`schedule_run` belongs to this repository's scheduled watchdog on the same
-branch. They have read-only Actions permission and supply no `START_CMD` or
+`schedule_run` belongs to this repository's scheduled or provider-triggered
+watchdog on the same branch. They have read-only Actions permission and supply no `START_CMD` or
 GitHub token to the agent. Existing hosts finish their normal drain; their old
 direct handover dispatches cannot start new jobs through this workflow.
 
@@ -70,8 +71,9 @@ updates naturally; `roll.yml` is explicit operator maintenance only.
 
 [GitHub schedule events can be delayed or dropped](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 Offsets and overlap provide headroom, not exact-time guarantees. A prolonged
-GitHub scheduling interruption can reduce capacity; no external fallback
-dispatches jobs. Account quotas and workflow concurrency limits also apply.
+GitHub scheduling interruption can reduce capacity in schedule mode. Provider
+mode uses a Raft primary's timer instead. Account quotas and workflow
+concurrency limits still apply.
 
 Verify scheduling by checking for new runs with `event: schedule` in each
 repository. An enabled workflow, a valid cron expression, or a successful manual
