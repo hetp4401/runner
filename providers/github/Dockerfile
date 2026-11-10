@@ -8,6 +8,7 @@ FROM node:24-bookworm-slim
 ENV NODE_ENV=production PORT=8924 BIND_HOST=0.0.0.0
 WORKDIR /app
 COPY --from=raft /runner-raft /usr/local/bin/runner-raft
+COPY --from=raft /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY control/src/ha/config.mjs control/src/ha/authority.mjs control/src/ha/tail.mjs ./control/src/ha/
 COPY control/cluster-init.mjs ./control/
 COPY .github/scripts/capacity.mjs ./.github/scripts/
