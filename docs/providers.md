@@ -8,6 +8,7 @@ provider adapters. The same controller and agent work with other Linux providers
 ## GitHub Actions
 
 Each participating repository has `machine.yml` and `watchdog.yml` workflows.
+The latter appears as **Machine schedule** in the Actions UI.
 Only scheduled watchdog runs launch machines. The watchdog reads its own
 repository's Actions inventory and target; it does not call the control plane.
 Manual watchdog runs are previews, and machine completion does not trigger a
@@ -49,9 +50,9 @@ workflow. Give accounts different minute offsets, for example:
 
 | Account | UTC cron | Minutes within each hour |
 | --- | --- | --- |
-| First | `1-59/10 * * * *` | 01, 11, 21, 31, 41, 51 |
-| Second | `4-59/10 * * * *` | 04, 14, 24, 34, 44, 54 |
-| Third | `7-59/10 * * * *` | 07, 17, 27, 37, 47, 57 |
+| First | `2,12,22,32,42,52 * * * *` | 02, 12, 22, 32, 42, 52 |
+| Second | `5,15,25,35,45,55 * * * *` | 05, 15, 25, 35, 45, 55 |
+| Third | `8,18,28,38,48,58 * * * *` | 08, 18, 28, 38, 48, 58 |
 
 Each reconciliation starts at most one host, with at least ten minutes between
 launch requests even if scheduled runs arrive together. Failed launches count
@@ -72,8 +73,16 @@ Offsets and overlap provide headroom, not exact-time guarantees. A prolonged
 GitHub scheduling interruption can reduce capacity; no external fallback
 dispatches jobs. Account quotas and workflow concurrency limits also apply.
 
-Use **Run workflow** on the watchdog to preview the account's plan without
-launching machines. Run its regression checks with Node.js 24:
+Verify scheduling by checking for new runs with `event: schedule` in each
+repository. An enabled workflow, a valid cron expression, or a successful manual
+preview does not prove that GitHub is delivering schedule events. If scheduled
+runs stop arriving, check the default branch, workflow state and associated
+account. Commit a cron change using an active account with write access to
+refresh the schedule association, then verify actual scheduled runs again.
+See [GitHub's schedule troubleshooting](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflow-stopped-running).
+
+Use **Run workflow** on **Machine schedule** to preview the account's plan
+without launching machines. Run its regression checks with Node.js 24:
 
 ```sh
 node --test .github/scripts/capacity.test.mjs
