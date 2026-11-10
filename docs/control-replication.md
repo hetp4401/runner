@@ -124,9 +124,18 @@ dependency: a quorum can schedule replacements; a minority cannot create votes.
 
 Ordinary app source updates currently replace all copies in parallel. With the
 Mac copies stopped, a fleet-wide source upgrade loses the remaining cluster
-memory. Treat that as planned maintenance: stop/fence the previous cluster,
-wait for the fresh copies, then explicitly bootstrap. Do not expect a rolling
-upgrade from a normal app source update.
+memory. Agents receive their plans independently: the first updated copy can
+stop before the remaining agents receive the new version. A replacement may
+also retain a joining state from the old generation, so waiting for every copy
+to become uninitialized is not a recovery procedure.
+
+Before updating a self-hosted controller app, prepare independent access to its
+hosts and enough recovery compute to form a quorum. Treat the update as planned
+maintenance: stop/fence the previous cluster, restart every recovery process
+with fresh memory, then explicitly bootstrap. Never reset a minority while an
+old quorum can still act. Return the ordinary fleet copies through the normal
+learner admission process before removing temporary recovery capacity. Do not
+expect a rolling upgrade from a normal app source update.
 
 ## External copies and Mac supervision
 
