@@ -10,7 +10,7 @@ Start with the [requirements](requirements.md) and [self-hosting guide](self-hos
 | [D1 storage](d1-storage.md) | Durable configuration, Global API Key setup, migration, quotas and failure behavior. |
 | [Architecture](architecture.md) | Web app, controller, agents, storage, networking and recovery. |
 | [Mac Docker operations](mac-control.md) | Colima, startup supervision, persistence and migration. |
-| [Provider adapters](providers.md) | Independent GitHub capacity, multiple accounts and watchdog fallback. |
+| [Provider adapters](providers.md) | Independent GitHub capacity and interleaved account schedules. |
 | [Self-hosting](self-hosting.md) | Initialize a controller, connect hosts, deploy an app and configure a reverse proxy. |
 | [VPS operations](vps-control.md) | Service checks, persistence, upgrades and migration. |
 | [Native Mac control](native-control.md) | Run the same controller under launchd, migrate a fleet, and verify crash recovery. |

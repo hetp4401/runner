@@ -8,10 +8,17 @@ provider adapters. The same controller and agent work with other Linux providers
 ## GitHub Actions
 
 Each participating repository has `machine.yml` and `watchdog.yml` workflows.
-The watchdog supplies missing capacity within that repository's target and
-concurrency constraints. `machine.yml` starts one Ubuntu Docker host and runs the
-agent directly in the job. It supplies a lifetime and a replacement command so
-an expiring host can request its own successor. Apps still run in Docker.
+Only scheduled watchdog runs launch machines. The watchdog reads its own
+repository's Actions inventory and target; it does not call the control plane.
+Manual watchdog runs are previews, and machine completion does not trigger a
+refill. There is no external provider service on a Mac or VPS.
+
+`machine.yml` starts one Ubuntu Docker host and runs the generic agent directly
+in the job. Apps still run in Docker. Machine jobs verify the requesting
+`schedule_run` belongs to this repository's scheduled watchdog on the same
+branch. They have read-only Actions permission and supply no `START_CMD` or
+GitHub token to the agent. Existing hosts finish their normal drain; their old
+direct handover dispatches cannot start new jobs through this workflow.
 
 Configure each repository independently:
 
@@ -24,55 +31,50 @@ Configure each repository independently:
 | Variable `AGENT_REPO` | Optional source repository, such as `hetp4401/runner`; defaults to this repository. |
 | Variable `REGION` | Optional explicit location label. |
 
-`POOL` and `POOL_SIZE` are compatibility aliases. The job's GitHub token stays
-in the provider process environment for its replacement command; agent source
-contains no account-specific logic. Machine jobs currently have a six-hour
-workflow timeout and report a 355-minute lifetime. GitHub account availability,
-quotas and workflow limits still govern whether replacement capacity can start.
+`POOL` and `POOL_SIZE` are compatibility aliases. The watchdog uses its own
+repository-scoped GitHub token; no cross-account credentials are needed.
+Machine jobs have a six-hour timeout and report a 355-minute lifetime. The
+control plane schedules app evacuation before the deadline using its ordinary
+departure gates. Agent and controller source contain no account-specific logic.
 
 For multiple accounts, configure each provider repository with its own target
 and tag, while sharing only the fleet origin/join identity. A controller move
 between VPS, native Mac and Docker requires no provider URL change when that
 public origin remains stable.
 
-## Optional watchdog fallback
+## Interleaved schedules
 
-`.github/scripts/capacity-fallback.py` runs independently of the controller. It
-reads current targets from repository variables, observes connected counts and
-dispatches the existing serialized watchdog when capacity is below target. It
-waits through controller recovery and avoids dispatching while a watchdog is
-already active. This is a provider adapter, not part of the scheduler.
+Put `watchdog.yml` on each repository's default branch and enable its Actions
+workflow. Give accounts different minute offsets, for example:
 
-Example private configuration (replace paths and repository names):
+| Account | UTC cron | Minutes within each hour |
+| --- | --- | --- |
+| First | `1-59/10 * * * *` | 01, 11, 21, 31, 41, 51 |
+| Second | `4-59/10 * * * *` | 04, 14, 24, 34, 44, 54 |
+| Third | `7-59/10 * * * *` | 07, 17, 27, 37, 47, 57 |
 
-```json
-{
-  "control_url": "https://runners.example.com",
-  "providers": [
-    {"login": "your-account", "repo": "your-account/runner"}
-  ],
-  "credential_sources": ["/absolute/private/github-credentials.json"],
-  "interval_seconds": 300
-}
-```
+Each reconciliation starts at most one host, with at least ten minutes between
+launch requests even if scheduled runs arrive together. Failed launches count
+toward that spacing. Pending jobs reserve capacity. A host running for at least
+210 minutes permits one extra host above the target to warm before departure;
+the provider never cancels healthy jobs to enforce its target. Actual running
+and pending jobs are capped at target plus one for new launch decisions,
+including during migration from overlapping legacy handovers.
 
-Keep the credential file outside the checkout with mode 0600. It can contain a
-JSON mapping from login to token. Tokens need access to the relevant repository's
-variables and workflow dispatch.
+This spreads replenishment over time instead of creating a whole cohort with
+the same deadline. An empty pool deliberately ramps up one host per interval.
+The generic control plane still staggers departures and moves app replicas to
+available hosts before retiring a machine. New scheduled hosts pick up source
+updates naturally; `roll.yml` is explicit operator maintenance only.
 
-Status checks use the stable control origin by default, with an explicit
-client identity accepted by the public edge. An optional `status_url` overrides
-the endpoint for private deployments. Do not use a replica's localhost address
-when the helper must keep working after that replica is stopped.
+[GitHub schedule events can be delayed or dropped](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+Offsets and overlap provide headroom, not exact-time guarantees. A prolonged
+GitHub scheduling interruption can reduce capacity; no external fallback
+dispatches jobs. Account quotas and workflow concurrency limits also apply.
 
-Test without dispatching:
+Use **Run workflow** on the watchdog to preview the account's plan without
+launching machines. Run its regression checks with Node.js 24:
 
 ```sh
-python3 .github/scripts/capacity-fallback.py \
-  --config /absolute/private/provider.json \
-  --state /absolute/private/provider-state.json --once --dry-run
+node --test .github/scripts/capacity.test.mjs
 ```
-
-Omit `--once --dry-run` for a supervised adapter. On the Mac it may remain a
-separate LaunchAgent using the stable public controller origin. Do not put
-these credentials in the controller image, app environment or public logs.

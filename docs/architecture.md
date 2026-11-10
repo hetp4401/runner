@@ -76,8 +76,8 @@ serving approved workloads while the controller is unavailable.
 
 The controller accepts supplied capacity and the agent reports an origin tag.
 Neither contains GitHub account lists or desired machine counts. Provider
-adapters own those targets and create machines. GitHub's workflows and optional
-watchdog fallback are documented in [provider adapters](providers.md).
+adapters own those targets and create machines. GitHub's independent account
+schedules are documented in [provider adapters](providers.md).
 
 App data stays on the machine unless the app implements replication or shared
 storage. Scheduling another replica does not copy an application's volumes.

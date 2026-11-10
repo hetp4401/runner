@@ -1,10 +1,8 @@
 name: roll
 
-# The agent changed: replace the machines one at a time so they all run the new code.
+# Explicit operator maintenance only. Scheduled hosts pick up agent changes
+# naturally; a source push must not expire a whole provider cohort.
 on:
-  push:
-    branches: [main]
-    paths: ["agent/**"]
   workflow_dispatch:
 
 jobs:

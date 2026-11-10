@@ -1,31 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ACTIVE_STATUSES, capacityPlan, githubClient, reconcileCapacity, targetCount } from "./capacity.mjs";
+import { verifyScheduledOrigin } from "./verify-schedule.mjs";
 
-const now = Date.parse("2026-11-02T12:00:00Z");
-const run = (id, slot, status = "in_progress", age = 60) => ({ id, name: `machine ${slot}`, status,
+const now = Date.parse("2026-11-10T12:00:00Z");
+const run = (id, slot, status = "in_progress", age = 60) => ({ id, display_title: `machine ${slot}`, status,
   created_at: new Date(now - age * 60_000).toISOString() });
 const env = { GITHUB_REPOSITORY: "school/Runners", MACHINE_REF: "main", MACHINE_COUNT: "15",
-  SERVER_TAG: "school", CONTROL_URL: "https://runners.example.test" };
+  SERVER_TAG: "school", GITHUB_EVENT_NAME: "schedule", GITHUB_RUN_ID: "1234" };
 
-function fixture({ active = [], recent = [], status = { fleetMode: "passive", groups: [{ tag: "school", online: 10 }] }, fail } = {}) {
+function fixture({ active = [], recent = [], fail } = {}) {
   const calls = [];
-  return {
-    calls,
-    options: {
-      now: () => now, log() {}, readStatus: async () => status,
-      api: async (path, options = {}) => {
-        calls.push({ path, ...options });
-        if (fail) await fail(path, options, calls);
-        if (options.method === "POST") return null;
-        const url = new URL(path, "https://api.example.test"), state = url.searchParams.get("status");
-        return { workflow_runs: state ? active.filter((r) => r.status === state) : recent };
-      },
+  return { calls, options: { now: () => now, log() {},
+    api: async (path, options = {}) => {
+      calls.push({ path, ...options });
+      if (fail) await fail(path, options);
+      if (options.method === "POST") return null;
+      const url = new URL(path, "https://api.example.test"), state = url.searchParams.get("status");
+      return { workflow_runs: state ? active.filter(r => r.status === state) : recent };
     },
-  };
+  } };
 }
 
-test("targets are provider settings, accept the legacy alias, and reject unsafe quantities", () => {
+test("targets remain provider settings with legacy aliases and quantity validation", () => {
   assert.equal(targetCount({}), 0);
   assert.equal(targetCount({ POOL_SIZE: "15" }), 15);
   assert.equal(targetCount({ MACHINE_COUNT: "6", POOL_SIZE: "15" }), 6);
@@ -33,118 +30,149 @@ test("targets are provider settings, accept the legacy alias, and reject unsafe 
   for (const value of ["-1", "1.5", "01", "51", "many", " "]) assert.throws(() => targetCount({ MACHINE_COUNT: value }));
 });
 
-test("handover jobs reserve one slot while queued and fresh jobs each reserve capacity", () => {
-  const active = [run(1, 7), run(2, 7, "queued"), run(3, 8), run(4, 0), run(5, 0, "pending")];
-  assert.deepEqual(capacityPlan(6, active, [], now), { active: 4, missing: 2, launch: 2, deferred: 0 });
+test("old handovers reserve one slot, while each scheduled job reserves its own host", () => {
+  const active = [run(1, 7), run(2, 7, "queued"), run(3, 8), run(4, "scheduled 100"), run(5, "scheduled 101", "pending")];
+  const plan = capacityPlan(6, active, [], now);
+  assert.equal(plan.active, 4);
+  assert.equal(plan.jobs, 5);
+  assert.equal(plan.missing, 2);
+  assert.equal(plan.launch, 1);
+  assert.equal(plan.deferred, 1);
 });
 
-test("requested, waiting and queued hosts prevent duplicate provisioning before they join", () => {
-  const active = ACTIVE_STATUSES.map((state, index) => run(index + 1, index + 1, state));
-  assert.deepEqual(capacityPlan(5, active, [], now), { active: 5, missing: 0, launch: 0, deferred: 0 });
+test("every pending state reserves capacity even if the controller is offline", async () => {
+  const active = ACTIVE_STATUSES.map((state, i) => run(i + 1, i + 1, state));
+  const f = fixture({ active });
+  assert.equal((await reconcileCapacity({ ...env, MACHINE_COUNT: "5" }, f.options)).launched, 0);
+  assert.ok(f.calls.every(c => c.path.startsWith('/repos/school/Runners/actions/') && !c.method));
 });
 
-test("the latest listing resolves completion races and duplicate API snapshots", () => {
-  assert.deepEqual(capacityPlan(3, [run(1, 1), run(2, 2)], [run(1, 1, "completed"), run(2, 2)], now),
-    { active: 1, missing: 2, launch: 2, deferred: 0 });
+test("a missing cohort is refilled one host at a time, at least ten minutes apart", () => {
+  let active = [], recent = [];
+  for (let minute = 0; minute < 60; minute++) {
+    const at = now + minute * 60_000;
+    const plan = capacityPlan(6, active, recent, at);
+    assert.equal(plan.launch, minute % 10 === 0 ? 1 : 0);
+    if (plan.launch) {
+      const r = { ...run(minute + 1, `scheduled ${minute}`, "queued"), created_at: new Date(at).toISOString() };
+      active.push(r); recent.push(r);
+    }
+  }
+  assert.equal(active.length, 6);
 });
 
-test("rapid failed launches cannot form an immediate completion/refill loop", () => {
-  const recent = Array.from({ length: 6 }, (_, i) => run(i + 10, 0, "completed", 1));
-  assert.deepEqual(capacityPlan(6, [], recent, now), { active: 0, missing: 6, launch: 0, deferred: 6 });
-  assert.equal(capacityPlan(6, [], recent, now + 11 * 60_000).launch, 6);
+test("bunched schedules and failed launches cannot burst-launch replacements", () => {
+  const recent = [run(10, "scheduled 500", "completed", 1)];
+  assert.equal(capacityPlan(15, [], recent, now).launch, 0);
+  assert.equal(capacityPlan(15, [], recent, now).retryAfterMs, 9 * 60_000);
+  assert.equal(capacityPlan(15, [], recent, now + 9 * 60_000).launch, 1);
 });
 
-test("the launch budget bounds partial replenishment and healthy excess is never removed", () => {
-  const active = [run(1, 1), run(2, 2)];
-  const recent = Array.from({ length: 5 }, (_, i) => run(i + 10, 0, "completed", 1));
-  assert.deepEqual(capacityPlan(6, active, recent, now), { active: 2, missing: 4, launch: 1, deferred: 3 });
+test("an aging host gets at most one overlap host and healthy jobs are never cancelled", async () => {
+  const active = [run(1, 1, "in_progress", 220), run(2, 2)];
+  assert.equal(capacityPlan(2, active, [], now).launch, 1);
+  active.push(run(3, "scheduled 50", "queued", 1));
+  const f = fixture({ active });
+  const result = await reconcileCapacity({ ...env, MACHINE_COUNT: "2" }, f.options);
+  assert.equal(result.launched, 0);
+  assert.ok(f.calls.every(c => !c.method));
   assert.equal(capacityPlan(1, active, [], now).launch, 0);
 });
 
-test("malformed inventory fails closed", () => {
-  for (const entry of [{ ...run(1, 1), id: null }, { ...run(1, 1), status: "unknown" }, { ...run(1, 1), created_at: "bad" }]) {
-    assert.throws(() => capacityPlan(10, [entry], [entry], now));
+test("waiting jobs and a young same-slot successor do not cause extra overlap launches", () => {
+  assert.equal(capacityPlan(1, [run(1, 1, "queued", 240)], [], now).aging, 0);
+  const active = [run(1, 1, "in_progress", 240), run(2, 1, "in_progress", 20)];
+  assert.equal(capacityPlan(1, active, [], now).aging, 0);
+  assert.equal(capacityPlan(1, active, [], now).launch, 0);
+  const delayed = { ...run(1, 1, "in_progress", 240), run_started_at: new Date(now - 30 * 60_000).toISOString() };
+  assert.equal(capacityPlan(1, [delayed], [], now).aging, 0);
+});
+
+test("actual job count caps overlap during migration from old handovers", () => {
+  const active = [run(1, 1), run(2, 1), run(3, 2), run(4, 2)];
+  const plan = capacityPlan(3, active, [], now);
+  assert.equal(plan.missing, 1);
+  assert.equal(plan.jobs, 4);
+  assert.equal(plan.launch, 0);
+});
+
+test("later listings resolve completion races and malformed inventory fails closed", () => {
+  assert.equal(capacityPlan(3, [run(1, 1), run(2, 2)], [run(1, 1, "completed"), run(2, 2)], now).active, 1);
+  for (const entry of [{ ...run(1, 1), id: null }, { ...run(1, 1), status: "unknown" },
+    { ...run(1, 1), created_at: "bad" }, { ...run(1, 1), run_started_at: "bad" }]) {
+    assert.throws(() => capacityPlan(10, [entry], [], now));
   }
 });
 
-test("disabled providers do not contact either service", async () => {
+test("disabled providers do not contact any service", async () => {
   const f = fixture({ fail() { throw new Error("must not call API"); } });
   assert.deepEqual(await reconcileCapacity({ MACHINE_COUNT: "0" }, f.options), { target: 0, launched: 0 });
-  assert.equal(f.calls.length, 0);
 });
 
-test("a ten-host provider with a target of fifteen requests exactly five fresh machines", async () => {
+test("scheduled dispatches carry their GitHub run ID and require no control-plane endpoint", async () => {
   const f = fixture({ active: Array.from({ length: 10 }, (_, i) => run(i + 1, i + 1)) });
   const result = await reconcileCapacity(env, f.options);
-  assert.equal(result.launched, 5);
-  const starts = f.calls.filter((c) => c.method === "POST");
-  assert.equal(starts.length, 5);
-  for (const request of starts) assert.deepEqual(request, {
-    path: "/repos/school/Runners/actions/workflows/machine.yml/dispatches", method: "POST", body: { ref: "main", inputs: { machine: "0" } },
-  });
-  assert.ok(f.calls.every((c) => c.method === "POST" || !c.method));
+  assert.equal(result.launched, 1);
+  assert.deepEqual(f.calls.filter(c => c.method), [{
+    path: "/repos/school/Runners/actions/workflows/machine.yml/dispatches", method: "POST",
+    body: { ref: "main", inputs: { schedule_run: "1234" } },
+  }]);
 });
 
-test("a repeat check sees pending jobs and requests no more capacity", async () => {
-  const active = [...Array.from({ length: 10 }, (_, i) => run(i + 1, i + 1)), ...Array.from({ length: 5 }, (_, i) => run(i + 11, 0, "queued", 1))];
-  const f = fixture({ active });
-  assert.equal((await reconcileCapacity(env, f.options)).launched, 0);
-  assert.ok(f.calls.every((c) => !c.method));
+test("manual workflows, completion events, local runs and explicit dry runs never dispatch", async () => {
+  for (const override of [{ GITHUB_EVENT_NAME: "workflow_dispatch" }, { GITHUB_EVENT_NAME: "workflow_run" },
+    { GITHUB_EVENT_NAME: undefined }, { CAPACITY_DRY_RUN: "1" }]) {
+    const f = fixture();
+    const result = await reconcileCapacity({ ...env, ...override }, f.options);
+    assert.equal(result.launch, 1);
+    assert.equal(result.launched, 0);
+    assert.ok(f.calls.every(c => !c.method));
+  }
 });
 
-test("an unavailable host report does not duplicate an already active provider job", async () => {
-  const f = fixture({ active: [run(1, 1)], status: { fleetMode: "passive", groups: [] } });
-  const result = await reconcileCapacity({ ...env, MACHINE_COUNT: "1" }, f.options);
-  assert.equal(result.joined, 0);
-  assert.equal(result.launched, 0);
+test("unreadable GitHub inventory and ambiguous dispatch errors fail without retrying a launch", async () => {
+  for (const fail of [
+    path => { if (path.includes("status=queued")) throw new Error("API unavailable"); },
+    (_path, options) => { if (options.method === "POST") throw new Error("dispatch connection lost"); },
+  ]) {
+    const f = fixture({ fail });
+    await assert.rejects(reconcileCapacity(env, f.options));
+    assert.ok(f.calls.filter(c => c.method === "POST").length <= 1);
+  }
 });
 
-test("dry runs compute the deficit without dispatching", async () => {
-  const f = fixture();
-  const result = await reconcileCapacity({ ...env, MACHINE_COUNT: "2", CAPACITY_DRY_RUN: "1" }, f.options);
-  assert.equal(result.launch, 2);
-  assert.equal(result.launched, 0);
-  assert.ok(f.calls.every((c) => !c.method));
-});
-
-test("API and controller errors cannot turn an unreadable fleet into an empty fleet", async () => {
-  const f = fixture({ fail(path) { if (path.includes("status=queued")) throw new Error("API unavailable"); } });
-  await assert.rejects(reconcileCapacity(env, f.options), /API unavailable/);
-  assert.ok(f.calls.every((c) => !c.method));
-  const legacy = fixture({ status: { fleetMode: "managed", groups: [] } });
-  await assert.rejects(reconcileCapacity(env, legacy.options), /passive controller/);
-  assert.equal(legacy.calls.length, 0);
-});
-
-test("active listings are paginated and not truncated to the newest hundred", async () => {
-  const f = fixture();
-  const baseApi = f.options.api;
+test("active inventory is paginated beyond the newest hundred", async () => {
+  const f = fixture(), api = f.options.api;
   f.options.api = async (path, options) => {
     const url = new URL(path, "https://api.example.test");
     if (url.searchParams.get("status") === "in_progress") {
       f.calls.push({ path });
-      const page = Number(url.searchParams.get("page"));
-      return { workflow_runs: page === 1 ? Array.from({ length: 100 }, (_, i) => run(i + 1, i + 1)) : [run(101, 101)] };
+      return { workflow_runs: url.searchParams.get("page") === "1"
+        ? Array.from({ length: 100 }, (_, i) => run(i + 1, i + 1)) : [run(101, 101)] };
     }
-    return baseApi(path, options);
+    return api(path, options);
   };
   const result = await reconcileCapacity(env, f.options);
   assert.equal(result.active, 101);
   assert.equal(result.launched, 0);
-  assert.ok(f.calls.some((c) => c.path.includes("status=in_progress") && c.path.includes("page=2")));
 });
 
-test("an ambiguous dispatch failure is not retried within the same reconciliation", async () => {
-  const f = fixture({ fail(_path, options, calls) {
-    if (options.method === "POST" && calls.filter((c) => c.method === "POST").length === 2) throw new Error("dispatch connection lost");
-  } });
-  await assert.rejects(reconcileCapacity({ ...env, MACHINE_COUNT: "3" }, f.options), /dispatch connection lost/);
-  assert.equal(f.calls.filter((c) => c.method === "POST").length, 2);
+test("machine jobs accept only their own branch's scheduled watchdog as origin", async () => {
+  const launchEnv = { SCHEDULE_RUN: "1234", GITHUB_REPOSITORY: "school/Runners", GITHUB_REF_NAME: "main" };
+  const origin = { event: "schedule", path: ".github/workflows/watchdog.yml", head_branch: "main" };
+  assert.equal(await verifyScheduledOrigin(launchEnv, async path => {
+    assert.equal(path, "/repos/school/Runners/actions/runs/1234"); return origin;
+  }), true);
+  for (const change of [{ event: "workflow_dispatch" }, { event: "workflow_run" },
+    { path: ".github/workflows/machine.yml" }, { head_branch: "other" }]) {
+    await assert.rejects(verifyScheduledOrigin(launchEnv, async () => ({ ...origin, ...change })), /scheduled watchdog/);
+  }
+  await assert.rejects(verifyScheduledOrigin({ ...launchEnv, SCHEDULE_RUN: "../42" }), /scheduled watchdog run/);
 });
 
-test("GitHub HTTP errors omit response bodies and credential values", async () => {
+test("GitHub HTTP errors omit response bodies and credentials", async () => {
   const client = githubClient("test-private-credential", undefined, async () => new Response("private error payload", { status: 403 }));
-  await assert.rejects(client("/repos/example/runner"), (error) => {
+  await assert.rejects(client("/repos/example/runner"), error => {
     assert.match(error.message, /HTTP 403/);
     assert.ok(!error.message.includes("test-private-credential"));
     assert.ok(!error.message.includes("private error payload"));

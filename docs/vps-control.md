@@ -78,25 +78,15 @@ Agents bind their identity and Docker ownership namespace to the controller URL;
 changing that URL requires a coordinated migration. A missing or incomplete
 database prevents startup instead of creating an empty fleet.
 
-## Provider refill fallback
+## Provider schedules
 
 GitHub-hosted machines have a finite job lifetime. An agent reconnects while its
 host remains alive; provider automation must replace hosts whose jobs have ended.
-The provider watchdog workflows maintain each repository's `MACHINE_COUNT`.
-
-For installations that need a backstop when GitHub schedule events are delayed,
-`.github/scripts/capacity-fallback.py` can run under an external supervisor. It
-checks connected counts every five minutes and dispatches the existing provider
-watchdog when a group is below its repository target. The watchdog retains its
-active-job checks, serialization and launch budget. The fallback waits through
-controller recovery and leaves already queued watchdogs alone.
-
-Its private JSON configuration supplies `control_url`, a local `status_url`,
-`providers` (each with `login` and `repo`), and operator-selected
-`credential_sources`. It reads credentials into memory without writing token
-values. Use a dedicated service account and keep the configuration and aggregate
-state private. `--once --dry-run` checks access and shows intended actions before
-enabling the supervisor.
+Each account's GitHub schedule maintains its repository's `MACHINE_COUNT`, with
+interleaved cron offsets and bounded launches. Supply decisions use Actions
+inventory and continue while the controller is unavailable. No Mac or VPS
+provider supervisor is installed. See [provider adapters](providers.md) for
+schedule configuration, warm overlap and timing limits.
 
 ## Troubleshooting
 
