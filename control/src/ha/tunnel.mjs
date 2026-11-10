@@ -15,7 +15,9 @@ export async function replicaTunnel(env, config, api = cloudflare) {
   if (typeof token !== 'string' || !token) throw new Error('replica tunnel has no token');
   const hostname = new URL(config.self.url).hostname;
   if (hostname === env.CONTROL_HOST) throw new Error('peer origin must differ from the primary hostname');
-  await route(env, hostname, tunnel.id, 'runner peer ' + config.cluster + ' ' + config.id, api);
+  // A fleet-hosted copy can use its ordinary numbered app URL as its peer
+  // origin. Its bundled tunnel then publishes only the shared primary hostname.
+  if (env.CP_PEER_TUNNEL !== '0') await route(env, hostname, tunnel.id, 'runner peer ' + config.cluster + ' ' + config.id, api);
   return { id: tunnel.id, token };
 }
 

@@ -34,15 +34,14 @@ settings:
 - `CP_NODE_ID`: this copy's positive integer identity.
 - Existing D1, Cloudflare, admin, join-token and receipt-signing settings.
 
-Peer origins must differ from the primary control hostname. Each voter owns a
-separate ordinary Cloudflare Tunnel. Local deployments may set
+Peer origins must differ from the primary control hostname. External voters use persistent named Cloudflare Tunnels. Fleet voters can use their normal numbered app domains with `CP_PEER_TUNNEL=0`; the app owns and maintains those routes. Each voter also has a bundled tunnel that can publish the shared primary hostname. Local deployments may set
 `CP_PEER_OVERRIDES` to an ID-to-origin JSON map for private container networking.
 Public peer addresses and membership remain identical on every copy.
 
 Run `node control/cluster-init.mjs prepare` with the intended environment.
 This creates only coordination tables and leaves the cluster inactive. Start
 the voters; they can elect and expose diagnostics without starting a scheduler.
-Stop the previous standalone scheduler, then run
+Start every configured voter at least once so its durable identity exists. Stop the previous standalone scheduler, then run
 `node control/cluster-init.mjs activate`. The primary starts the scheduler and,
 after tunnel inventory recovery, points the existing control hostname at its
 own tunnel. Do not run an uncoordinated standalone scheduler alongside it.
@@ -50,6 +49,8 @@ own tunnel. Do not run an uncoordinated standalone scheduler alongside it.
 `deactivate` stops authorization of new work. It is an explicit maintenance
 operation, not a way to rewrite membership. A different membership requires a
 coordinated migration; changing the member list in one process is rejected.
+For an address-only change, keep the same voter IDs and use `update-addresses`
+while inactive, then roll out the matching private environment to all copies.
 
 ## Fleet copies are an ordinary app
 
@@ -61,7 +62,7 @@ watchdogs, special scheduling rules or additional Cloudflare services.
 The application receives the normal `FLEET_REPLICA` variable. Setting
 `CP_NODE_ID_OFFSET=3` maps app replicas 1–4 to voters 4–7; voters 1–3 can run
 elsewhere. The offset is deployment configuration, not a built-in Mac topology.
-Do not put a fixed `CP_NODE_ID` in the app's shared environment.
+Do not put a fixed `CP_NODE_ID` in the app's shared environment. Its `CP_MEMBERS` entry can use that copy's stable numbered app domain; `CP_PEER_TUNNEL=0` preserves the app-managed DNS record.
 
 Provide `CONTROL_IMAGE` for an image built from this repository, or replace
 the example image with a standard Compose remote Git build context pinned to a
@@ -100,8 +101,9 @@ configuration on an available host. Never reset its vote state or lower quorum.
 `control/compose-replicas.mjs` generates a normal Compose deployment from a
 JSON file containing `environment_file` (an absolute private path), `image`
 and local `members` such as `[{ "id": 1, "port": 8920 }]`. Each copy gets an
-independent identity volume and loopback port. The existing Mac supervisor
-accepts optional `compose_file` and `services` settings; its default remains
+independent identity volume and loopback port. An optional `dns` array selects ordinary DNS resolvers for these containers,
+for example when the host resolver has cached missing, newly created peer names.
+The existing Mac supervisor accepts optional `compose_file` and `services` settings; its default remains
 the single `control` service.
 
 ## Leadership, routing and persistence

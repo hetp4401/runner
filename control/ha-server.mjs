@@ -223,6 +223,7 @@ async function tick() {
       const fence = await authority.renew(); nextRenew = Date.now() + 5000;
       if (!fence) { if (application) demote('cluster inactive or fenced'); return; }
     }
+    if (!authority.current) return; // prepared but not activated
     if (!authority.live()) throw new Error('authority lease expired');
     if (!application) {
       const fence = await authority.check();

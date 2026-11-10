@@ -88,6 +88,7 @@ export function settings(input) {
   env.CONTROLLER_NAME ||= env.CONTROL_HOST;
   env.REQUIRE_DEPLOY_AUTH = flag(env.REQUIRE_DEPLOY_AUTH, "REQUIRE_DEPLOY_AUTH", "1");
   env.AUTO_TUNNEL = flag(env.AUTO_TUNNEL, "AUTO_TUNNEL", "1");
+  env.CP_PEER_TUNNEL = flag(env.CP_PEER_TUNNEL, "CP_PEER_TUNNEL", "1");
   // A missing volume must never silently initialize an empty fleet on restart.
   delete env.INIT_CONTROL_DB;
   return env;
