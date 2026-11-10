@@ -82,6 +82,16 @@ try {
   await until(async () => (await views()).filter(v => v.raft?.leader).length === 7);
   const staged = await views();
   check('staged replicas elect but do not start a scheduler before activation', () => assert.equal(staged.some(v => v.primary || v.authority), false));
+  const stagedShell = await fetch(members[0].url + '/');
+  const stagedPage = await stagedShell.text();
+  check('the shared Runners Fleet interface is available before a primary starts', () => {
+    assert.equal(stagedShell.status, 200); assert.match(stagedPage, /function controlPlanePanel\(\)/);
+    assert.match(stagedPage, /nav class="tabs"/); assert.doesNotMatch(stagedPage, /cp-cluster-link/);
+  });
+  const legacy = await fetch(members[0].url + '/cluster', { redirect: 'manual' });
+  check('old replica dashboard links redirect into the main Fleet tab', () => {
+    assert.equal(legacy.status, 302); assert.equal(legacy.headers.get('location'), '/#/fleet');
+  });
   await db.query('UPDATE cp_cluster SET active=1 WHERE id=1');
   const first = await primary();
   check('activation starts exactly one primary scheduler', () => assert.ok(first.authority?.epoch >= 1));
@@ -130,6 +140,12 @@ try {
   await sleep(3000);
   const blocked = await Promise.all([1, 2, 3].map(id => request(id, '/_cp/verify')));
   check('three surviving Mac-side voters cannot authorize control changes', () => assert.ok(blocked.every(r => r.status !== 200)));
+  const survivingShell = await fetch(members[0].url + '/');
+  const survivingView = await request(1, '/api/cluster');
+  check('the same Fleet interface and local peer view remain available without quorum', () => {
+    assert.equal(survivingShell.status, 200); assert.equal(survivingView.status, 200);
+    assert.equal(survivingView.body.self, 1); assert.equal(survivingView.body.replicas.length, 7);
+  });
   console.log(checks + ' HA service checks passed');
 } catch (error) {
   for (const [name, log] of logs) console.error('replica ' + name + ': ' + log);

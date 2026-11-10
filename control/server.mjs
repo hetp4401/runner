@@ -143,7 +143,7 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
 const agentSockets = new Map();
 const status = control.status.bind(control);
 control.status = () => ({ ...status(), controlPlane: {
-  ...(guard.enabled ? { replica: Number(env.CP_NODE_ID), replicas: Number(env.CP_REPLICAS), clusterView: '/cluster' } : {}),
+  ...(guard.enabled ? { replica: Number(env.CP_NODE_ID), replicas: Number(env.CP_REPLICAS), clusterView: '/#/fleet' } : {}),
   mode: guard.enabled ? "raft" : env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
   runtime: env.CONTROLLER_RUNTIME || "native",
   owner: env.CONTROLLER_KIND || "vps", name: env.CONTROLLER_NAME || "VPS",

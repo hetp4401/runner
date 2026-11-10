@@ -156,6 +156,7 @@
 
   /* ---- metrics ---- */
   .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  #cp-summary { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
   .tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 12px 14px; }
   .tile .label { color: var(--fg-2); font-size: var(--fs-xs); }
   .tile .value { font-size: var(--fs-num); font-weight: 650; margin-top: 2px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -280,7 +281,6 @@
       <a href="#/activity" data-nav="activity"><i aria-hidden="true">↻</i>Activity</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
-      <a href="/cluster" id="cp-cluster-link" hidden><i aria-hidden="true">◉</i>Replicas</a>
     </nav>
     <div class="spacer"></div>
     <span id="summary" role="status" aria-live="polite"></span>
@@ -2366,16 +2366,101 @@ function vMetrics() {
   };
 }
 
+// This section reads the replica serving this page, independently of the primary's
+// fleet status. Keep it usable during an election and cancel work on navigation.
+function controlPlanePanel() {
+  let data = null, error = null, disposed = false, request = null, timer = null;
+  const html = `<section aria-labelledby="cp-heading">
+    <h2><span class="grow" id="cp-heading">Control plane</span><button type="button" class="small" data-act="cp-refresh" id="cp-refresh">Refresh</button></h2>
+    <div class="meta" id="cp-meta" role="status">Loading replica health…</div>
+    <div class="tiles" id="cp-summary" style="margin:12px 0"></div><div id="cp-replicas"></div>
+    <div id="cp-history"><h2>Recent primary transitions</h2><div id="cp-transitions"></div>
+      <p class="meta">Recent history is kept in memory and may reset after a full cluster restart.</p></div>
+    </section>`;
+  function render() {
+    if (disposed) return;
+    const cp = S.status?.controlPlane;
+    const single = cp && !cp.replicas && !data;
+    $("#cp-history").hidden = Boolean(single);
+    $("#cp-refresh").hidden = Boolean(single);
+    if (single) {
+      setHtml($("#cp-meta"), "One controller · no leader election");
+      setHtml($("#cp-summary"), `<div class="tile"><div class="label">Controller</div><div class="value">${esc(cp.name || "Single controller")}</div><div class="subv">${esc(cp.runtime || cp.mode)}</div></div>`);
+      setHtml($("#cp-replicas"), "");
+      return;
+    }
+    const now = Date.now();
+    const fresh = row => !error && row.reachable && now - row.lastSeen < 15_000;
+    const voting = row => fresh(row) && row.view?.raft?.identityValid;
+    const rows = data?.replicas || [];
+    const primary = rows.find(row => voting(row) && row.view.primary);
+    const self = rows.find(row => row.id === data?.self);
+    setHtml($("#cp-meta"), `${data ? `View from ${esc(self?.label || `replica ${data.self}`)} · updated ${esc(clock(data.observedAt))}` : "Loading replica health…"}${error ? `<div class="errbox">${esc(error)}${data ? " Showing the last received view." : ""}</div>` : ""}`);
+    if (!data) return;
+    const tile = (label, value, sub) => `<div class="tile"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="subv">${esc(sub)}</div></div>`;
+    setHtml($("#cp-summary"), tile("Primary", error ? "Unknown" : primary ? `Replica ${primary.id}` : "Waiting", error ? "Refresh unavailable" : primary?.label || "No primary is ready") +
+      tile("Reachable voters", error ? "Unknown" : `${rows.filter(voting).length} / ${data.count}`, `${data.quorum} required for quorum`) +
+      tile("Election term", data.term ?? "–", error ? "Last received term" : "As seen by this replica") +
+      tile("Viewing replica", data.self, self?.label || "This replica"));
+    setHtml($("#cp-replicas"), table(["Replica", "Health", "Role", "Primary it sees", "Runtime tail", "Memory"], rows.map(row => {
+      const v = row.view, raft = v?.raft, current = fresh(row);
+      const health = !current ? pill(error ? "gone" : "failed", error ? "Unknown" : "Unavailable")
+        : v?.error ? pill("deploying", "Needs attention") : !raft?.identityValid ? pill("deploying", "Warming up") : pill("healthy", "Healthy");
+      const role = v?.primary ? "Primary" : v?.recovering ? "Recovering" : raft?.role === "StateFollower" ? "Standby"
+        : raft?.role === "StateLeader" ? "Preparing primary" : raft?.role?.includes("Candidate") ? "Electing" : "Starting";
+      return { cells: [
+        `<a href="${esc(row.url)}/#/fleet" target="_blank" rel="noopener">${esc(row.label || `Replica ${row.id}`)}</a><div class="s">Replica ${esc(row.id)}${row.id === data.self ? " · this view" : ""}</div>`,
+        `${health}<div class="s">${row.lastSeen ? `Seen ${esc(ago(now - row.lastSeen))} ago` : "Not seen yet"}</div>${v?.error ? `<div class="s">${esc(v.error)}</div>` : ""}`,
+        `${current ? (v?.primary && raft?.identityValid ? pill("healthy", role) : esc(role)) : v ? `<span class="meta">Last seen: ${esc(role.toLowerCase())}</span>` : "–"}`,
+        raft?.leader ? `Replica ${esc(raft.leader)}<div class="s">Term ${esc(raft.term)}${current ? "" : " · last received"}</div>` : "–",
+        v?.rlog ? `${esc(compact(v.rlog.entries))} entries<div class="s">${esc(bytes(v.rlog.bytes))}</div>` : "–",
+        esc(bytes(v?.memoryBytes)),
+      ] };
+    }), { label: "Control-plane replicas" }));
+    setHtml($("#cp-transitions"), table(["When", "Primary elected", "Term"], (data.transitions || []).map(event => ({ cells: [
+      `<time datetime="${esc(new Date(event.at).toISOString())}">${esc(new Date(event.at).toLocaleString())}</time>`,
+      `${esc(rows.find(row => row.id === event.leader)?.label || `Replica ${event.leader}`)}<div class="s">Replica ${esc(event.leader)}</div>`,
+      esc(event.term),
+    ] })), { empty: "No primary transition observed yet", label: "Primary transitions" }));
+  }
+  async function refresh() {
+    if (disposed || request) return;
+    if (S.status?.controlPlane && !S.status.controlPlane.replicas && !data) return render();
+    const controller = new AbortController(); request = controller;
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetch("/api/cluster", { cache: "no-store", signal: controller.signal });
+      if (!response.ok) throw new Error("Replica health is unavailable. Try refreshing.");
+      const received = await response.json();
+      if (disposed) return;
+      data = received; error = null;
+    } catch (e) {
+      if (disposed) return;
+      error = e.name === "AbortError" ? "Replica health took too long to respond." : "Replica health is unavailable. Try refreshing.";
+    } finally {
+      clearTimeout(timeout); request = null;
+    }
+    render();
+  }
+  return { html, status: render, refresh,
+    mount() { refresh(); timer = setInterval(() => { if (!document.hidden) refresh(); }, 5000); },
+    unmount() { disposed = true; clearInterval(timer); request?.abort(); },
+  };
+}
+
 function vFleet() {
+  const controlPlane = controlPlanePanel();
   return {
     title: "Fleet",
-    html: `<h1>Fleet</h1><div class="sub">Servers join as they become available. Group tags describe their origin; there are no server targets.</div>
+    html: `<h1>Fleet</h1><div class="sub">Control-plane health, server groups, and fleet settings.</div>
+      ${controlPlane.html}
       <h2>Server groups</h2><div id="fl-groups"></div>
       <h2>Rebalancing</h2><div id="fl-rebalance"></div>
       <h2>Restart</h2><div class="card"><div class="row"><span class="grow meta" id="fl-roll-text"></span><button type="button" data-act="rollall" id="fl-roll"></button></div></div>
       <h2>Add a server</h2><div id="fl-join"></div>`,
     status() {
       const st = S.status;
+      controlPlane.status();
       setHtml($("#fl-groups"), table(["Tag", "Connected servers"], (st.groups ?? []).map((g) => ({ cells: [esc(g.tag), esc(g.online)] })), { empty: "No servers connected yet" }));
       setHtml($("#fl-rebalance"), `<div class="card"><div class="row"><span class="grow"><b>Automatic rebalancing</b></span>
         <button type="button" class="switch" role="switch" data-act="rebalance" aria-checked="${st.rebalance.on}" aria-pressed="${st.rebalance.on}" aria-label="Automatic rebalancing">${st.rebalance.on ? "✓ On" : "○ Off"}</button></div>${rebalanceLog(10)}</div>`);
@@ -2390,10 +2475,13 @@ function vFleet() {
       const b = e.target.closest("[data-act]");
       if (!b) return;
       const act = b.dataset.act;
+      if (act === "cp-refresh") controlPlane.refresh();
       if (act === "rebalance") setRebalance(b.getAttribute("aria-pressed") !== "true");
       if (act === "rollall") restartAll();
       if (act === "rollstop") stopRoll();
     },
+    mount() { controlPlane.mount(); },
+    unmount() { controlPlane.unmount(); },
   };
 }
 
@@ -2554,9 +2642,7 @@ function renderChrome() {
   const n = items.filter((x) => x.kind === "failed" || x.kind === "gone").length;
   const pending = items.filter((x) => x.kind === "deploying").length;
   const cp = S.status.controlPlane;
-  const clusterLink = $("#cp-cluster-link");
-  if (clusterLink) clusterLink.hidden = !cp?.replicas;
-  const controller = cp ? `<span class="long" title="The active fleet controller">${cp.replicas ? `Replica ${cp.replica} primary (${cp.replicas} voters)` : cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? `Mac controller${cp.runtime === "docker" ? " (Docker)" : ""}` : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
+  const controller = cp ? `<span class="long"><a href="#/fleet" title="Control-plane health and primary transitions">${cp.replicas ? `Replica ${cp.replica} primary (${cp.replicas} voters)` : cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? `Mac controller${cp.runtime === "docker" ? " (Docker)" : ""}` : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"}</a> · </span>` : "";
   setHtml($("#summary"), `${controller}${pill(n ? "failed" : pending ? "deploying" : "healthy", `${upCount()} up${n ? ` · ${plural(n, "problem")}` : pending ? ` · ${pending} pending` : ""}`)}`);
 }
 

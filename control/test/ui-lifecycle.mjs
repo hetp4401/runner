@@ -30,7 +30,7 @@ function harness(status = structuredClone(base)) {
     '#ad-versions','#ad-logs','#ad-spec','#ad-code','#ad-version','#ed-form','#ed-up','#ed-updir',
     '#ed-compose','#ed-dockerfile','#ed-files','#ed-port','#ed-replicas','#ed-name','#ed-name-hint']) node(id);
   const context = vm.createContext({ console,URLSearchParams,Request,Response,AbortController,
-    setTimeout,clearTimeout,queueMicrotask,innerWidth:1365,addEventListener(){},
+    setTimeout,clearTimeout,setInterval,clearInterval,queueMicrotask,innerWidth:1365,addEventListener(){},
     localStorage:{getItem:()=>null,setItem(){}},location:{hash:'#/',search:''},
     getSelection:()=>null,document:{querySelector:q=>nodes.get(q)??null,querySelectorAll:()=>[],addEventListener(){},activeElement:null},
     hooks:{}, fixture:status });
@@ -143,5 +143,52 @@ await check('closing logs cancels an in-flight resume instead of reopening the s
   const resuming=h.click('logs-pause');await h.click('logs-close');
   d.resolve({session:'cancelled-resume'});await resuming;await tick();
   assert.equal(h.sockets.length,1);
+});
+function clusterHarness() {
+  const h=harness();
+  for(const id of ['#cp-history','#cp-refresh','#cp-meta','#cp-summary','#cp-replicas','#cp-transitions']) h.node(id);
+  const at=Date.now();
+  h.cluster={self:2,count:3,quorum:2,term:4,observedAt:at,replicas:[1,2,3].map(id=>({
+    id,url:`https://cp-${id}.example.test`,label:`Host ${id}`,reachable:true,lastSeen:at,
+    view:{primary:id===1,raft:{identityValid:true,role:id===1?'StateLeader':'StateFollower',leader:1,term:4},rlog:{entries:5,bytes:100},memoryBytes:1000}
+  })),transitions:[{at,term:4,leader:1}]};
+  h.context.fetch=async path=>{assert.equal(path,'/api/cluster');return Response.json(h.cluster);};
+  h.panel=h.run('controlPlanePanel()');return h;
+}
+await check('Fleet shows local replica health and transitions when the primary status is unavailable',async()=>{
+  const h=clusterHarness();h.run('S.status=null');await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/3 \/ 3/);
+  assert.match(h.nodes.get('#cp-meta').innerHTML,/View from Host 2/);
+  assert.match(h.nodes.get('#cp-replicas').innerHTML,/https:\/\/cp-3.example.test\/#\/fleet/);
+  assert.match(h.nodes.get('#cp-transitions').innerHTML,/Host 1/);
+});
+await check('an unreachable former primary is not displayed as the current primary',async()=>{
+  const h=clusterHarness();h.cluster.replicas[0].reachable=false;await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/No primary is ready/);
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/2 \/ 3/);
+  assert.match(h.nodes.get('#cp-replicas').innerHTML,/Last seen: primary/);
+});
+await check('a failed replica refresh retains history but marks current health unknown',async()=>{
+  const h=clusterHarness();await h.panel.refresh();
+  h.context.fetch=async()=>{throw Error('offline');};await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-meta').innerHTML,/Showing the last received view/);
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/Unknown/);
+  assert.doesNotMatch(h.nodes.get('#cp-replicas').innerHTML,/>Healthy</);
+  assert.match(h.nodes.get('#cp-transitions').innerHTML,/Host 1/);
+});
+await check('leaving Fleet aborts a pending replica request and prevents late rendering',async()=>{
+  const h=clusterHarness(),d=deferred();let signal;
+  h.context.fetch=async(_path,options)=>{signal=options.signal;return d.promise;};
+  const loading=h.panel.refresh();h.panel.unmount();
+  assert.equal(signal.aborted,true);h.nodes.get('#cp-summary').innerHTML='next page';
+  d.resolve(Response.json(h.cluster));await loading;
+  assert.equal(h.nodes.get('#cp-summary').innerHTML,'next page');
+});
+await check('a standalone controller displays without requesting Raft diagnostics',async()=>{
+  const h=clusterHarness();h.run('S.status.controlPlane={name:"Local controller",runtime:"docker"}');
+  h.context.fetch=async()=>{throw Error('must not request a cluster');};await h.panel.refresh();
+  assert.match(h.nodes.get('#cp-summary').innerHTML,/Local controller/);
+  assert.equal(h.nodes.get('#cp-history').hidden,true);
+  assert.doesNotMatch(h.nodes.get('#cp-meta').innerHTML,/unavailable/);
 });
 console.log(`${passed} UI lifecycle and current-health regressions passed.`);

@@ -140,9 +140,13 @@ eventually stops authority rather than permitting concurrent schedulers.
 
 ## Inspection and verification
 
-Every replica serves `/cluster` and `/api/cluster` independently of the primary:
-its view of each peer, reachability, leader, term, runtime-tail size and recent
-primary transitions. Each peer link opens that peer's own perspective.
+The main Runners **Fleet** tab (`/#/fleet`) includes control-plane replica health
+and recent primary transitions, using the same tables, navigation and light/dark
+theme as the rest of the panel. Every replica serves the application shell and
+its `/api/cluster` independently of the primary, so this section remains available
+during elections or quorum loss. It shows that replica's view of each peer,
+reachability, leader, term and runtime-tail size. Each peer link opens the same
+Fleet view from that peer's perspective. Old `/cluster` links redirect to Fleet.
 `/_cp/*` requires the cluster secret; raw runtime reports are not public.
 
 Build the Go test binary with `go -C control/raft build -o /tmp/runners-raft-test .`,

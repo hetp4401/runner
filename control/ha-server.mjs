@@ -19,7 +19,7 @@ const childPort = Number(env.CP_CHILD_PORT || 8930), port = Number(env.PORT || 8
 const childOrigin = 'http://127.0.0.1:' + childPort;
 const overrides = JSON.parse(env.CP_PEER_OVERRIDES || '{}');
 const peers = new Map(), cursors = new Map(), sockets = new Set();
-const children = new Set(), page = readFileSync(new URL('./src/ha/cluster.html', import.meta.url), 'utf8');
+const children = new Set(), page = readFileSync(new URL('./src/app.html', import.meta.url), 'utf8');
 let raft = null, core = null, application = null, tunnel = null, connector = null;
 let stopping = false, busy = false, peersBusy = false, nextRenew = 0, nextRoute = 0;
 let appReady = false, lastError = null, lastTransition = null, coreRetry = 0, startBusy = false;
@@ -143,6 +143,11 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 503, { error: 'primary unavailable' });
     }
     if (url.pathname === '/cluster' || url.pathname === '/cluster/') {
+      res.writeHead(302, { location: '/#/fleet', 'cache-control': 'no-store' }); return res.end();
+    }
+    // Every replica serves the same application shell. Its Fleet section can
+    // inspect the local cluster view even when no primary can serve fleet APIs.
+    if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); return res.end(page);
     }
     if (url.pathname === '/readyz') {
@@ -155,8 +160,7 @@ const server = http.createServer(async (req, res) => {
         mode: 'raft', replica: config.id, primary: Boolean(appReady && authority.live()), quorum: config.quorum });
     const target = destination(req);
     if (!target) {
-      if (url.pathname === '/') { res.writeHead(302, { location: '/cluster' }); return res.end(); }
-      return reply(res, 503, { error: 'no primary is ready; existing workloads keep running', cluster: '/cluster' });
+      return reply(res, 503, { error: 'no primary is ready; existing workloads keep running', cluster: '/#/fleet' });
     }
     proxy(req, res, target);
   } catch { reply(res, 503, { error: 'current leader authority unavailable; retry shortly' }); }
