@@ -1,4 +1,4 @@
-// The control plane as one process: configuration in SQLite, runtime tables in memory, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
+// The control plane as one process: configuration in D1 or SQLite, runtime tables in memory, HTTP on 127.0.0.1:PORT (a Cloudflare tunnel in front gives it
 // runners.<domain>). Settings and secrets come from the environment (see the README).
 //   PORT (8920), DATA_DIR (.), DOMAIN, CONTROL_HOST, ZONE, ACCOUNT_ID, MAX_SLOTS (optional cap on slots), FLEET_PASSWORD, JOIN_TOKEN,
 //   CF_API_TOKEN (or CF_API_KEY + CF_API_EMAIL), CF_API_BASE (tests), POLL_S, DNS=off (no DNS changes), ALERT_WEBHOOK,
@@ -10,6 +10,7 @@ import { WebSocketServer } from "ws";
 import { fileURLToPath } from "node:url";
 import { Control } from "./src/index.js";
 import { LocalStore } from "./src/local-store.mjs";
+import { D1Store } from "./src/d1-store.mjs";
 import { loadAgentBundle } from "./src/agent-bundle.mjs";
 import { clientAddress, validateProxyConfig } from "./src/client-ip.mjs";
 
@@ -43,10 +44,12 @@ validateProxyConfig(env);
 if (!env.STATE_SIGNING_KEY || !env.JOIN_TOKEN) throw new Error("STATE_SIGNING_KEY and JOIN_TOKEN are required for agent recovery");
 process.umask(0o077);
 mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-const sql = new LocalStore(`${dataDir}/control.db`, { initialize: env.INIT_CONTROL_DB === "1", onFailure() {
+const storeOptions = { initialize: env.INIT_CONTROL_DB === "1", onFailure() {
   log("configuration storage failed; restarting before issuing more plans");
   setImmediate(() => shutdown(1));
-} });
+} };
+if (env.CONFIG_STORAGE && !["d1", "sqlite"].includes(env.CONFIG_STORAGE)) throw new Error("CONFIG_STORAGE must be d1 or sqlite");
+const sql = env.CONFIG_STORAGE === "d1" ? new D1Store(env, storeOptions) : new LocalStore(`${dataDir}/control.db`, storeOptions);
 
 let timer = null;
 const bundle = loadAgentBundle(fileURLToPath(new URL("..", import.meta.url)));
@@ -67,6 +70,7 @@ const control = new Control({
 });
 sql.protect(control);
 control.usage = () => ({ enabled: true, startedAt: usage.startedAt,
+  configuration: sql.diagnostics?.() || { backend: "sqlite" },
   http: { ...usage.http }, externalHttp: { ...usage.externalHttp }, agent: { ...usage.agent }, logs: { ...usage.logs } });
 
 const server = http.createServer(async (req, res) => {
@@ -126,7 +130,7 @@ control.status = () => ({ ...status(), controlPlane: {
   mode: env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
   runtime: env.CONTROLLER_RUNTIME || "native",
   owner: env.CONTROLLER_KIND || "vps", name: env.CONTROLLER_NAME || "VPS",
-  configStorage: "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
+  configStorage: env.CONFIG_STORAGE === "d1" ? "cloudflare-d1" : "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
   runtimeStorage: "memory", metricsHistoryMinutes: Number(env.MEMORY_HISTORY_MIN),
   tunnelStorage: "memory", tunnelsReady: control.tunnelsReady, tunnelsDiscovered: control.slots.size,
   tunnelRecoveryError: control.tunnelRecoveryError,

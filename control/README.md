@@ -51,12 +51,17 @@ Initialization creates `control.db` and private fleet identity in the `control-d
 
 Open `https://runners.example.com`, replacing the domain. The bundled connector exposes the controller and its WebSocket API. The full sequence, including a first app deployment, is in [self-hosting](../docs/self-hosting.md).
 
+The current Mac deployment uses [Cloudflare D1 configuration storage](../docs/d1-storage.md).
+Initialize new fleets locally first, then migrate before selecting D1.
+
 ## Configuration
 
 The Docker package reads `.env` through the root [Compose file](../compose.yaml). An environment variable does not automatically create a corresponding process outside the package.
 
 | Setting | Purpose and default |
 | --- | --- |
+| `CONFIG_STORAGE` | `d1` for Cloudflare D1; unset or `sqlite` for local SQLite. |
+| `D1_DATABASE_ID`, `D1_API_KEY`, `D1_API_EMAIL` | D1 database and Global API Key authentication. Requires `ACCOUNT_ID` or `D1_ACCOUNT_ID`. |
 | `DOMAIN` | Required DNS zone apex, without a scheme or path. |
 | `CF_API_TOKEN` | Scoped management token. Alternatively use both `CF_API_EMAIL` and `CF_API_KEY`. |
 | `CONTROL_HOST` | Public controller hostname; defaults to `runners.<DOMAIN>`. |
@@ -96,7 +101,7 @@ docker compose up -d
 
 Adjust the local URL if you changed `CONTROL_PORT`. `/healthz` confirms HTTP liveness and reports `tunnelsReady`; Docker's health check also requires tunnel discovery and, with the bundled connector, a ready connection. Scheduling waits for recovery before placing workloads.
 
-Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to SQLite. Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
+Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to the selected store (D1 on the Mac deployment). Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
 
 ## Source and development
 
@@ -104,6 +109,9 @@ Keep the data volume and private `.env` across upgrades. Configuration changes c
 | --- | --- |
 | [`server.mjs`](server.mjs) | HTTP server, agent WebSockets, live log connections and shutdown. |
 | [`src/index.js`](src/index.js) | App validation, authentication, placement, reconciliation and plans. |
+| [`src/d1-store.mjs`](src/d1-store.mjs) | D1 loading, atomic configuration commits, revision guards and RAM working database. |
+| [`src/d1-client.mjs`](src/d1-client.mjs), [`src/d1-worker.mjs`](src/d1-worker.mjs) | Global API Key authentication and bounded synchronous configuration I/O. |
+| [`d1-migrate.mjs`](d1-migrate.mjs) | Offline SQLite-to-D1 migration and full content verification. |
 | [`src/local-store.mjs`](src/local-store.mjs) | Durable SQLite configuration and in-memory runtime tables. |
 | [`src/state-policy.js`](src/state-policy.js) | Boundary between authoritative configuration and recoverable observations. |
 | [`src/bootstrap.mjs`](src/bootstrap.mjs) | Initialization, identity and Cloudflare discovery. |

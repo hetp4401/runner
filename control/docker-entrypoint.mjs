@@ -35,7 +35,7 @@ try {
     env = identity(env);
     console.log(JSON.stringify({ ADMIN_PASSWORD: env.ADMIN_PASSWORD, JOIN_TOKEN: env.JOIN_TOKEN }, null, 2));
   } else if (command === "start") {
-    if (!existsSync(join(env.DATA_DIR, "control.db"))) throw new Error("control.db is missing; restore the fleet or run init for a new fleet");
+    if (env.CONFIG_STORAGE !== "d1" && !existsSync(join(env.DATA_DIR, "control.db"))) throw new Error("control.db is missing; restore the fleet or run init for a new fleet");
     env = identity(env, { persistNamespace: true });
     if (!env.CF_API_TOKEN && !(env.CF_API_KEY && env.CF_API_EMAIL)) throw new Error("set CF_API_TOKEN, or both CF_API_KEY and CF_API_EMAIL");
     env = await resolveCloudflare(env);

@@ -36,6 +36,7 @@ node control/test/sim/phase5.test.mjs   # dark and lit replicas, cold departures
 node control/test/sim/regions.test.mjs  # regional placement, shortages, moves, eviction, deadlines, cross-region handovers
 node control/test/sim/hybrid.test.mjs   # D1 encryption/write suppression, receipts, witnesses and cold recovery
 node control/test/agent-link.mjs        # large reports, fragmented WebSocket replies, ping and wake
+node control/test/d1-store.mjs          # atomic D1 commits, lost responses, revision conflicts, zero runtime I/O
 node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero runtime writes, migration and cold recovery
 node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure holds, DNS, lazy tokens and zero durable writes
 node control/test/local-server.mjs      # real VPS HTTP/WebSocket process, SIGKILL and agent recovery
@@ -73,7 +74,7 @@ Run `python3 control/test/agent-docker.py runner-agent:local` on a Linux Docker 
 
 ## Archived hybrid integration
 
-These tests cover the inactive Mac/Cloudflare implementation kept for reference. The current Docker control plane uses `server.mjs` and `local-store.mjs`; it needs none of the services below.
+These tests cover the inactive Mac/Cloudflare implementation kept for reference. The current Docker control plane uses `server.mjs` with `d1-store.mjs` or `local-store.mjs`; it needs none of the services below.
 
 Use Node 24. From `control/`, initialize a disposable local D1 database:
 

@@ -100,6 +100,7 @@ export function identity(env, { required = true, persistNamespace = false } = {}
 }
 
 export function initialize(env) {
+  if (env.CONFIG_STORAGE === "d1") throw new Error("D1 initialization is explicit: migrate an initialized local fleet with d1-migrate.mjs before starting");
   const database = join(env.DATA_DIR, "control.db");
   const file = join(env.DATA_DIR, "identity.json");
   if (existsSync(database) || existsSync(file)) throw new Error("fleet data already exists; init will not overwrite it");

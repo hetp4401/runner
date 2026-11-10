@@ -10,8 +10,9 @@ flowchart LR
   CF --> Tunnel[Controller cloudflared]
   subgraph Controller container
     Tunnel --> CP[Node HTTP API and scheduler]
-    CP --> DB[(SQLite /data)]
+    CP --> RAM[(SQLite in RAM)]
   end
+  CP -->|configuration commits| D1[(Cloudflare D1)]
   Providers[Provider adapters / GitHub workflows] --> Hosts[Linux agent hosts]
   Hosts <-->|outgoing authenticated WebSocket| CF
   Hosts --> Apps[Docker Compose apps]
@@ -40,11 +41,17 @@ The [Mac runbook](mac-control.md) covers service operation and availability.
 
 ## State and recovery
 
-`control/src/local-store.mjs` persists five configuration tables in SQLite:
+`control/src/d1-store.mjs` persists five configuration tables in Cloudflare D1 when
+`CONFIG_STORAGE=d1` (the active Mac deployment). `local-store.mjs` also supports
+local SQLite for standalone installations. The tables are:
 `projects`, `versions`, `settings`, `app_passwords` and `app_env`. They contain the
 authoritative app definitions, source history, operator settings and secrets.
 `identity.json` and the private controller environment preserve fleet identity
 and Cloudflare access. Preserve these files together when moving the controller.
+D1 mode loads a private in-memory working database at startup and commits changed
+configuration rows atomically before acknowledging edits. No local `control.db`
+is used. A stale revision or unconfirmed write stops new plans and restarts the
+process; existing agents keep their approved workloads. See [D1 storage](d1-storage.md).
 
 Machine reports, scheduling observations, metrics and tunnel credentials remain
 in controller memory. Agents retain their approved plans, inventory and signed
@@ -56,7 +63,7 @@ The default recovery hold is three minutes.
 Run exactly one controller for a fleet. A local volume lock cannot fence another
 computer or another volume. Before migration, disable the old scheduler and its
 automatic startup, preserve the public origin, join token, signing key and tunnel
-namespace, and transfer the current SQLite files after stopping the old controller. Never initialize a new empty
+namespace, and use the same D1 database (or transfer the stopped SQLite files for local storage). Never initialize a new empty
 fleet as an outage-recovery shortcut.
 
 ## Agents and providers

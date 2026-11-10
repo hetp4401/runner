@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends util-linux && r
 COPY --from=tunnel /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY --from=tunnel /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY control/src ./src
-COPY control/server.mjs control/docker-entrypoint.mjs control/healthcheck.mjs control/agent.Dockerfile control/agent-launcher.mjs ./
+COPY control/server.mjs control/d1-migrate.mjs control/docker-entrypoint.mjs control/healthcheck.mjs control/agent.Dockerfile control/agent-launcher.mjs ./
 COPY --chmod=755 control/docker-entrypoint.sh ./
 COPY agent /app/agent
 RUN mkdir -p /data /run/runner && chown node:node /data /run/runner

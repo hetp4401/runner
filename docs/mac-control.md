@@ -5,6 +5,10 @@ Docker image. Colima supplies Docker Engine on macOS. The fleet's applications
 and agents continue running on their Linux hosts. No Docker socket is mounted in
 the controller container.
 
+The active Mac fleet stores durable configuration in [Cloudflare D1](d1-storage.md).
+Its Docker volume holds fleet identity and the process lock, with no local database.
+The SQLite transfer instructions below apply to older/local-storage installations.
+
 ## Install the engine and stage source
 
 On Apple Silicon with Homebrew and Python 3:
@@ -111,7 +115,7 @@ The service starts Colima when necessary and ensures the existing Compose
 service is up. It never initializes a fleet, builds an image or deletes a volume.
 Docker restarts the controller on process failure; launchd restarts the Mac
 supervisor. A graceful supervisor stop also stops the controller. Configuration
-changes commit immediately to SQLite on the persistent Docker volume.
+changes commit immediately to D1 when `CONFIG_STORAGE=d1`; local SQLite remains an optional backend.
 
 ## Checks and upgrades
 
@@ -132,8 +136,9 @@ profile, project and volume. Never use `docker compose down -v` or delete Colima
 data disk while retaining the fleet.
 
 When moving back to a native or VPS controller, stop and disable the Docker
-LaunchAgent first, then transfer the current stopped database and private
-configuration using the migration procedure above. Preserve credentials and
+LaunchAgent first, then preserve its private configuration and identity. For D1,
+point the replacement at the same database; for local SQLite, transfer the stopped
+database using the migration procedure above. Preserve credentials and
 namespaces, verify data, and enable exactly one scheduler.
 
 The Mac must stay logged in, awake and connected. The supervisor prevents idle

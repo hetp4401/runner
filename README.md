@@ -1,6 +1,6 @@
 # Runner: control plane and agent
 
-A self-hosted control plane schedules Docker apps across Linux machines. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; SQLite stores app specs, source versions, secrets and operator settings. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
+A self-hosted control plane schedules Docker apps across Linux machines. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker; Cloudflare D1 stores app specs, source versions, secrets and operator settings on the Mac deployment; standalone installs can also use local SQLite. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
 Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Every agent has a required `SERVER_TAG` naming its origin group, or `standalone`. Tags are metadata: the CP accepts supplied servers and has no desired server counts. An explicit `START_CMD` can start that agent's own replacement during a requested handover. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. See [How it works](#how-it-works) for the entities and their responsibilities.
 
@@ -210,16 +210,16 @@ On a CP restart, agents keep serving while it loads desired configuration, redis
 
 | Location | State |
 | --- | --- |
-| CP SQLite on disk | App specs/source versions, app secrets/password hashes, desired fleet settings and app rollout decisions. |
+| CP configuration store (D1, or optional local SQLite) | App specs/source versions, app secrets/password hashes, desired fleet settings and app rollout decisions. |
 | CP private configuration | Management credentials, join token, signing key and stable fleet namespace. |
 | CP RAM, including SQLite TEMP tables | Health, placements, runs, metrics, events, diagnostics and discovered tunnel IDs/tokens. |
 | Agent's disk | Identity, approved plan, receipt, local connector token, recent metrics, verified agent code and app data. App data is not replicated between hosts. |
 
-Normal reports, health checks and placements make **no persistent CP writes**. Configuration changes and committed app rollout decisions can write SQLite. [`state-policy.js`](control/src/state-policy.js) defines the durable tables/settings and is shared by storage and receipt recovery; a receipt cannot replace those authoritative settings.
+Normal reports, health checks and placements make **no persistent CP writes**. Configuration changes and committed app rollout decisions commit to the selected configuration store before acknowledgment. D1 mode uses SQLite only in RAM; it creates no local database file. See [D1 storage](docs/d1-storage.md). [`state-policy.js`](control/src/state-policy.js) defines the durable tables/settings and is shared by storage and receipt recovery; a receipt cannot replace those authoritative settings.
 
 ### Reading the code
 
-Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then [`Control.sync()` in index.js](control/src/index.js) for report → reconcile → plan. [`local-store.mjs`](control/src/local-store.mjs) enforces the persistence boundary. On the host, [`agent.mjs`](agent/agent.mjs) contains `main()` and `reconcile()`; [`runtime.mjs`](agent/runtime.mjs) handles ownership, safe files and recovery helpers. [`control-link.mjs`](agent/control-link.mjs) carries reports and plans. The archived Mac/Worker implementations are outside this path.
+Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then [`Control.sync()` in index.js](control/src/index.js) for report → reconcile → plan. [`d1-store.mjs`](control/src/d1-store.mjs) and [`local-store.mjs`](control/src/local-store.mjs) enforce the persistence boundary. On the host, [`agent.mjs`](agent/agent.mjs) contains `main()` and `reconcile()`; [`runtime.mjs`](agent/runtime.mjs) handles ownership, safe files and recovery helpers. [`control-link.mjs`](agent/control-link.mjs) carries reports and plans. The archived Mac/Worker implementations are outside this path.
 
 ### Self-healing
 
@@ -230,7 +230,7 @@ Start with [`control/server.mjs`](control/server.mjs) for HTTP/WebSockets, then 
 
 ## Running the control plane
 
-Use the [control plane module guide](control/README.md) for configuration and source entrypoints, the [self-hosting guide](docs/self-hosting.md) for Docker setup, and [VPS operations](docs/vps-control.md) for service operation and migration. Scheduling runs in the controller process with SQLite.
+Use the [control plane module guide](control/README.md) for configuration and source entrypoints, the [self-hosting guide](docs/self-hosting.md) for Docker setup, and [VPS operations](docs/vps-control.md) for service operation and migration. Scheduling runs in the controller process with an in-memory working database; durable storage is selected with `CONFIG_STORAGE`.
 
 The production server also runs locally for development:
 

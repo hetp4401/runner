@@ -16,12 +16,14 @@ export class LocalStore {
     this.persistedSettings = new Map();
     this.sequence = 0;
     this.mutationDepth = 0;
-    if (!existsSync(filename) && !initialize) {
+    this.transactionDepth = 0;
+    const memory = filename === ":memory:";
+    if (!memory && !existsSync(filename) && !initialize) {
       throw new Error("control.db is missing; mount the existing configuration database (INIT_CONTROL_DB=1 is only for a new fleet)");
     }
-    mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
+    if (!memory) mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(filename);
-    chmodSync(filename, 0o600);
+    if (!memory) chmodSync(filename, 0o600);
     try {
       const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map((r) => r.name);
       if (tables.length || !initialize) {
@@ -58,15 +60,19 @@ export class LocalStore {
     const point = `config_${++this.sequence}`;
     const settings = new Map(this.persistedSettings);
     this.db.exec(`SAVEPOINT ${point}`);
+    this.transactionDepth++;
     try {
       const result = fn();
       if (result && typeof result.then === "function") throw new Error("configuration transactions must be synchronous");
+      if (this.transactionDepth === 1) this.beforeCommit?.();
       this.db.exec(`RELEASE ${point}`);
       return result;
     } catch (error) {
       this.db.exec(`ROLLBACK TO ${point}; RELEASE ${point}`);
       this.persistedSettings = settings;
       throw error;
+    } finally {
+      this.transactionDepth--;
     }
   }
 
@@ -74,8 +80,12 @@ export class LocalStore {
     const after = new Map(this.db.prepare("SELECT key,value FROM temp.settings").all().filter((r) => durableSetting(r.key)).map((r) => [r.key, r.value]));
     for (const [key, value] of after) if (this.persistedSettings.get(key) !== value) {
       this.db.prepare("INSERT INTO main.settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, value);
+      this.onConfigChange?.("settings");
     }
-    for (const key of this.persistedSettings.keys()) if (!after.has(key)) this.db.prepare("DELETE FROM main.settings WHERE key=?").run(key);
+    for (const key of this.persistedSettings.keys()) if (!after.has(key)) {
+      this.db.prepare("DELETE FROM main.settings WHERE key=?").run(key);
+      this.onConfigChange?.("settings");
+    }
     this.persistedSettings = after;
   }
 
@@ -131,12 +141,15 @@ export class LocalStore {
         else if (!CONFIG_TABLES.includes(table)) throw new Error(`storage lifetime is not defined for ${table}`);
       }
       const changesSettings = /^\s*(?:INSERT(?: OR \w+)? INTO|UPDATE|DELETE FROM)\s+settings\b/i.test(query);
+      const changedTable = query.match(/^\s*(?:INSERT(?: OR \w+)? INTO|REPLACE INTO|UPDATE|DELETE FROM)\s+(?:main\.)?(\w+)/i)?.[1];
+      const changesConfig = changedTable !== "settings" && CONFIG_TABLES.includes(changedTable);
       const run = () => {
         const rows = this.db.prepare(query).all(...args);
         if (changesSettings) this.syncSettings();
+        if (changesConfig) this.onConfigChange?.(changedTable);
         return { toArray: () => rows };
       };
-      return changesSettings ? this.atomic(run) : run();
+      return changesSettings || (changesConfig && this.beforeCommit) ? this.atomic(run) : run();
     } catch (error) {
       // A bad read (for example, a fractional LIMIT) cannot leave desired state
       // ahead of disk. Fail only that request. Writes and configuration edits
