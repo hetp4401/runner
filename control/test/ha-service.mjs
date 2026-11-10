@@ -111,6 +111,9 @@ try {
   const agentAuthority = new PlanAuthority(members.find(m => m.id === first.id).url, env.JOIN_TOKEN);
   await agentAuthority.accept({ leadership: first.authority });
   isolated = new Set([first.id, ...members.filter(m => m.id !== first.id).slice(0, 2).map(m => m.id)]);
+  const strandedJoin = await request(first.id, '/_cp/join', { method: 'POST',
+    body: JSON.stringify({ id: first.id, node: 281474976700001, boot: 'isolated-join-test-incarnation' }) });
+  check('an isolated leader cannot admit a fresh process into an uncommitted generation', () => assert.notEqual(strandedJoin.status, 200));
   const second = await until(async () => { const all = await views(); return all.find(v => !isolated.has(v.id) && v.primary && v.authority?.term > first.authority.term); });
   const refused = await request(first.id, '/_cp/verify', { method: 'POST', body: JSON.stringify(first.authority) });
   check('an isolated old scheduler refuses authority after a new election', () => assert.notEqual(refused.status, 200));

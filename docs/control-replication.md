@@ -76,6 +76,8 @@ slot and stable hostname remain the same.
 A new process first joins as a non-voting learner. After it catches up, the
 leader replaces the previous physical identity through joint consensus. Both
 the old and new voting majorities must agree before the replacement is ready.
+A leader must confirm a live quorum before accepting a join request, including
+during the interval before an isolated leader notices it has lost authority.
 A removed incarnation stops acting and cannot rejoin in that process. Application
 commands are not replicated through this Raft group; its compacted protocol
 state and membership snapshots are held in RAM.

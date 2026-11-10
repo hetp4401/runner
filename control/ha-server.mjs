@@ -114,6 +114,10 @@ const server = http.createServer(async (req, res) => {
       const corePaths = { '/_cp/raft-status': '/status', '/_cp/join': '/join', '/_cp/pull': '/pull', '/_cp/bootstrap': '/bootstrap' };
       if (corePaths[url.pathname]) {
         if (!core) return reply(res, 503, { error: 'voter warming up' });
+        // A stale leader can still report StateLeader briefly after losing
+        // quorum. Do not strand a fresh process in that generation while the
+        // membership proposal cannot commit.
+        if (url.pathname === '/_cp/join' && req.method === 'POST') await jsonRequest(raftOrigin + '/verify');
         return proxy(req, res, raftOrigin, corePaths[url.pathname] + url.search);
       }
       if (url.pathname === '/_cp/raft') {
