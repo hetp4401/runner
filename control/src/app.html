@@ -2375,7 +2375,7 @@ function controlPlanePanel() {
     <div class="meta" id="cp-meta" role="status">Loading replica health…</div>
     <div class="tiles" id="cp-summary" style="margin:12px 0"></div><div id="cp-replicas"></div>
     <div id="cp-history"><h2>Recent primary transitions</h2><div id="cp-transitions"></div>
-      <p class="meta">Recent history is kept in memory and may reset after a full cluster restart.</p></div>
+      <p class="meta">The latest 30 primary transitions are kept in memory. Losing all cluster memory requires an explicit bootstrap.</p></div>
     </section>`;
   function render() {
     if (disposed) return;
@@ -2406,7 +2406,8 @@ function controlPlanePanel() {
       const v = row.view, raft = v?.raft, current = fresh(row);
       const health = !current ? pill(error ? "gone" : "failed", error ? "Unknown" : "Unavailable")
         : v?.error ? pill("deploying", "Needs attention") : !raft?.identityValid ? pill("deploying", "Warming up") : pill("healthy", "Healthy");
-      const role = v?.primary ? "Primary" : v?.recovering ? "Recovering" : raft?.role === "StateFollower" ? "Standby"
+      const role = raft?.phase === "retired" ? "Replaced" : raft?.phase === "uninitialized" ? "Awaiting bootstrap" : raft?.phase === "joining" ? "Joining"
+        : v?.primary ? "Primary" : v?.recovering ? "Recovering" : raft?.role === "StateFollower" ? "Standby"
         : raft?.role === "StateLeader" ? "Preparing primary" : raft?.role?.includes("Candidate") ? "Electing" : "Starting";
       return { cells: [
         `<a href="${esc(row.url)}/#/fleet" target="_blank" rel="noopener">${esc(row.label || `Replica ${row.id}`)}</a><div class="s">Replica ${esc(row.id)}${row.id === data.self ? " · this view" : ""}</div>`,

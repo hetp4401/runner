@@ -4,7 +4,8 @@ import { fork, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { ClusterDatabase } from '../src/ha/database.mjs';
+import { D1Client } from '../src/d1-client.mjs';
+import { bootstrapManifest } from '../cluster-init.mjs';
 import { D1Store } from '../src/d1-store.mjs';
 import { PlanAuthority } from '../../agent/runtime.mjs';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -36,13 +37,12 @@ const env = { ...process.env, CONFIG_STORAGE: 'd1', ACCOUNT_ID: 'test', D1_DATAB
   CONTROL_HOST: 'runners.test.example', DOMAIN: 'test.example', ZONE: 'test', CF_API_TOKEN: 'test-token',
   CF_API_BASE: 'http://127.0.0.1:' + cfPort, DNS: 'off', AUTO_TUNNEL: '0', BIND_HOST: '127.0.0.1',
   CP_REPLICAS: '7', CP_CLUSTER_ID: 'test-cluster-generation', CP_CLUSTER_TOKEN: 'test-cluster-token-at-least-32-characters',
-  CP_MEMBERS: JSON.stringify(members), CP_RAFT_BINARY: '/tmp/runners-raft-test',
+  CP_MEMBERS: JSON.stringify(members), CP_RAFT_BINARY: '/tmp/runners-raft-memory-test',
   CP_RAFT_TICK_MS: '100', CP_RAFT_ELECTION_TICKS: '12', CP_RAFT_HEARTBEAT_TICKS: '2',
   STATE_SIGNING_KEY: 'test-signing-key', JOIN_TOKEN: 'test-join-token', ADMIN_PASSWORD: 'test-admin',
-  RECOVERY_MS: '0', QUIET_MS: '0', CP_WARM_REPLACEMENT: '1' };
-const db = new ClusterDatabase(env);
-await db.query([{ sql: 'INSERT INTO cp_cluster VALUES(1,?,?,?,0)', params: [env.CP_CLUSTER_ID, 7, env.CP_MEMBERS] },
-  { sql: "INSERT INTO cp_authority VALUES(1,0,'',0,0,0,0)", params: [] }]);
+  RECOVERY_MS: '0', QUIET_MS: '0' };
+const client = new D1Client(env);
+const db = { query(sql) { return client.query(sql).flatMap(result => result.results); } };
 async function start(id, name = String(id)) {
   const port = await freePort(), raftPort = await freePort(), childPort = await freePort();
   const child = spawn(process.execPath, [new URL('../ha-server.mjs', import.meta.url).pathname], {
@@ -79,9 +79,9 @@ const primary = () => until(async () => { const leaders = (await views()).filter
 let staleStore;
 try {
   for (let id = 1; id <= 7; id++) await start(id);
-  await until(async () => (await views()).filter(v => v.raft?.leader).length === 7);
+  await until(async () => (await views()).filter(v => v.raft?.phase === 'uninitialized').length === 7);
   const staged = await views();
-  check('staged replicas elect but do not start a scheduler before activation', () => assert.equal(staged.some(v => v.primary || v.authority), false));
+  check('fresh replicas neither vote nor start a scheduler before explicit bootstrap', () => assert.equal(staged.some(v => v.primary || v.authority), false));
   const stagedShell = await fetch(members[0].url + '/');
   const stagedPage = await stagedShell.text();
   check('the shared Runners Fleet interface is available before a primary starts', () => {
@@ -92,9 +92,10 @@ try {
   check('old replica dashboard links redirect into the main Fleet tab', () => {
     assert.equal(legacy.status, 302); assert.equal(legacy.headers.get('location'), '/#/fleet');
   });
-  await db.query('UPDATE cp_cluster SET active=1 WHERE id=1');
+  const seed = bootstrapManifest({ members, quorum: 4 }, staged.map(view => view.raft));
+  for (const member of members) assert.equal((await request(member.id, '/_cp/bootstrap', { method: 'POST', body: JSON.stringify(seed) })).status, 200);
   const first = await primary();
-  check('activation starts exactly one primary scheduler', () => assert.ok(first.authority?.epoch >= 1));
+  check('a bootstrapped quorum starts exactly one primary scheduler', () => assert.ok(first.authority?.epoch >= seed.term));
   const follower = members.find(m => m.id !== first.id).id;
   const dashboard = await request(follower, '/api/status');
   check('a standby forwards the regular dashboard to the primary', () => assert.equal(dashboard.status, 200));
@@ -105,16 +106,21 @@ try {
   const created = await request(first.id, '/api/projects/example', { method: 'PUT',
     headers: { 'x-admin-password': env.ADMIN_PASSWORD }, body: JSON.stringify({ compose: 'services:\n  app:\n    image: nginx\n', replicas: 1 }) });
   check('the active primary can commit application configuration to D1', () => assert.equal(created.status, 200));
-  staleStore = new D1Store({ ...env, CP_HA_CHILD: '1', CP_HA_AUTHORITY: JSON.stringify(first.authority) });
+  staleStore = new D1Store({ ...env, CP_HA_CHILD: '1', CP_HA_MANAGER: 'http://127.0.0.1:' + processes.get(String(first.id)).port,
+    CP_HA_AUTHORITY: JSON.stringify(first.authority) });
   const agentAuthority = new PlanAuthority(members.find(m => m.id === first.id).url, env.JOIN_TOKEN);
   await agentAuthority.accept({ leadership: first.authority });
   isolated = new Set([first.id, ...members.filter(m => m.id !== first.id).slice(0, 2).map(m => m.id)]);
   const second = await until(async () => { const all = await views(); return all.find(v => !isolated.has(v.id) && v.primary && v.authority?.term > first.authority.term); });
   const refused = await request(first.id, '/_cp/verify', { method: 'POST', body: JSON.stringify(first.authority) });
   check('an isolated old scheduler refuses authority after a new election', () => assert.notEqual(refused.status, 200));
-  assert.throws(() => staleStore.mutate(() => staleStore.exec('INSERT INTO projects VALUES(?,?,?,?,?,?,?)', 'stale', 1, 1, 1, null, Date.now(), 1)));
-  const stale = await db.query("SELECT name FROM projects WHERE name='stale'");
-  check('D1 atomically rejects stale-leader writes even at the correct config revision', () => assert.equal(stale.length, 0));
+  assert.throws(() => staleStore.mutate(() => staleStore.exec('INSERT INTO projects VALUES(?,?,?,?,?,?,?)', 'stale', 1, 1, 1, null, Date.now(), 1)), /primary authority/);
+  check('a former primary cannot save configuration even before the new primary writes', () => {
+    assert.equal(db.query("SELECT name FROM projects WHERE name='stale'").length, 0);
+  });
+  const newer = await request(second.id, '/api/projects/newer', { method: 'PUT', headers: { 'x-admin-password': env.ADMIN_PASSWORD },
+    body: JSON.stringify({ compose: 'services:\n  app:\n    image: nginx\n', replicas: 1 }) });
+  assert.equal(newer.status, 200);
   agentAuthority.url = members.find(m => m.id === second.id).url;
   await assert.rejects(agentAuthority.accept({ leadership: first.authority }));
   await agentAuthority.accept({ leadership: second.authority });
@@ -125,10 +131,12 @@ try {
   await until(async () => (await views()).every(v => v.raft?.leader === second.id));
   const replace = second.id;
   const warm = await start(replace, 'replacement');
-  await until(async () => (await request(warm, '/readyz')).body?.replacementWaiting);
+  await until(async () => (await request(warm, '/readyz')).body?.voterReady, 45000);
   const warmView = await request(warm, '/_cp/status');
-  check('an ordinary app replacement becomes ready without duplicating its predecessor vote', () => {
-    assert.equal(warmView.body.raft, null); assert.equal(warmView.body.primary, false);
+  const previous = await request(replace, '/_cp/status');
+  check('an ordinary app replacement is admitted before retiring its predecessor', () => {
+    assert.equal(warmView.body.raft.identityValid, true); assert.equal(previous.body.raft.identityValid, false);
+    assert.equal(previous.body.primary, false);
   });
   await stop(replace); endpoints.set(replace, warm.port);
   const afterMove = await primary();
@@ -146,12 +154,17 @@ try {
     assert.equal(survivingShell.status, 200); assert.equal(survivingView.status, 200);
     assert.equal(survivingView.body.self, 1); assert.equal(survivingView.body.replicas.length, 7);
   });
+  check('D1 has no election, membership, ownership or authority tables', () => {
+    assert.deepEqual(db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'cp_%'"), []);
+    assert.equal(survivingView.body.persistence.electionMetadata, 'memory');
+  });
   console.log(checks + ' HA service checks passed');
 } catch (error) {
   for (const [name, log] of logs) console.error('replica ' + name + ': ' + log);
   throw error;
 } finally {
   staleStore?.close();
+  client.close();
   await Promise.all([...processes.keys()].map(stop));
   for (const server of [...proxies, cloudflare]) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
   fixture.kill('SIGTERM'); await rm(root, { recursive: true, force: true });

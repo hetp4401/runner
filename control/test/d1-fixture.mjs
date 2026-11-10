@@ -1,10 +1,8 @@
 import http from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import { SCHEMA, META_SCHEMA } from "../src/d1-store.mjs";
-import { CLUSTER_SCHEMA } from "../src/ha/database.mjs";
 const db = new DatabaseSync(":memory:");
 db.exec([...SCHEMA.map((s) => s.sql), META_SCHEMA, "INSERT INTO runner_meta VALUES(1,1,'runners.test.example',1,0,'initial')"].join(";"));
-db.exec(CLUSTER_SCHEMA.join(";"));
 let failAfterCommit = false;
 const server = http.createServer(async (req, res) => {
   if (req.url === "/lose-response") { failAfterCommit = true; res.end("ok"); return; }

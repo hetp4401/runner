@@ -10,20 +10,26 @@ export class D1Client {
     this.shared = new SharedArrayBuffer(32 * 1024 * 1024);
     this.state = new Int32Array(this.shared, 0, 2);
     this.bytes = new Uint8Array(this.shared, 8);
+    let leadership = null;
+    if (env.CP_HA_CHILD === "1") {
+      if (!env.CP_HA_MANAGER || !env.CP_CLUSTER_TOKEN || !env.CP_HA_AUTHORITY) throw new Error("replicated configuration writes require primary authority");
+      leadership = { url: env.CP_HA_MANAGER + "/_cp/verify", token: env.CP_CLUSTER_TOKEN, expected: JSON.parse(env.CP_HA_AUTHORITY) };
+    }
     this.worker = new Worker(new URL("./d1-worker.mjs", import.meta.url), { workerData: {
       url: `${env.D1_API_BASE || "https://api.cloudflare.com/client/v4"}/accounts/${encodeURIComponent(account)}/d1/database/${encodeURIComponent(database)}/query`, key, email,
+      leadership,
     } });
     this.worker.on("error", () => { this.broken = true; });
     this.worker.unref();
     this.stats = { requests: 0, rowsRead: 0, rowsWritten: 0 };
   }
-  query(statements) {
+  query(statements, { verifyLeadership = false } = {}) {
     if (this.broken) throw new Error("D1 connection is unavailable");
     const batch = typeof statements === "string" ? [{ sql: statements, params: [] }] : statements;
     Atomics.store(this.state, 0, 0);
-    this.worker.postMessage({ batch, shared: this.shared });
+    this.worker.postMessage({ batch, shared: this.shared, verifyLeadership });
     this.stats.requests++;
-    if (Atomics.wait(this.state, 0, 0, 35_000) === "timed-out") {
+    if (Atomics.wait(this.state, 0, 0, 40_000) === "timed-out") {
       this.broken = true;
       this.worker.terminate();
       throw new Error("D1 request timed out; configuration outcome must be checked on restart");

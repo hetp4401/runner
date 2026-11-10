@@ -4,9 +4,10 @@ const get = async (url) => {
   return response;
 };
 try {
-  if (Number(process.env.CP_REPLICAS || 1) > 1 && process.env.CP_WARM_REPLACEMENT === '1') {
-    // Healthy replacement, waiting for its predecessor to release the vote.
-    await get('http://127.0.0.1:' + (process.env.PORT || 8920) + '/readyz');
+  if (Number(process.env.CP_REPLICAS || 1) > 1) {
+    // Joining and bootstrapping are live states. App readiness separately
+    // waits for a committed voter replacement before retiring its predecessor.
+    await get('http://127.0.0.1:' + (process.env.PORT || 8920) + '/healthz');
   } else {
   const status = await (await get(`http://127.0.0.1:${process.env.PORT || 8920}/healthz`)).json();
   if (!status.tunnelsReady) throw new Error("tunnel inventory is not ready");

@@ -5,14 +5,13 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { clusterConfig, equalSecret } from './src/ha/config.mjs';
-import { ClusterDatabase } from './src/ha/database.mjs';
 import { Authority } from './src/ha/authority.mjs';
 import { RuntimeTail } from './src/ha/tail.mjs';
 import { replicaTunnel, route } from './src/ha/tunnel.mjs';
 
 const env = process.env, config = clusterConfig(env);
 if (!config.enabled) throw new Error('ha-server requires a replicated configuration');
-const database = new ClusterDatabase(env), tail = new RuntimeTail();
+const tail = new RuntimeTail();
 const started = Date.now(), incarnation = randomUUID();
 const raftOrigin = 'http://127.0.0.1:' + (env.CP_RAFT_PORT || 8931);
 const childPort = Number(env.CP_CHILD_PORT || 8930), port = Number(env.PORT || 8920);
@@ -23,7 +22,6 @@ const children = new Set(), page = readFileSync(new URL('./src/app.html', import
 let raft = null, core = null, application = null, tunnel = null, connector = null;
 let stopping = false, busy = false, peersBusy = false, nextRenew = 0, nextRoute = 0;
 let appReady = false, lastError = null, lastTransition = null, coreRetry = 0, startBusy = false;
-let identityWaitingUntil = 0;
 let routing = false;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = text => console.log(new Date().toISOString() + ' replica ' + config.id + ' ' + text);
@@ -34,7 +32,7 @@ async function jsonRequest(url, init = {}) {
   if (!response.ok) throw new Error('peer request failed (HTTP ' + response.status + ')');
   return response.status === 204 ? null : response.json();
 }
-const authority = new Authority(config, database, () => jsonRequest(raftOrigin + '/verify'));
+const authority = new Authority(config, () => jsonRequest(raftOrigin + '/verify'));
 function launch(binary, args, childEnv, kind) {
   const child = spawn(binary, args, { env: childEnv, stdio: 'inherit' });
   children.add(child);
@@ -43,8 +41,7 @@ function launch(binary, args, childEnv, kind) {
     children.delete(child);
     if (child === core) {
       core = null; raft = null;
-      identityWaitingUntil = code === 75 ? Date.now() + 15_000 : 0;
-      coreRetry = Date.now() + (code === 75 ? 2000 : 10_000);
+      coreRetry = Date.now() + 10_000;
       demote('voter stopped');
     }
     if (child === application) { application = null; appReady = false; }
@@ -73,7 +70,7 @@ function localView() {
     started, observedAt: Date.now(), raft, primary: Boolean(application && appReady && authority.live()),
     authority: authority.live() ? authority.current : null, recovering: Boolean(application && !appReady),
     tunnelReady: Boolean(connector), error: lastError, memoryBytes: process.memoryUsage().rss,
-    rlog: tail.stats(), transitions: tail.history(), d1: { ...database.stats } };
+    rlog: tail.stats(), transitions: tail.history(), coordinationStorage: 'memory' };
 }
 function clusterView() {
   const now = Date.now();
@@ -82,7 +79,7 @@ function clusterView() {
     replicas: config.members.map(member => {
       const row = member.id === config.id ? { at: now, view: localView() } : peers.get(member.id);
       return { ...member, reachable: Boolean(row && now - row.at < 15_000), lastSeen: row?.at || null, view: row?.view || null };
-    }), transitions: tail.history(), persistence: { configuration: 'D1', electionMetadata: 'D1', rlog: 'bounded memory only' } };
+    }), transitions: tail.history(), persistence: { configuration: 'D1', electionMetadata: 'memory', rlog: 'bounded memory only', transitions: 'latest 30 in memory' } };
 }
 async function body(req, limit = 2 * 1024 * 1024) {
   const chunks = []; let size = 0;
@@ -114,6 +111,11 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname.startsWith('/_cp/')) {
       if (!equalSecret(req.headers['x-cp-token'], config.token)) return reply(res, 401, { error: 'unauthorized' });
+      const corePaths = { '/_cp/raft-status': '/status', '/_cp/join': '/join', '/_cp/pull': '/pull', '/_cp/bootstrap': '/bootstrap' };
+      if (corePaths[url.pathname]) {
+        if (!core) return reply(res, 503, { error: 'voter warming up' });
+        return proxy(req, res, raftOrigin, corePaths[url.pathname] + url.search);
+      }
       if (url.pathname === '/_cp/raft') {
         if (!core) return reply(res, 503, { error: 'voter warming up' });
         return proxy(req, res, raftOrigin, '/message');
@@ -151,12 +153,12 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }); return res.end(page);
     }
     if (url.pathname === '/readyz') {
-      const warm = env.CP_WARM_REPLACEMENT === '1' && Date.now() < identityWaitingUntil;
-      return reply(res, (core && raft?.identityValid) || warm ? 200 : 503,
-        { ok: Boolean((core && raft?.identityValid) || warm), voterReady: Boolean(core && raft?.identityValid), replacementWaiting: warm });
+      const ready = Boolean(core && raft?.identityValid && !raft.outgoing?.length);
+      return reply(res, ready ? 200 : 503,
+        { ok: ready, voterReady: ready, replacementWaiting: raft?.phase === 'joining', bootstrapRequired: raft?.phase === 'uninitialized' });
     }
-    if (url.pathname === '/healthz') return reply(res, core && raft?.identityValid ? 200 : 503,
-      { ok: Boolean(core && raft?.identityValid), tunnelsReady: Boolean(core && raft?.identityValid),
+    if (url.pathname === '/healthz') return reply(res, core ? 200 : 503,
+      { ok: Boolean(core), tunnelsReady: Boolean(connector || env.AUTO_TUNNEL === '0'),
         mode: 'raft', replica: config.id, primary: Boolean(appReady && authority.live()), quorum: config.quorum });
     const target = destination(req);
     if (!target) {
@@ -210,8 +212,6 @@ async function tick() {
     }
     if (!core) return;
     raft = await jsonRequest(raftOrigin + '/status');
-    if (!raft.identityValid) throw new Error('member identity expired');
-    identityWaitingUntil = 0;
     lastError = null;
     if (!startBusy && !connector && !['0', 'false'].includes(env.AUTO_TUNNEL)) {
       startBusy = true;
@@ -222,12 +222,11 @@ async function tick() {
       lastTransition = transition;
       tail.append('transition', { id: transition, at: Date.now(), term: raft.term, leader: raft.leader, observedBy: config.id });
     }
-    if (raft.role !== 'StateLeader' || raft.leader !== config.id) { if (application || authority.current) demote('Raft leadership changed'); return; }
+    if (!raft.identityValid || raft.role !== 'StateLeader' || raft.leader !== config.id) { if (application || authority.current) demote('Raft leadership changed'); return; }
     if (Date.now() >= nextRenew) {
       const fence = await authority.renew(); nextRenew = Date.now() + 5000;
-      if (!fence) { if (application) demote('cluster inactive or fenced'); return; }
     }
-    if (!authority.current) return; // prepared but not activated
+    if (!authority.current) return;
     if (!authority.live()) throw new Error('authority lease expired');
     if (!application) {
       const fence = await authority.check();
@@ -296,9 +295,6 @@ async function shutdown(code = 0) {
   process.exit(code);
 }
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => shutdown());
-const cluster = await database.query('SELECT * FROM cp_cluster WHERE id=1');
-if (cluster.length !== 1 || cluster[0].cluster_id !== config.cluster || cluster[0].replicas !== config.count ||
-    cluster[0].members !== JSON.stringify(config.members)) throw new Error('cluster must be explicitly prepared with this membership');
 server.listen(port, env.BIND_HOST || '127.0.0.1', () => log('replica endpoints ready'));
 setInterval(tick, 1000); setInterval(pollPeers, 3000);
 await tick();

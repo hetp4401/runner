@@ -1,9 +1,24 @@
 import { parentPort, workerData } from "node:worker_threads";
 
-parentPort.on("message", async ({ batch, shared }) => {
+parentPort.on("message", async ({ batch, shared, verifyLeadership }) => {
   const state = new Int32Array(shared, 0, 2), destination = new Uint8Array(shared, 8);
   let output, status = 1;
   try {
+    // Check immediately before submitting a configuration change, including
+    // changes whose API handler waited on asynchronous work. This proof stays
+    // in memory; D1 contains only application configuration and its revision.
+    if (verifyLeadership && workerData.leadership) {
+      const { url, token, expected } = workerData.leadership;
+      let current;
+      try {
+        const proof = await fetch(url, { method: "POST", signal: AbortSignal.timeout(5000),
+          headers: { "content-type": "application/json", "x-cp-token": token }, body: JSON.stringify(expected) });
+        if (proof.ok) current = await proof.json();
+      } catch {}
+      if (!current || ["cluster", "node", "boot", "term", "epoch"].some(key => current[key] !== expected[key])) {
+        throw new Error("D1 write refused: primary authority could not be confirmed");
+      }
+    }
     const response = await fetch(workerData.url, {
       method: "POST", signal: AbortSignal.timeout(30_000),
       headers: { "content-type": "application/json", "x-auth-key": workerData.key, "x-auth-email": workerData.email },

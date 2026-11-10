@@ -14,8 +14,8 @@ export class RuntimeTail {
     if(kind==='transition')this.transition(data);
     return event;
   }
-  transition(data){if(!data?.id)return;this.transitions.set(data.id,data);while(this.transitions.size>200)this.transitions.delete(this.transitions.keys().next().value);}
+  transition(data){if(!data?.id)return;this.transitions.set(data.id,data);while(this.transitions.size>30){const oldest=[...this.transitions].sort((a,b)=>a[1].at-b[1].at)[0][0];this.transitions.delete(oldest);}}
   read(after=0){const first=this.entries[0]?.event.sequence||this.sequence+1;return{sequence:this.sequence,first,gap:after<first-1,events:this.entries.filter(x=>x.event.sequence>after).slice(0,64).map(x=>x.event)};}
   stats(){return{sequence:this.sequence,entries:this.entries.length,bytes:this.bytes,reportBytes:this.reportBytes,transitions:this.transitions.size};}
-  history(){return[...this.transitions.values()].sort((a,b)=>b.at-a.at).slice(0,100);}
+  history(){return[...this.transitions.values()].sort((a,b)=>b.at-a.at).slice(0,30);}
 }

@@ -60,7 +60,7 @@ waits for agent reports before scheduling. Receipts recover observations; they
 cannot reconstruct missing app source, password hashes or application secrets.
 The default recovery hold is three minutes.
 
-In single-controller mode, run exactly one controller for a fleet. Replicated mode uses Raft quorum checks and D1 fencing instead; see [control replication](control-replication.md). A local volume lock cannot fence another
+In single-controller mode, run exactly one controller for a fleet. Replicated mode uses memory-only Raft quorum checks and agent authority checks; D1 holds application configuration only. See [control replication](control-replication.md). A local volume lock cannot fence another
 computer or another volume. Before migration, disable the old scheduler and its
 automatic startup, preserve the public origin, join token, signing key and tunnel
 namespace, and use the same D1 database (or transfer the stopped SQLite files for local storage). Never initialize a new empty

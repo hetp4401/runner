@@ -9,7 +9,7 @@ export function replicaCount(value = '1') {
 export function clusterConfig(env) {
   const count = replicaCount(env.CP_REPLICAS ?? '1');
   if (count === 1) return { count, enabled: false };
-  if (env.CONFIG_STORAGE !== 'd1') throw new Error('replicated controllers require CONFIG_STORAGE=d1');
+  if (env.CONFIG_STORAGE !== 'd1') throw new Error('replicated controllers require shared application configuration (CONFIG_STORAGE=d1)');
   let members;
   try { members = JSON.parse(env.CP_MEMBERS); } catch { throw new Error('CP_MEMBERS must be a JSON array'); }
   if (!Array.isArray(members) || members.length !== count) throw new Error('CP_MEMBERS must contain CP_REPLICAS distinct members');

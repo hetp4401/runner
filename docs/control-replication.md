@@ -1,156 +1,193 @@
 # Replicated control plane
 
-The same Docker image can run alone or as a Raft voter. `CP_REPLICAS=1` is
-the ordinary single-controller service: no election process, peer traffic or
-coordination writes. Replicated mode accepts an odd number of at least three;
-two and all even values are rejected. Application replica counts are independent.
+The same Docker image runs alone or as a member of a Raft cluster.
+`CP_REPLICAS=1` runs the ordinary controller without elections or peer traffic.
+Replicated mode accepts an odd number of at least three. Two and all even
+values are rejected. Application replica counts are independent.
 
-Raft uses `go.etcd.io/raft/v3` with pre-voting, quorum checks and quorum-confirmed
-ReadIndex requests. Membership is explicit and fixed for a cluster generation.
-Starting another copy does not replace a healthy primary or lower the quorum.
+Coordination is entirely in memory. The implementation uses
+[`go.etcd.io/raft/v3`](https://github.com/etcd-io/raft), pre-voting, quorum checks,
+and quorum-confirmed ReadIndex requests. D1 stores application configuration;
+it does not store terms, votes, membership changes, authority, transitions, or
+Raft log entries. No Cloudflare service beyond the existing D1 configuration
+store, tunnels and DNS is required.
 
-| Voters | Votes required | Voter failures tolerated |
+| Configured slots | Votes required | Unavailable voters tolerated |
 | --- | --- | --- |
 | 3 | 2 | 1 |
 | 5 | 3 | 2 |
 | 7 | 4 | 3 |
 
-Count physical failure domains as well as containers. Three Mac containers plus
-four fleet containers need four voters to make changes. The fleet can continue
-without the Mac only while all four fleet voters are available. Losing all four
-fleet voters leaves three votes and pauses the control plane. Existing agent
-workloads keep running. Membership never shrinks automatically after failures.
+Count physical failure domains as well as containers. With three Mac copies and
+four fleet copies, the fleet can continue without the Mac while all four fleet
+voters remain available. Losing all four fleet copies leaves three votes and
+pauses control changes. Existing agent workloads keep running. Membership never
+shrinks automatically to work around quorum loss.
 
-## Configuration and activation
+## Configuration and first startup
 
-Replicated mode currently requires the existing D1 configuration store. All
-copies share the fleet's identity credentials, tunnel namespace and these private
-settings:
+Copies share the fleet's configuration credentials, tunnel namespace and:
 
-- `CP_REPLICAS`: total voting members, including externally hosted copies.
-- `CP_CLUSTER_ID`: a stable, unique identifier, 16–100 letters, digits, underscores or dashes.
-- `CP_CLUSTER_TOKEN`: a private random secret of at least 32 characters.
-- `CP_MEMBERS`: JSON array of `{ "id": 1, "url": "https://cp-1.example.com", "label": "Host A" }` entries. IDs and HTTP(S) origins must be unique.
-- `CP_NODE_ID`: this copy's positive integer identity.
+- `CP_REPLICAS`: total logical member slots, including external copies.
+- `CP_CLUSTER_ID`: stable identifier, 16–100 letters, digits, underscores or dashes.
+- `CP_CLUSTER_TOKEN`: private random secret of at least 32 characters.
+- `CP_MEMBERS`: JSON array of `{ "id": 1, "url": "https://cp-1.example.com", "label": "Host A" }`. IDs and HTTP(S) origins must be unique.
+- `CP_NODE_ID`: this copy's logical member slot.
 - Existing D1, Cloudflare, admin, join-token and receipt-signing settings.
 
-Peer origins must differ from the primary control hostname. External voters use persistent named Cloudflare Tunnels. Fleet voters can use their normal numbered app domains with `CP_PEER_TUNNEL=0`; the app owns and maintains those routes. Each voter also has a bundled tunnel that can publish the shared primary hostname. Local deployments may set
-`CP_PEER_OVERRIDES` to an ID-to-origin JSON map for private container networking.
-Public peer addresses and membership remain identical on every copy.
+These are ordinary deployment settings. An app definition may contain its peer
+addresses in D1, just as it contains other application environment settings;
+no changing consensus state is saved there.
 
-Run `node control/cluster-init.mjs prepare` with the intended environment.
-This creates only coordination tables and leaves the cluster inactive. Start
-the voters; they can elect and expose diagnostics without starting a scheduler.
-Start every configured voter at least once so its durable identity exists. Stop the previous standalone scheduler, then run
-`node control/cluster-init.mjs activate`. The primary starts the scheduler and,
-after tunnel inventory recovery, points the existing control hostname at its
-own tunnel. Do not run an uncoordinated standalone scheduler alongside it.
+Peer origins must differ from the primary hostname. External copies use
+persistent named Cloudflare Tunnels. Fleet copies use their normal numbered app
+domains with `CP_PEER_TUNNEL=0`. Each copy also has a tunnel that can publish the
+shared primary hostname. `CP_PEER_OVERRIDES` optionally maps logical IDs to
+private networking origins without changing the public member list.
 
-`deactivate` stops authorization of new work. It is an explicit maintenance
-operation, not a way to rewrite membership. A different membership requires a
-coordinated migration; changing the member list in one process is rejected.
-For an address-only change, keep the same voter IDs and use `update-addresses`
-while inactive, then roll out the matching private environment to all copies.
+A fresh process starts without a vote. If a surviving cluster has quorum, it
+admits that process automatically. If this is the first cluster startup, start
+at least a quorum of copies and ensure every previous scheduler has stopped.
+Then, using the private deployment environment, run:
+
+```sh
+node control/cluster-init.mjs status
+node control/cluster-init.mjs bootstrap --confirm-old-cluster-stopped
+```
+
+The tool creates a manifest only in memory and distributes it to the fresh
+processes. Unavailable slots receive placeholder identities; the surviving
+quorum can replace them when their processes appear. Initialized members refuse
+a different bootstrap generation. Never bootstrap across a network partition
+or while an old cluster can still act. Do not run a standalone scheduler beside
+a replicated cluster.
+
+The initial term defaults to the current Unix time in milliseconds. After a
+clock rollback, set `CP_BOOTSTRAP_TERM` above the highest epoch still remembered
+by agents. Normal elections increase the term without consulting wall time.
+
+## Memory-only safety and recovery
+
+Ordinary Raft requires durable term and vote state when a node restarts with
+the same identity. This implementation never restarts a forgotten voter: every
+process creates a new random physical Raft identity and boot token. The logical
+slot and stable hostname remain the same.
+
+A new process first joins as a non-voting learner. After it catches up, the
+leader replaces the previous physical identity through joint consensus. Both
+the old and new voting majorities must agree before the replacement is ready.
+A removed incarnation stops acting and cannot rejoin in that process. Application
+commands are not replicated through this Raft group; its compacted protocol
+state and membership snapshots are held in RAM.
+
+This deliberately favors exclusive authority over automatic recovery:
+
+- A surviving quorum can admit restarted copies and perform planned handoffs.
+- If fewer than a quorum retain their memory, new processes cannot restore the
+  missing votes by themselves. Restarting a container does not recover its vote.
+- Complete cluster memory loss requires stopping every old incarnation and
+  explicitly bootstrapping a fresh generation. History is lost. Do not lower the
+  quorum or reset a minority while another partition might still be active.
 
 ## Fleet copies are an ordinary app
 
-Use [the example Compose app](../examples/control-replicas/compose.yaml). It has
-normal app replicas, private environment, health checks, placement, moves and
-container shutdown. There are no controller-specific GitHub jobs, provider
-watchdogs, special scheduling rules or additional Cloudflare services.
+Use [the example Compose app](../examples/control-replicas/compose.yaml). It uses
+normal replicas, private environment, placement, readiness, moves, and container
+shutdown. There are no controller-specific GitHub jobs or scheduling helpers.
 
-The application receives the normal `FLEET_REPLICA` variable. Setting
-`CP_NODE_ID_OFFSET=3` maps app replicas 1–4 to voters 4–7; voters 1–3 can run
-elsewhere. The offset is deployment configuration, not a built-in Mac topology.
-Do not put a fixed `CP_NODE_ID` in the app's shared environment. Its `CP_MEMBERS` entry can use that copy's stable numbered app domain; `CP_PEER_TUNNEL=0` preserves the app-managed DNS record.
+The normal `FLEET_REPLICA` variable identifies each app replica.
+`CP_NODE_ID_OFFSET=3` maps app replicas 1–4 to logical slots 4–7; slots 1–3 may
+run elsewhere. The offset is deployment configuration, not a built-in Mac
+topology. Do not set a fixed `CP_NODE_ID` in the shared app environment.
 
-Provide `CONTROL_IMAGE` for an image built from this repository, or replace
-the example image with a standard Compose remote Git build context pinned to a
-full commit. Store credentials through the ordinary private app environment,
-never in public Compose/source files.
+Use an image built from this repository, or a standard Compose remote Git build
+context pinned to a full commit. Keep credentials in the private app environment.
+`x-runner.spread-tags: true` asks placement to prefer different machine tags on
+a best-effort basis; see [placement preferences](region-affinity.md).
 
-Set `x-runner.spread-tags: true` to prefer different machine origin tags.
-This preference is best effort, applies only to apps that request it, and never
-overrides a required region. It does not move healthy copies merely to improve
-tag diversity. See [placement preferences](region-affinity.md).
+During an ordinary app move, the replacement starts while the old copy is still
+running. It exchanges Raft messages through bounded in-memory peer mailboxes
+until the stable app domain moves to it. `/readyz` returns 200 only after the
+learner has become a voter and joint consensus has finished. The old incarnation
+has already lost authority before the scheduler removes its container. Moving
+a primary first transfers leadership to another voter. A 30-second container
+stop grace period allows graceful shutdown.
 
-A replacement starts before the old copy is removed. With
-`CP_WARM_REPLACEMENT=1`, `/readyz` also recognizes a fully started replacement
-waiting for its predecessor's voter identity. It does not vote yet. Once the
-normal scheduler removes the old copy, that copy stops its scheduler, attempts
-a leadership transfer and releases its identity. The replacement then loads the
-same durable election state and joins. Set a 30-second container stop grace
-period. Updated agents honor every app's configured stop signal and grace
-period; older agents that force-remove a copy require identity-lease expiry.
+`/healthz` is a separate liveness check: a fresh process or learner is alive even
+when it cannot vote. It must not be repeatedly restarted just because quorum is
+unavailable. `CP_WARM_REPLACEMENT` is no longer needed.
 
-A hard host failure can skip graceful handoff. An identity lease prevents a
-second process from voting as the same member; crash takeover can wait up to
-90 seconds. App readiness and voter readiness are separate fields in the API.
-Regular app source updates use the existing app update behavior; upgrading all
-four fleet copies together can temporarily lose quorum if only three external
-voters remain. Plan upgrades while sufficient voters are available.
+A planned handoff works with exactly a quorum when both old and new processes
+remain available until promotion. A hard failure that leaves fewer than a quorum
+requires operator recovery. The control-plane app is intentionally a recursive
+dependency: a quorum can schedule replacements; a minority cannot create votes.
 
-This is intentionally a recursive dependency. An existing quorum can schedule
-replacement CP app copies. If fewer than a quorum survive, the scheduler cannot
-create the voters it needs. Recovery requires restoring existing voter hosts,
-or temporarily starting a missing voter with its normal image and private
-configuration on an available host. Never reset its vote state or lower quorum.
+Ordinary app source updates currently replace all copies in parallel. With the
+Mac copies stopped, a fleet-wide source upgrade loses the remaining cluster
+memory. Treat that as planned maintenance: stop/fence the previous cluster,
+wait for the fresh copies, then explicitly bootstrap. Do not expect a rolling
+upgrade from a normal app source update.
 
 ## External copies and Mac supervision
 
-`control/compose-replicas.mjs` generates a normal Compose deployment from a
-JSON file containing `environment_file` (an absolute private path), `image`
-and local `members` such as `[{ "id": 1, "port": 8920 }]`. Each copy gets an
-independent identity volume and loopback port. An optional `dns` array selects ordinary DNS resolvers for these containers,
-for example when the host resolver has cached missing, newly created peer names.
-The existing Mac supervisor accepts optional `compose_file` and `services` settings; its default remains
-the single `control` service.
+`control/compose-replicas.mjs` generates a normal Compose deployment from a JSON
+file with `environment_file`, `image`, and local `members`, for example
+`[{ "id": 1, "port": 8920 }]`. Each copy gets a loopback port and a volume for
+ordinary fleet identity credentials. That volume contains no Raft vote state.
+The optional `dns` array configures ordinary container resolvers. The Mac
+supervisor supports `compose_file` and `services`; its default is the standalone
+`control` service. Explicitly stopped external copies stay stopped during fleet
+maintenance unless the operator chooses to restore them.
 
-## Leadership, routing and persistence
+## Authority and routing
 
-Only the primary starts a scheduler child. Scheduling, agent plans, API
-operations and Cloudflare effects require a fresh quorum confirmation.
-Leadership loss stops that child and closes its agent WebSockets. Standbys
-forward ordinary dashboard/API traffic to the current primary, which also
-handles connections reaching a former primary during DNS propagation.
+Only the primary starts a scheduler child. Scheduling, agent plans, API changes,
+and Cloudflare effects require fresh quorum confirmation. Leadership loss stops
+the child and closes its agent WebSockets. Standbys forward dashboard/API traffic
+to the primary, including traffic arriving through old DNS routes. The primary
+reconciles the existing shared hostname to its tunnel.
 
-D1 configuration transactions also check the current leadership epoch inside
-the same atomic batch. Updated agents verify plan authority through the stable
-control origin and remember their highest accepted epoch. A new primary fences
-old configuration writes and obsolete plans. Work already accepted before a
-handoff may finish; an external Cloudflare request cannot be recalled. The
-primary periodically reconciles its hostname.
+The D1 I/O worker confirms authority immediately before submitting each
+configuration transaction. The transaction also checks the ordinary application
+configuration revision atomically, so a stale edit cannot overwrite a newer
+commit. No leadership record is written to D1. Agents verify plan authority
+through the stable control origin and remember the highest accepted term/epoch.
+They reject obsolete or missing proofs.
 
-D1 stores desired configuration plus minimal election and fencing metadata:
-term/vote, fixed membership, the compacted consensus boundary, pending empty
-leadership-barrier index/term pairs, voter ownership and current authority.
-No application commands, runtime reports, metrics or runtime log history are
-written into the Raft protocol state.
+A request authorized before a handoff may finish afterward. Already submitted
+D1 or Cloudflare HTTP requests cannot be recalled. Quorum guards prevent new
+operations by a former primary; revision checks protect newer configuration
+and the current primary reconciles external routing.
 
-The runtime `rlog` is a bounded memory tail (up to 2,048 entries / 8 MiB),
-with a separately bounded 8 MiB latest-report cache. Peers exchange it in memory
-and recover signed inventory from agents. Recent primary transitions are
-bounded in memory too. A full restart can lose that history.
+## History and inspection
 
-Stable operation renews seven voter identity leases every 30 seconds and one
-authority fence every five seconds: about 37,440 updated rows/day before
-elections and configuration edits. These coordination writes are new in HA
-mode; ordinary runtime reports still do not write to D1. D1/API unavailability
-eventually stops authority rather than permitting concurrent schedulers.
+Each copy retains the latest **30 primary transitions in memory** and exchanges
+that history with peers. Nothing writes transition history to D1, SQLite, or a
+history file. Full memory loss clears it. The runtime `rlog` is a bounded tail
+of at most 2,048 entries / 8 MiB, with a separate 8 MiB latest-report cache. Peers
+exchange observations in memory and recover signed inventory from agents.
+There are zero periodic D1 coordination writes.
 
-## Inspection and verification
+The Runners **Fleet** tab (`/#/fleet`) shows replica health and transitions using
+the panel's existing theme. Every copy serves the shell and `/api/cluster`
+independently, including during elections and quorum loss. The view shows peer
+reachability, current leader, term, voter readiness, and runtime-tail size.
+Peer links open that replica's perspective. `/_cp/*` requires the cluster secret;
+raw runtime reports are not public. Old `/cluster` links redirect to Fleet.
 
-The main Runners **Fleet** tab (`/#/fleet`) includes control-plane replica health
-and recent primary transitions, using the same tables, navigation and light/dark
-theme as the rest of the panel. Every replica serves the application shell and
-its `/api/cluster` independently of the primary, so this section remains available
-during elections or quorum loss. It shows that replica's view of each peer,
-reachability, leader, term and runtime-tail size. Each peer link opens the same
-Fleet view from that peer's perspective. Old `/cluster` links redirect to Fleet.
-`/_cp/*` requires the cluster secret; raw runtime reports are not public.
+## Verification
 
-Build the Go test binary with `go -C control/raft build -o /tmp/runners-raft-test .`,
-then run `node control/test/raft-cluster.mjs` and
-`node control/test/ha-service.mjs` using Node 24. The tests cover seven-voter
-elections, partitions, restart, duplicate identities, stale D1 writes, agent
-fencing, standby forwarding and normal-app replacement handoff.
+With Go 1.24 or newer and Node 24:
+
+```sh
+go -C control/raft build -o /tmp/runners-raft-memory-test .
+node control/test/raft-memory.mjs
+node control/test/ha-service.mjs
+node control/test/ha-setup.mjs
+node control/test/d1-store.mjs
+```
+
+Tests cover explicit bootstrap, seven-member elections, partitions, quorum loss,
+new identities after restart, learner promotion, replacement with only four
+available voters, primary handoff, stale configuration and agent rejection,
+standby forwarding, and the 30-transition limit.

@@ -1,33 +1,54 @@
+// Explicit recovery boundary for a completely volatile consensus cluster.
+// Nothing in this tool, including its bootstrap manifest, is saved to storage.
+import { randomBytes, randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { clusterConfig } from './src/ha/config.mjs';
-import { ClusterDatabase, CLUSTER_SCHEMA } from './src/ha/database.mjs';
-const config = clusterConfig(process.env);
-if (!config.enabled) throw new Error('single-controller mode does not initialize cluster coordination');
-const action = process.argv[2] || 'prepare';
-if (!['prepare', 'activate', 'deactivate', 'update-addresses'].includes(action)) throw new Error('command must be prepare, activate, deactivate or update-addresses');
-const database = new ClusterDatabase(process.env);
-await database.query(CLUSTER_SCHEMA.map(sql => ({ sql, params: [] })));
-const members = JSON.stringify(config.members);
-let row = (await database.query('SELECT * FROM cp_cluster WHERE id=1'))[0];
-if (!row) {
-  if (action !== 'prepare') throw new Error('prepare the cluster before changing its state');
-  await database.query([
-    { sql: 'INSERT INTO cp_cluster VALUES(1,?,?,?,0)', params: [config.cluster, config.count, members] },
-    { sql: "INSERT INTO cp_authority VALUES(1,0,'',0,0,0,0)", params: [] },
-  ]);
-  row = { cluster_id: config.cluster, replicas: config.count, members, active: 0 };
+
+export function bootstrapManifest(config, views, term = Date.now()) {
+  const available = views.filter(view => view && config.members.some(member => member.id === view.id));
+  if (new Set(available.map(view => view.id)).size < config.quorum) throw new Error('a quorum of reachable, fresh processes is required');
+  if (available.some(view => view.generation || view.phase !== 'uninitialized')) throw new Error('cluster memory still exists; rejoin it instead of bootstrapping');
+  if (!Number.isSafeInteger(term) || term < 1 || term > 2 ** 52) throw new Error('bootstrap term must be a safe positive integer');
+  const used = new Set();
+  const members = config.members.map(member => {
+    const view = available.find(v => v.id === member.id);
+    let node = view?.node;
+    if (!view) do { node = randomBytes(6).readUIntBE(0, 6); } while (!node || used.has(node));
+    if (!Number.isSafeInteger(node) || node < 1 || used.has(node) || (view && typeof view.boot !== 'string')) throw new Error('invalid or duplicate process identity');
+    used.add(node);
+    return { id: member.id, node, boot: view?.boot || randomUUID() };
+  });
+  return { generation: randomUUID(), term, members };
 }
-if (row.cluster_id !== config.cluster || row.replicas !== config.count) throw new Error('cluster identity/size differs; refusing automatic reconfiguration');
-if (action === 'update-addresses') {
-  const before = JSON.parse(row.members).map(member => member.id).sort((a, b) => a - b);
-  if (row.active !== 0 || JSON.stringify(before) !== JSON.stringify(config.members.map(member => member.id))) throw new Error('address updates require an inactive cluster and exactly the same voter IDs');
-  const changed = await database.query('UPDATE cp_cluster SET members=? WHERE id=1 AND cluster_id=? AND active=0 RETURNING id', [members, config.cluster]);
-  if (changed.length !== 1) throw new Error('cluster changed during address update');
-} else {
-  if (row.members !== members) throw new Error('member configuration differs; use update-addresses while inactive for address-only changes');
-  if (action === 'activate') {
-    const initialized = await database.query('SELECT node_id FROM cp_raft_state WHERE cluster_id=?', [config.cluster]);
-    if (initialized.length !== config.count || config.members.some(member => !initialized.some(row => row.node_id === member.id))) throw new Error('start every configured voter once before activation; missing election state cannot be recreated while active');
+
+export async function initializeCluster(env, action, confirmed = false) {
+  const members = JSON.parse(env.CP_MEMBERS || '[]');
+  const config = clusterConfig({ ...env, CP_NODE_ID: env.CP_NODE_ID || String(members[0]?.id || '') });
+  if (!config.enabled) throw new Error('single-controller mode has no consensus bootstrap');
+  const overrides = JSON.parse(env.CP_PEER_OVERRIDES || '{}');
+  async function request(member, path, body) {
+    const response = await fetch((overrides[String(member.id)] || member.url) + path, {
+      method: body ? 'POST' : 'GET', signal: AbortSignal.timeout(8000),
+      headers: { 'x-cp-token': config.token, 'content-type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    if (!response.ok) throw new Error('replica ' + member.id + ': HTTP ' + response.status);
+    return response.json();
   }
-  if (action !== 'prepare') await database.query('UPDATE cp_cluster SET active=? WHERE id=1 AND cluster_id=?', [action === 'activate' ? 1 : 0, config.cluster]);
+  const views = await Promise.all(config.members.map(member => request(member, '/_cp/raft-status').catch(() => null)));
+  if (action === 'status') return views.map((view, index) => ({ id: config.members[index].id, reachable: Boolean(view), phase: view?.phase, leader: view?.leader, term: view?.term }));
+  if (action !== 'bootstrap') throw new Error('command must be status or bootstrap');
+  if (!confirmed) throw new Error('bootstrap requires --confirm-old-cluster-stopped; never bootstrap across a partition');
+  const manifest = bootstrapManifest(config, views, Number(env.CP_BOOTSTRAP_TERM || Date.now()));
+  for (const member of config.members.filter((_, index) => views[index])) {
+    await request(member, '/_cp/bootstrap', manifest);
+  }
+  return { cluster: config.cluster, generation: manifest.generation, replicas: config.count, quorum: config.quorum, initialized: views.filter(Boolean).length, storage: 'memory' };
 }
-console.log(JSON.stringify({ cluster: config.cluster, replicas: config.count, quorum: config.quorum, action }));
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  initializeCluster(process.env, process.argv[2] || 'status', process.argv.includes('--confirm-old-cluster-stopped'))
+    .then(result => console.log(JSON.stringify(result)))
+    .catch(error => { console.error(error.message); process.exitCode = 1; });
+}
