@@ -113,13 +113,13 @@ const poolsOf = (c, f, name) => {
   ok("the server with 27 minutes left got no copy", !c.copiesOn("web", s0.machine).length && c.copiesOf("web").length === 2, placed(c, "web").join(" "));
 }
 
-{ // 8. stateless copies spread across pools as well as servers
+{ // 8. an app can opt into spreading across pools as well as servers
   const c = makeControl();
   const f = new Fleet(c, { a: { size: 4, cap: 20 }, b: { size: 4, cap: 20 } }, { drainAt: () => null });
   await f.startPool("a");
   await f.startPool("b");
   await f.run(4 * MIN);
-  deploy(c, "web", app("web", 4));
+  deploy(c, "web", app("web", 4, "  spread-tags: true\n"));
   await f.run(3 * MIN);
   const by = poolsOf(c, f, "web");
   ok("4 copies over two pools: two in each", by.a === 2 && by.b === 2, JSON.stringify(by));

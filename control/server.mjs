@@ -13,6 +13,7 @@ import { LocalStore } from "./src/local-store.mjs";
 import { D1Store } from "./src/d1-store.mjs";
 import { loadAgentBundle } from "./src/agent-bundle.mjs";
 import { clientAddress, validateProxyConfig } from "./src/client-ip.mjs";
+import { authorityGuard } from "./src/ha/guard.mjs";
 
 const env = { ...process.env, RECOVER_RUNTIME: "1", RECOVER_TUNNELS: "1", MEMORY_HISTORY_MIN: process.env.MEMORY_HISTORY_MIN || "360" };
 const port = Number(env.PORT) || 8920;
@@ -40,6 +41,8 @@ globalThis.fetch = async (...args) => {
 };
 const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
 validateProxyConfig(env);
+const guard = authorityGuard(env, () => setImmediate(() => shutdown(1)));
+await guard.check();
 
 if (!env.STATE_SIGNING_KEY || !env.JOIN_TOKEN) throw new Error("STATE_SIGNING_KEY and JOIN_TOKEN are required for agent recovery");
 process.umask(0o077);
@@ -69,6 +72,13 @@ const control = new Control({
   },
 });
 sql.protect(control);
+if (guard.enabled) {
+  const alarm = control.alarm.bind(control), cloudflare = control.cf.bind(control), event = control.logEvent.bind(control);
+  control.alarm = async (...args) => { await guard.check(); return alarm(...args); };
+  control.cf = async (...args) => { await guard.check(); return cloudflare(...args); };
+  control.logEvent = (...args) => { const result = event(...args); guard.report('event', control.recentEvents.at(-1)); return result; };
+  await guard.recover(control);
+}
 control.usage = () => ({ enabled: true, startedAt: usage.startedAt,
   configuration: sql.diagnostics?.() || { backend: "sqlite" },
   http: { ...usage.http }, externalHttp: { ...usage.externalHttp }, agent: { ...usage.agent }, logs: { ...usage.logs } });
@@ -108,10 +118,16 @@ const server = http.createServer(async (req, res) => {
       headers,
       body: req.method === "GET" || req.method === "HEAD" ? undefined : Buffer.concat(chunks),
     });
+    await guard.check();
     const response = await control.fetch(request);
-    const body = Buffer.from(await response.arrayBuffer());
-    res.writeHead(response.status, { ...Object.fromEntries(response.headers), "content-length": body.length, server: "runner-control" });
-    res.end(body);
+    const proof = await guard.check();
+    let responseBody = Buffer.from(await response.arrayBuffer());
+    if (proof && req.method === 'POST' && req.url?.split('?')[0] === '/api/sync' && response.ok) {
+      responseBody = Buffer.from(JSON.stringify({ ...JSON.parse(responseBody), leadership: proof }));
+      try { guard.report('report', JSON.parse(Buffer.concat(chunks))); } catch {}
+    }
+    res.writeHead(response.status, { ...Object.fromEntries(response.headers), "content-length": responseBody.length, server: "runner-control" });
+    res.end(responseBody);
   } catch (e) {
     log(`request failed: ${e.stack ?? e}`);
     if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
@@ -127,7 +143,8 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 });
 const agentSockets = new Map();
 const status = control.status.bind(control);
 control.status = () => ({ ...status(), controlPlane: {
-  mode: env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
+  ...(guard.enabled ? { replica: Number(env.CP_NODE_ID), replicas: Number(env.CP_REPLICAS), clusterView: '/cluster' } : {}),
+  mode: guard.enabled ? "raft" : env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
   runtime: env.CONTROLLER_RUNTIME || "native",
   owner: env.CONTROLLER_KIND || "vps", name: env.CONTROLLER_NAME || "VPS",
   configStorage: env.CONFIG_STORAGE === "d1" ? "cloudflare-d1" : "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
@@ -163,7 +180,7 @@ server.on("upgrade", (req, socket, head) => {
       return wss.handleUpgrade(req, socket, head, (ws) => {
         usage.http.responsesOut++;
         let run = null;
-        ws.on("message", (raw) => {
+        ws.on("message", async (raw) => {
           usage.agent.messagesIn++;
           let message;
           try {
@@ -173,10 +190,14 @@ server.on("upgrade", (req, socket, head) => {
             usage.agent.syncIn++;
             run = message.body?.run;
             if (run) agentSockets.set(run, ws);
+            await guard.check();
             control.setPace(Date.now());
             const plan = control.sync(message.body, clientAddress(req, env));
+            const proof = await guard.check();
+            if (proof) plan.leadership = proof;
+            guard.report('report', message.body);
             sendAgent(ws, { type: "plan", id: message.id, plan });
-          } catch (error) { sendAgent(ws, { type: "error", id: message?.id, error: error.message }); }
+          } catch (error) { if (ws.readyState === ws.OPEN) sendAgent(ws, { type: "error", id: message?.id, error: error.message }); }
         });
         ws.on("close", () => { if (agentSockets.get(run) === ws) agentSockets.delete(run); });
         ws.on("error", () => {});

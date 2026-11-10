@@ -89,3 +89,5 @@ For the archived Cloudflare-only mode, substitute `test/wrangler.cloudflare.json
 ## Automatic public addresses
 
 Run `node control/test/public-tunnels.mjs` for connector ownership, health withdrawal, offline restart, authorization, host loss, provider capacity, DNS ownership and cleanup. `node control/test/sim/global-domains.test.mjs` covers the global/numbered domain lifecycle, moves, scaling, cold discovery and token privacy. `node control/test/ui-lifecycle.mjs` checks global main links and numbered replica links. Docker smoke tests verify that the controller image works with the two modules alone.
+
+Replication checks: build the real Raft core with `go -C control/raft build -o /tmp/runners-raft-test .`, then run `node control/test/raft-cluster.mjs` and `node control/test/ha-service.mjs`. Both use isolated D1 fixtures. `node control/test/spread-tags.mjs` covers opt-in tag diversity and region restrictions.

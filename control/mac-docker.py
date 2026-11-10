@@ -28,8 +28,14 @@ def configuration(filename):
     envfile = Path(config["environment_file"])
     if envfile.stat().st_mode & 0o077:
         raise ValueError("environment_file must be owner-only (chmod 600)")
-    if not (Path(config["source"]) / "compose.yaml").is_file():
-        raise ValueError("source must contain compose.yaml")
+    compose_file = Path(config.get("compose_file", str(Path(config["source"]) / "compose.yaml")))
+    if not compose_file.is_absolute() or not compose_file.is_file():
+        raise ValueError("compose_file must be an existing absolute path")
+    config["compose_file"] = str(compose_file)
+    services = config.get("services", ["control"])
+    if not isinstance(services, list) or not services or any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,60}", name) for name in services):
+        raise ValueError("services must list valid Compose service names")
+    config["services"] = services
     for key in ("profile", "project"):
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,40}", config[key]):
             raise ValueError("invalid " + key)
@@ -61,7 +67,7 @@ def command(args, env, timeout=180, check=True):
 def compose(config):
     return ["docker", "compose", "--project-name", config["project"],
             "--project-directory", config["source"], "--file",
-            str(Path(config["source"]) / "compose.yaml")]
+            config["compose_file"]]
 
 
 def serve(config, env):
@@ -83,7 +89,7 @@ def serve(config, env):
                 if stopping.is_set():
                     break
                 # Idempotent; never initializes data, builds, pulls or removes volumes.
-                command(compose(config) + ["up", "-d", "--no-build", "--pull", "never", "control"], env)
+                command(compose(config) + ["up", "-d", "--no-build", "--pull", "never"] + config["services"], env)
                 if not started:
                     print("Docker controller started; monitoring dedicated Colima engine", flush=True)
                     started = True
@@ -92,7 +98,7 @@ def serve(config, env):
             stopping.wait(30)
     finally:
         try:
-            command(compose(config) + ["stop", "--timeout", "15", "control"], env, timeout=25, check=False)
+            command(compose(config) + ["stop", "--timeout", "30"] + config["services"], env, timeout=45, check=False)
         finally:
             caffeine.terminate()
             lock.close()

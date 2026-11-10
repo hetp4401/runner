@@ -49,3 +49,27 @@ node control/test/sim/regions.test.mjs
 ```
 
 They exercise grouping, validation, unknown locations, capacity shortages, fixed container names, manual moves, scheduled departures, eviction, region changes, restart persistence and cross-region handovers with continued readiness.
+
+## Prefer different machine tags
+
+Apps can opt into best-effort diversity across machine origin tags:
+
+```yaml
+x-runner:
+  replicas: 4
+  spread-tags: true
+```
+
+The scheduler prefers tags with fewer other replicas of this app among otherwise
+eligible machines. A tag might represent a provider account, a home server group,
+or another operator-defined pool. No provider names are built into the policy.
+Health, region restrictions, departures and safe placement remain authoritative.
+A single available tag still runs all replicas; extra replicas can reuse tags.
+Standalone machines share the `standalone` tag. The preference is disabled when
+omitted or false, and other values are rejected.
+
+The preference applies to new placements and automatic move destinations. It does
+not relocate healthy copies solely to improve tag diversity. Explicit manual
+moves remain possible. Replica-count and environment edits preserve the policy
+in the versioned Compose specification. Status exposes `spreadTags`, and the app
+page shows when the preference is enabled.

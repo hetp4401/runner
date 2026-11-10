@@ -1,0 +1,29 @@
+# A normal fleet app. Set CONTROL_IMAGE and the controller's private environment.
+# This example maps fleet replicas 1..4 to voters 4..7; change the offset/count
+# to match your own CP_MEMBERS and the voters hosted outside the fleet.
+x-runner:
+  replicas: 4
+  spread-tags: true
+  port: 8920
+  ready: /readyz
+services:
+  controller:
+    image: ${CONTROL_IMAGE}
+    env_file: .env
+    environment:
+      CP_NODE_ID_OFFSET: "3"
+      CP_WARM_REPLACEMENT: "1"
+    ports: ["8920:8920"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - identity:/data
+    tmpfs:
+      - /run/runner:uid=1000,gid=1000,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  identity:

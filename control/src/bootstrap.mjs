@@ -3,6 +3,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { join } from "node:path";
 import { Control } from "./index.js";
 import { LocalStore } from "./local-store.mjs";
+import { replicaCount } from "./ha/config.mjs";
 
 const IDENTITY_KEYS = ["ADMIN_PASSWORD", "JOIN_TOKEN", "STATE_SIGNING_KEY"];
 const NAMESPACE_KEYS = ["TUNNEL_PREFIX", "CONTROLLER_TUNNEL_NAME"];
@@ -61,6 +62,13 @@ function saveIdentity(env, saved) {
 
 export function settings(input) {
   const env = { ...input };
+  env.CP_REPLICAS = String(replicaCount(env.CP_REPLICAS ?? "1"));
+  // Stable replica numbers let this controller run as an ordinary fleet app.
+  if (env.CP_REPLICAS !== '1' && !env.CP_NODE_ID && env.CP_NODE_ID_OFFSET !== undefined) {
+    const offset = Number(env.CP_NODE_ID_OFFSET), replica = Number(env.FLEET_REPLICA);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(replica) || replica < 1) throw new Error('CP_NODE_ID_OFFSET requires a nonnegative offset and FLEET_REPLICA');
+    env.CP_NODE_ID = String(offset + replica);
+  }
   env.DOMAIN = hostname(env.DOMAIN, "DOMAIN");
   env.CONTROL_HOST = hostname(env.CONTROL_HOST || `runners.${env.DOMAIN}`, "CONTROL_HOST");
   if (!env.CONTROL_HOST.endsWith(`.${env.DOMAIN}`)) throw new Error("CONTROL_HOST must be a subdomain of DOMAIN");

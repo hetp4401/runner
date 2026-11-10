@@ -1,6 +1,6 @@
 # Control plane module
 
-The control plane accepts app definitions, schedules their replicas across connected agents, manages public DNS and tunnels, and exposes the dashboard and API. Run one controller per fleet.
+The control plane accepts app definitions, schedules their replicas across connected agents, manages public DNS and tunnels, and exposes the dashboard and API. Run one controller, or an explicitly configured odd-sized Raft cluster with one active primary. See [control replication](../docs/control-replication.md).
 
 Every public app automatically gets a global hostname and a hostname for each replica. The dashboard uses the global URL as the main link and retains numbered replica links. See [public addresses](../docs/public-addresses.md) for failover and upgrades.
 

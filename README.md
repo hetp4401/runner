@@ -250,3 +250,7 @@ The Docker setup uses a persistent data volume and private `.env` configuration.
 - **More servers:** start tagged agents through your provider automation or the required-tag join command. The CP schedules onto servers that connect; it never fills a target or retires extra healthy servers.
 - **Another provider or account:** assign a distinct `SERVER_TAG`, supply its servers externally and reuse the fleet join token. Tags group observed machines without pre-registering a capacity or quantity.
 - **The join token only joins.** A machine started for a slot that's live gets that slot only if the control plane asked for a machine there (a handover's replacement, or a claimed start); otherwise it's given a free slot instead, so the token alone can't take over a live machine's tunnel.
+
+### Replicated control plane
+
+Use `CP_REPLICAS=1` for the ordinary single controller, or an odd number of at least three for Raft with one active primary. Fleet replicas run as a normal app, including ordinary health checks and moves. See [replication, persistence and recovery](docs/control-replication.md) and the [example app](examples/control-replicas/compose.yaml). Apps can opt into best-effort tag diversity with `x-runner.spread-tags: true`.

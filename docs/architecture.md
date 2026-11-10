@@ -1,6 +1,6 @@
 # Architecture
 
-Runners is a web app and API backed by one controller and a fleet of Linux agents.
+Runners is a web app and API backed by one active controller and a fleet of Linux agents. The controller can run alone or as the elected primary of a [replicated cluster](control-replication.md).
 The controller can run in Docker on a Linux server or on a Mac through Colima.
 Application containers run on the agent hosts.
 
@@ -60,7 +60,7 @@ waits for agent reports before scheduling. Receipts recover observations; they
 cannot reconstruct missing app source, password hashes or application secrets.
 The default recovery hold is three minutes.
 
-Run exactly one controller for a fleet. A local volume lock cannot fence another
+In single-controller mode, run exactly one controller for a fleet. Replicated mode uses Raft quorum checks and D1 fencing instead; see [control replication](control-replication.md). A local volume lock cannot fence another
 computer or another volume. Before migration, disable the old scheduler and its
 automatic startup, preserve the public origin, join token, signing key and tunnel
 namespace, and use the same D1 database (or transfer the stopped SQLite files for local storage). Never initialize a new empty

@@ -1,0 +1,142 @@
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { fork, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { ClusterDatabase } from '../src/ha/database.mjs';
+import { D1Store } from '../src/d1-store.mjs';
+import { PlanAuthority } from '../../agent/runtime.mjs';
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const root = await mkdtemp(tmpdir() + '/runner-ha-');
+const fixture = fork(new URL('./d1-fixture.mjs', import.meta.url), { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+const [{ port: d1Port }] = await once(fixture, 'message');
+const listen = async server => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return server.address().port; };
+const freePort = async () => { const server = http.createServer(); const port = await listen(server); await new Promise(resolve => server.close(resolve)); return port; };
+const cloudflare = http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({ success: true, result: [], result_info: { total_pages: 1 } }));
+});
+const cfPort = await listen(cloudflare), members = [], endpoints = new Map(), proxies = [], processes = new Map(), logs = new Map();
+let isolated = new Set(), checks = 0;
+const check = (name, fn) => { fn(); checks++; console.log('ok ' + name); };
+for (let id = 1; id <= 7; id++) {
+  const proxy = http.createServer((req, res) => {
+    const from = Number(req.headers['x-cp-from']);
+    if (from && isolated.size && isolated.has(from) !== isolated.has(id)) { res.writeHead(503); return res.end(); }
+    const outgoing = http.request('http://127.0.0.1:' + endpoints.get(id) + req.url,
+      { method: req.method, headers: req.headers }, incoming => { res.writeHead(incoming.statusCode, incoming.headers); incoming.pipe(res); });
+    outgoing.on('error', () => { if (!res.headersSent) res.writeHead(503); res.end(); }); req.pipe(outgoing);
+  });
+  proxies.push(proxy);
+  members.push({ id, url: 'http://127.0.0.1:' + await listen(proxy), label: 'Replica ' + id });
+}
+const env = { ...process.env, CONFIG_STORAGE: 'd1', ACCOUNT_ID: 'test', D1_DATABASE_ID: 'test',
+  D1_API_KEY: 'test-global-key', D1_API_EMAIL: 'test@example.com', D1_API_BASE: 'http://127.0.0.1:' + d1Port,
+  CONTROL_HOST: 'runners.test.example', DOMAIN: 'test.example', ZONE: 'test', CF_API_TOKEN: 'test-token',
+  CF_API_BASE: 'http://127.0.0.1:' + cfPort, DNS: 'off', AUTO_TUNNEL: '0', BIND_HOST: '127.0.0.1',
+  CP_REPLICAS: '7', CP_CLUSTER_ID: 'test-cluster-generation', CP_CLUSTER_TOKEN: 'test-cluster-token-at-least-32-characters',
+  CP_MEMBERS: JSON.stringify(members), CP_RAFT_BINARY: '/tmp/runners-raft-test',
+  CP_RAFT_TICK_MS: '100', CP_RAFT_ELECTION_TICKS: '12', CP_RAFT_HEARTBEAT_TICKS: '2',
+  STATE_SIGNING_KEY: 'test-signing-key', JOIN_TOKEN: 'test-join-token', ADMIN_PASSWORD: 'test-admin',
+  RECOVERY_MS: '0', QUIET_MS: '0', CP_WARM_REPLACEMENT: '1' };
+const db = new ClusterDatabase(env);
+await db.query([{ sql: 'INSERT INTO cp_cluster VALUES(1,?,?,?,0)', params: [env.CP_CLUSTER_ID, 7, env.CP_MEMBERS] },
+  { sql: "INSERT INTO cp_authority VALUES(1,0,'',0,0,0,0)", params: [] }]);
+async function start(id, name = String(id)) {
+  const port = await freePort(), raftPort = await freePort(), childPort = await freePort();
+  const child = spawn(process.execPath, [new URL('../ha-server.mjs', import.meta.url).pathname], {
+    env: { ...env, PORT: String(port), CP_RAFT_PORT: String(raftPort), CP_CHILD_PORT: String(childPort),
+      CP_NODE_ID: String(id), DATA_DIR: root + '/' + name }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  logs.set(name, ''); for (const stream of [child.stdout, child.stderr]) stream.on('data', data => logs.set(name, (logs.get(name) + data).slice(-6000)));
+  child.exited = new Promise(resolve => child.once('exit', resolve));
+  const instance = { id, port, child, name }; processes.set(name, instance);
+  if (name === String(id)) endpoints.set(id, port);
+  return instance;
+}
+async function stop(name) {
+  const process = processes.get(String(name)); if (!process) return;
+  processes.delete(String(name)); process.child.kill('SIGTERM');
+  const timer = setTimeout(() => process.child.kill('SIGKILL'), 15_000);
+  await process.child.exited; clearTimeout(timer);
+}
+async function request(id, path, init = {}) {
+  const url = typeof id === 'number' ? members.find(m => m.id === id).url : 'http://127.0.0.1:' + id.port;
+  try {
+    const response = await fetch(url + path, { signal: AbortSignal.timeout(8000), ...init,
+      headers: { 'x-cp-token': env.CP_CLUSTER_TOKEN, 'content-type': 'application/json', ...init.headers } });
+    return { status: response.status, body: await response.json() };
+  } catch { return { status: 0 }; }
+}
+async function until(fn, timeout = 25_000) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) { const value = await fn(); if (value) return value; await sleep(150); }
+  throw new Error('timed out waiting for replica condition');
+}
+const views = async () => (await Promise.all(members.map(m => request(m.id, '/_cp/status')))).filter(r => r.status === 200).map(r => r.body);
+const primary = () => until(async () => { const leaders = (await views()).filter(v => v.primary); return leaders.length === 1 && leaders[0]; });
+let staleStore;
+try {
+  for (let id = 1; id <= 7; id++) await start(id);
+  await until(async () => (await views()).filter(v => v.raft?.leader).length === 7);
+  const staged = await views();
+  check('staged replicas elect but do not start a scheduler before activation', () => assert.equal(staged.some(v => v.primary || v.authority), false));
+  await db.query('UPDATE cp_cluster SET active=1 WHERE id=1');
+  const first = await primary();
+  check('activation starts exactly one primary scheduler', () => assert.ok(first.authority?.epoch >= 1));
+  const follower = members.find(m => m.id !== first.id).id;
+  const dashboard = await request(follower, '/api/status');
+  check('a standby forwards the regular dashboard to the primary', () => assert.equal(dashboard.status, 200));
+  const insight = await request(follower, '/api/cluster');
+  check('every replica exposes the complete membership and recent transitions', () => {
+    assert.equal(insight.body.replicas.length, 7); assert.equal(insight.body.quorum, 4); assert.ok(insight.body.transitions.length);
+  });
+  const created = await request(first.id, '/api/projects/example', { method: 'PUT',
+    headers: { 'x-admin-password': env.ADMIN_PASSWORD }, body: JSON.stringify({ compose: 'services:\n  app:\n    image: nginx\n', replicas: 1 }) });
+  check('the active primary can commit application configuration to D1', () => assert.equal(created.status, 200));
+  staleStore = new D1Store({ ...env, CP_HA_CHILD: '1', CP_HA_AUTHORITY: JSON.stringify(first.authority) });
+  const agentAuthority = new PlanAuthority(members.find(m => m.id === first.id).url, env.JOIN_TOKEN);
+  await agentAuthority.accept({ leadership: first.authority });
+  isolated = new Set([first.id, ...members.filter(m => m.id !== first.id).slice(0, 2).map(m => m.id)]);
+  const second = await until(async () => { const all = await views(); return all.find(v => !isolated.has(v.id) && v.primary && v.authority?.term > first.authority.term); });
+  const refused = await request(first.id, '/_cp/verify', { method: 'POST', body: JSON.stringify(first.authority) });
+  check('an isolated old scheduler refuses authority after a new election', () => assert.notEqual(refused.status, 200));
+  assert.throws(() => staleStore.mutate(() => staleStore.exec('INSERT INTO projects VALUES(?,?,?,?,?,?,?)', 'stale', 1, 1, 1, null, Date.now(), 1)));
+  const stale = await db.query("SELECT name FROM projects WHERE name='stale'");
+  check('D1 atomically rejects stale-leader writes even at the correct config revision', () => assert.equal(stale.length, 0));
+  agentAuthority.url = members.find(m => m.id === second.id).url;
+  await assert.rejects(agentAuthority.accept({ leadership: first.authority }));
+  await agentAuthority.accept({ leadership: second.authority });
+  await assert.rejects(agentAuthority.accept({ leadership: first.authority }), /obsolete/);
+  await assert.rejects(agentAuthority.accept({}), /omitted/);
+  check('agents reject obsolete and missing leadership proofs', () => assert.equal(agentAuthority.current.epoch, second.authority.epoch));
+  isolated = new Set();
+  await until(async () => (await views()).every(v => v.raft?.leader === second.id));
+  const replace = second.id;
+  const warm = await start(replace, 'replacement');
+  await until(async () => (await request(warm, '/readyz')).body?.replacementWaiting);
+  const warmView = await request(warm, '/_cp/status');
+  check('an ordinary app replacement becomes ready without duplicating its predecessor vote', () => {
+    assert.equal(warmView.body.raft, null); assert.equal(warmView.body.primary, false);
+  });
+  await stop(replace); endpoints.set(replace, warm.port);
+  const afterMove = await primary();
+  await until(async () => (await request(replace, '/_cp/status')).body?.raft?.leader === afterMove.id);
+  check('moving a primary transfers leadership and lets the replacement take its released vote', () => {
+    assert.ok(processes.has('replacement')); assert.notEqual(afterMove.id, replace);
+  });
+  for (const id of [4, 5, 6, 7]) await stop(id === replace ? 'replacement' : id);
+  await sleep(3000);
+  const blocked = await Promise.all([1, 2, 3].map(id => request(id, '/_cp/verify')));
+  check('three surviving Mac-side voters cannot authorize control changes', () => assert.ok(blocked.every(r => r.status !== 200)));
+  console.log(checks + ' HA service checks passed');
+} catch (error) {
+  for (const [name, log] of logs) console.error('replica ' + name + ': ' + log);
+  throw error;
+} finally {
+  staleStore?.close();
+  await Promise.all([...processes.keys()].map(stop));
+  for (const server of [...proxies, cloudflare]) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+  fixture.kill('SIGTERM'); await rm(root, { recursive: true, force: true });
+}

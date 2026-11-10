@@ -43,6 +43,7 @@ export class D1Store extends LocalStore {
     this.dirty = new Set();
     this.commits = 0;
     this.origin = env.CONTROL_HOST;
+    this.authority = env.CP_HA_CHILD === '1' ? JSON.parse(env.CP_HA_AUTHORITY) : null;
     try {
       this.client = options.client || new D1Client(env);
       const meta = metadata(this.client);
@@ -83,6 +84,11 @@ export class D1Store extends LocalStore {
     }
     if (batch.length) {
       const id = randomUUID();
+      if (this.authority) {
+        const a = this.authority;
+        batch.unshift({ sql: "SELECT CASE WHEN EXISTS(SELECT 1 FROM cp_authority WHERE id=1 AND node_id=? AND boot=? AND term=? AND epoch=? AND expires>unixepoch()) AND EXISTS(SELECT 1 FROM cp_cluster WHERE id=1 AND cluster_id=? AND active=1) THEN 1 ELSE json('obsolete leader') END AS allowed",
+          params: [a.node, a.boot, a.term, a.epoch, a.cluster] });
+      }
       // REST batches are atomic. A stale revision rejects the entire edit.
       batch.unshift({ sql: "SELECT CASE WHEN EXISTS (SELECT 1 FROM runner_meta WHERE id=1 AND ready=1 AND origin=? AND revision=?) THEN 1 ELSE json('configuration revision conflict') END AS allowed", params: [this.origin, this.revision] });
       batch.push({ sql: "UPDATE runner_meta SET revision=revision+1,commit_id=? WHERE id=1", params: [id] });

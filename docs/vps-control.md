@@ -30,7 +30,7 @@ docker compose restart control
 
 Adjust the URLs for your domain and `CONTROL_PORT`. `/healthz` reports HTTP liveness and tunnel discovery. Docker health also checks the bundled tunnel's readiness when enabled. A fresh controller holds scheduling while it rediscovers its tunnels and collects agent receipts; running agents keep serving approved workloads.
 
-Only one controller may schedule a fleet. The Docker entrypoint takes an operating-system lock when sharing a volume; copied volumes on different hosts cannot protect each other. Stop the original controller before starting a migrated copy.
+Only one primary may schedule a fleet. A standalone deployment must run one scheduler; [replicated mode](control-replication.md) explicitly coordinates multiple copies. The Docker entrypoint takes an operating-system lock when sharing a volume; copied volumes on different hosts cannot protect each other. Stop the original controller before starting a migrated copy.
 
 ## Upgrade
 

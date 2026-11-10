@@ -280,6 +280,7 @@
       <a href="#/activity" data-nav="activity"><i aria-hidden="true">↻</i>Activity</a>
       <a href="#/metrics" data-nav="metrics"><i aria-hidden="true">∿</i>Metrics</a>
       <a href="#/fleet" data-nav="fleet"><i aria-hidden="true">⚙</i>Fleet</a>
+      <a href="/cluster" id="cp-cluster-link" hidden><i aria-hidden="true">◉</i>Replicas</a>
     </nav>
     <div class="spacer"></div>
     <span id="summary" role="status" aria-live="polite"></span>
@@ -1888,7 +1889,7 @@ function vApp(name, q = new URLSearchParams()) {
       }
       document.title = `${name} · Runners`;
       setHtml($("#ad-head"), `<div class="row"><h1 class="grow">${esc(name)}</h1>${appPill(p, runs)}</div>
-        <div class="sub">v${p.version} · ${p.port ? `port ${p.port}` : "no port"}${p.region ? ` · region ${esc(p.region)}` : p.regions?.length ? ` · regions ${p.regions.map(esc).join(" / ")}` : ""} · updated ${ago(S.status.now - p.updated)} ago · ${p.files.length ? "built from files" : "published images"}</div>
+        <div class="sub">v${p.version} · ${p.port ? `port ${p.port}` : "no port"}${p.region ? ` · region ${esc(p.region)}` : p.regions?.length ? ` · regions ${p.regions.map(esc).join(" / ")}` : ""}${p.spreadTags ? " · spread across tags" : ""} · updated ${ago(S.status.now - p.updated)} ago · ${p.files.length ? "built from files" : "published images"}</div>
         ${p.port ? `<div class="url" style="margin-top:4px">${appUrls(p, true)}${!p.enabled ? ` <span class="meta">Disabled: its URLs become available when enabled again.</span>` : ""}</div>` : ""}
         <div class="actions"><a class="btn primary" href="#/apps/${enc(name)}/edit">Edit</a>
           <button type="button" data-act="${p.enabled ? "disable" : "enable"}">${p.enabled ? "Disable" : "Enable"}</button>
@@ -2107,7 +2108,7 @@ function vEditor(name, sample) {
         <p class="hint" id="ed-fields-hint">Port: what the app listens on (or <code>x-runner.port</code> in the compose file); without one the app has no URL. Replicas: 1–${MAX_REPLICAS} (default 1), spread over the servers with the most room; more replicas than servers means some servers run two or more.</p>
         <label class="f" for="ed-compose">Docker Compose</label>
         <textarea id="ed-compose" spellcheck="false" placeholder="services:&#10;  web:&#10;    image: nginx:latest&#10;    ports: [&quot;8080:80&quot;]&#10;    restart: unless-stopped"></textarea>
-        <p class="hint">Optional with a Dockerfile: then one service is made that builds it and publishes the port. Set <code>x-runner.region</code> to keep all replicas in one region, or <code>x-runner.regions: [us-west, us-central, us-east]</code> to assign a region to each replica as servers are replaced.</p>
+        <p class="hint">Optional with a Dockerfile: then one service is made that builds it and publishes the port. Set <code>x-runner.region</code> to keep all replicas in one region, or <code>x-runner.regions: [us-west, us-central, us-east]</code> to assign a region to each replica as servers are replaced. Set <code>x-runner.spread-tags: true</code> to prefer different machine tags for replicas when capacity allows.</p>
         <label class="f" for="ed-dockerfile">Dockerfile</label>
         <textarea id="ed-dockerfile" spellcheck="false" placeholder="FROM node:22-alpine&#10;WORKDIR /app&#10;COPY . .&#10;CMD [&quot;node&quot;, &quot;server.js&quot;]"></textarea>
         <label class="f">Other files</label>
@@ -2473,6 +2474,8 @@ function vGuide() {
         <li><b>App password</b> (optional): ${privateDeploys ? "leave it empty to require the admin password for changes" : "leave it empty and anyone can change or remove the app"}; with one, changing it needs that app password (or the admin password). If it's lost, the fleet's owner can set a new one with the admin password.</li>
         <li><b>Deploy.</b> ${privateDeploys ? "Enter the admin password when asked. " : ""}The app's page shows each replica come up, and every server's error if one fails.</li></ol>
       <p class="hint">Roll back from the app's Versions list: <b>Roll back</b> deploys that version's files again (it becomes the newest version) and keeps the replica count. The app's page also sets or changes an app's password.</p>
+      <h3>Spread replicas across machine tags</h3>
+      <p>Set <code>x-runner.spread-tags: true</code> to prefer placing replicas on machines with different origin tags. This is optional and best effort: a single available tag still runs every replica, and region, health and capacity requirements take priority. Existing healthy copies are kept in place; the preference applies to new placements and replacement destinations.</p>
       <h3>Keep an app in a region</h3>
       <p>Set <code>x-runner.region</code> to <code>us-west</code>, <code>us-central</code> or <code>us-east</code>. All replicas stay in that broad region while individual servers come and go. Leaving servers are excluded, and servers with at least 30 minutes before their scheduled departure are preferred. If the region has no usable server, the app waits there; its page explains why. Apps with no region use the whole fleet.</p>
       ${codebox("x-runner:\n  port: 8080\n  replicas: 3\n  region: us-west\nservices:\n  web:\n    image: traefik/whoami\n    command: [\"--port\", \"8080\"]\n    ports: [\"8080:8080\"]\n")}
@@ -2551,6 +2554,8 @@ function renderChrome() {
   const n = items.filter((x) => x.kind === "failed" || x.kind === "gone").length;
   const pending = items.filter((x) => x.kind === "deploying").length;
   const cp = S.status.controlPlane;
+  const clusterLink = $("#cp-cluster-link");
+  if (clusterLink) clusterLink.hidden = !cp?.replicas;
   const controller = cp ? `<span class="long" title="The active fleet controller">${cp.owner === "vps" ? `${esc(cp.name || "VPS")} controller` : cp.owner === "mac" ? `Mac controller${cp.runtime === "docker" ? " (Docker)" : ""}` : cp.mode === "hybrid-v2" ? "Cloudflare fallback" : "Cloudflare controller"} · </span>` : "";
   setHtml($("#summary"), `${controller}${pill(n ? "failed" : pending ? "deploying" : "healthy", `${upCount()} up${n ? ` · ${plural(n, "problem")}` : pending ? ` · ${pending} pending` : ""}`)}`);
 }

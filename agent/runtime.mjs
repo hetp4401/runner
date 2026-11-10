@@ -351,3 +351,29 @@ export async function validateBindSources(root, sources = []) {
     }
   } finally { await top.close(); }
 }
+// Remember the newest accepted leader across agent restarts. A fresh check
+// against the stable control origin fences plans received on obsolete sockets.
+export class PlanAuthority {
+  constructor(url, token, current = null) { Object.assign(this, { url, token, current }); }
+  async accept(plan) {
+    const next = plan?.leadership;
+    if (!next) {
+      if (this.current) throw new Error('controller omitted required leadership proof');
+      return;
+    }
+    if (!Number.isSafeInteger(next.epoch) || next.epoch < 1 || !Number.isSafeInteger(next.term) ||
+        typeof next.cluster !== 'string' || typeof next.boot !== 'string') throw new Error('invalid leadership proof');
+    if (this.current && (next.cluster !== this.current.cluster || next.epoch < this.current.epoch ||
+        (next.epoch === this.current.epoch && ['node', 'boot', 'term'].some(key => next[key] !== this.current[key])))) {
+      throw new Error('obsolete leadership proof');
+    }
+    const response = await fetch(this.url + '/api/leadership/verify', {
+      method: 'POST', headers: { authorization: 'Bearer ' + this.token, 'content-type': 'application/json' },
+      body: JSON.stringify(next), signal: AbortSignal.timeout(7000),
+    });
+    if (!response.ok) throw new Error('controller cannot confirm current leadership');
+    const confirmed = await response.json();
+    if (['cluster', 'node', 'boot', 'term', 'epoch'].some(key => confirmed[key] !== next[key])) throw new Error('leadership changed during plan verification');
+    this.current = { ...next };
+  }
+}

@@ -301,6 +301,7 @@ function keysOn(replicas, name) {
 //                    copy that isn't ready is never restarted for it (only a copy that stops answering at all is)
 //   region: us-west  keep placements and moves in a broad region while individual VMs are replaced
 //   regions: [...]   assign replica 1 to the first region, replica 2 to the next, repeating as needed
+//   spread-tags: true prefer different machine origin tags, without requiring them
 // Every app is treated alike otherwise: a move starts the new copy and drops the old one only once the new one works.
 function policyOf(compose) {
   let xr = {};
@@ -310,8 +311,9 @@ function policyOf(compose) {
   if (!isMap(xr)) xr = {};
   return {
     ready: typeof xr.ready === "string" ? xr.ready : null,
-    region: typeof xr.region === "string" && Object.hasOwn(REGIONS, xr.region) ? xr.region : null,
-    regions: Array.isArray(xr.regions) ? xr.regions.filter((r) => typeof r === "string" && Object.hasOwn(REGIONS, r)) : [],
+    spreadTags: xr["spread-tags"] === true,
+    region: validRegion(xr.region) ? xr.region : null,
+    regions: Array.isArray(xr.regions) ? xr.regions.filter(validRegion) : [],
   };
 }
 
@@ -477,6 +479,7 @@ function buildSpec(body, { trusted = false } = {}) {
     throw new HttpError(400, `x-runner.regions must be a nonempty list of up to ${MAX_REPLICAS} region labels`);
   }
   if (xr.region != null && xr.regions != null) throw new HttpError(400, "set x-runner.region or x-runner.regions, not both");
+  if (Object.hasOwn(xr, "spread-tags") && typeof xr["spread-tags"] !== "boolean") throw new HttpError(400, "x-runner.spread-tags must be true or false");
   if (!trusted) {
     // Checked as compose reads it: with YAML merge keys (<<) applied.
     const merged = YAML.parse(compose, { merge: true });
@@ -1154,6 +1157,7 @@ export class Control {
       replicas: latest?.replicas ?? 1,
       region: latest?.policy.region ?? null,
       regions: latest?.policy.regions ?? [],
+      spreadTags: latest?.policy.spreadTags === true,
       placed, // each replica's machine, by replica number; a copy being moved away (leaving) comes after its new copy
       staying,
       blocked: this.blocked.get(p.name) ?? null, // why a replica has no machine, when it's a clash rather than a shortage
@@ -1916,7 +1920,7 @@ export class Control {
   // outside its region are excluded too. Machines near their scheduled departure or hard deadline (under 30 minutes
   // left), or hot (over HOT_CPU / HOT_MEM on their last 3 minutes), are
   // passed over unless nothing else is left. Then: ready first, fewest copies of the app on the machine (a second copy
-  // only where every machine has one), then in its pool, then machines with room (under ROOM_CPU / ROOM_MEM) before
+  // only where every machine has one), then in its tag when spread-tags is enabled, then machines with room before
   // busy ones, fewest copies placed, most room.
   bestMachine(name, up, counts, now, replica = 1) {
     const p = this.projects.get(name);
@@ -1924,8 +1928,16 @@ export class Control {
     const region = regionForReplica(spec?.policy, replica);
     const mine = new Map(); // machine -> copies of this app there (ones moving away included: their ports are still in use)
     for (const x of this.copiesOf(name)) mine.set(x.machine, (mine.get(x.machine) ?? 0) + 1);
-    const inPool = new Map(); // pool -> staying copies of this app there
-    for (const x of this.copiesOf(name)) if (!x.leaving) inPool.set(this.poolOf(x.machine, up), (inPool.get(this.poolOf(x.machine, up)) ?? 0) + 1);
+    const inTag = new Map(); // tag -> distinct other replicas, only for opted-in apps
+    const live = spec?.policy.spreadTags ? this.liveMachines(now) : null;
+    if (spec?.policy.spreadTags) for (const x of this.copiesOf(name)) {
+      if (x.leaving || x.replica === replica) continue;
+      const run = up.get(x.machine) || live.get(x.machine);
+      if (!run) continue;
+      const tag = run.pool || "standalone";
+      if (!inTag.has(tag)) inTag.set(tag, new Set());
+      inTag.get(tag).add(x.replica);
+    }
     const runsOnSlot = new Map();
     for (const r of this.liveRuns(now)) runsOnSlot.set(r.machine, (runsOnSlot.get(r.machine) ?? 0) + 1);
     const starting = this.startingCounts(up);
@@ -1939,11 +1951,11 @@ export class Control {
       if ((starting.get(r.machine) ?? 0) >= MAX_STARTING_COPIES) continue;
       const due = this.dueAt(r);
       if (due && now >= due) continue;
-      const pool = this.poolOf(r.machine, up);
+      const tag = r.pool || "standalone";
       const room = this.headroom(r.machine, now);
       const placed = counts.get(r.machine) ?? 0;
       cands.push({
-        machine: r.machine, ready: r.ready, doubling, pool: inPool.get(pool) ?? 0, placed, h: room.h, roomy: room.h > 0,
+        machine: r.machine, ready: r.ready, doubling, tagCopies: inTag.get(tag)?.size ?? 0, placed, h: room.h, roomy: room.h > 0,
         lifeOk: Math.min(r.deadline ?? Infinity, due ?? Infinity) - now >= 30 * MIN, hot: room.cpu > HOT_CPU || room.mem > HOT_MEM,
         reason: `${room.measured ? `cpu ${Math.round(room.cpu)}%, memory ${Math.round(room.mem)}%` : "no metrics yet"}, ${placed} other ${placed === 1 ? "copy" : "copies"} placed`,
       });
@@ -1951,7 +1963,7 @@ export class Control {
     let list = cands.filter((c) => c.lifeOk && !c.hot);
     if (!list.length) list = cands.filter((c) => c.lifeOk);
     if (!list.length) list = cands;
-    return list.sort((a, b) => b.ready - a.ready || a.doubling - b.doubling || a.pool - b.pool || b.roomy - a.roomy || a.placed - b.placed || b.h - a.h)[0] ?? null;
+    return list.sort((a, b) => b.ready - a.ready || a.doubling - b.doubling || a.tagCopies - b.tagCopies || b.roomy - a.roomy || a.placed - b.placed || b.h - a.h)[0] ?? null;
   }
 
   liveMachines(now) {

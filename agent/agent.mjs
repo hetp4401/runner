@@ -24,7 +24,7 @@ import { availableParallelism } from "node:os";
 import { resolve } from "node:path";
 import { startMetrics } from "./metrics.mjs";
 import { ControlLink } from "./control-link.mjs";
-import { namespace, projectName, fingerprint, resumeState, resolveServerTag, appRoutes, PublicTunnels, ownsCompose, ownsInfrastructure, containerHealth,
+import { namespace, projectName, fingerprint, resumeState, resolveServerTag, appRoutes, PublicTunnels, PlanAuthority, ownsCompose, ownsInfrastructure, containerHealth,
   privateDirectory, stageDeployment, writeDataFiles, bindLayout, validateBindSources, cacheAgentBundle, downloadAgentBundle, OWNER_LABEL, COPY_LABEL } from "./runtime.mjs";
 
 const env = process.env;
@@ -34,6 +34,7 @@ const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(
 let saved = null;
 try { saved = JSON.parse(await readFile(`${base}/agent-state.json`, "utf8")); } catch (error) { if (error.code !== "ENOENT") throw new Error("cannot read the saved agent inventory; restore it before restarting"); }
 const resumed = resumeState(saved, bootId, env.CONTROL_URL, Date.now(), env.RUNNER_INSTALL_REVISION);
+const planAuthority = new PlanAuthority(env.CONTROL_URL, env.JOIN_TOKEN, saved?.leadership || null);
 const tag = resolveServerTag(env, saved);
 const pool = tag === "standalone" ? null : tag;
 const started = resumed.started;
@@ -133,7 +134,7 @@ let stateWrites = Promise.resolve();
 function saveState() {
   const data = JSON.stringify({ v: 2, bootId, control: env.CONTROL_URL, started, machine, tunnelToken, agent, run, previousRun, restartRequested, wasReady,
     installedRevision: env.RUNNER_INSTALL_REVISION || saved?.installedRevision, domain, tag,
-    recovery, desired: cachedDesired, publicTunnels: cachedPublicTunnels, projects: [...projects], metrics: metrics.history() });
+    recovery, leadership: planAuthority.current, desired: cachedDesired, publicTunnels: cachedPublicTunnels, projects: [...projects], metrics: metrics.history() });
   stateWrites = stateWrites.catch(() => {}).then(async () => {
     const path = `${base}/agent-state.json`;
     const temporary = `${path}.${randomUUID()}.tmp`;
@@ -279,7 +280,10 @@ async function remove(name) {
   try {
     const containers = await ownedContainers(name, p);
     if (containers.length) {
-      const removed = await sh("docker", ["rm", "-f", ...containers.map((c) => c.Id)]);
+      // Every app gets its configured Docker stop signal and grace period.
+      const running = containers.filter(c => c.State?.Running).map(c => c.Id);
+      if (running.length && !(await sh("docker", ["stop", ...running])).ok) throw new Error("could not stop the application's containers cleanly");
+      const removed = await sh("docker", ["rm", ...containers.map((c) => c.Id)]);
       if (!removed.ok) throw new Error("could not remove this application's Docker containers");
     }
     await removeDir(`${dir}/${name}`);
@@ -775,7 +779,10 @@ async function main() {
     let plan = null;
     try {
       plan = await sync();
+      await planAuthority.accept(plan);
+      if (plan?.leadership) await saveState();
     } catch (e) {
+      plan = null;
       log(`control plane unreachable (${e.message}); keeping what's running`);
     }
     if (plan?.retire && !plan.hold) return shutdown("a newer run of this machine is healthy, so this one is leaving");
