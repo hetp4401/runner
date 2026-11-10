@@ -51,8 +51,7 @@ Initialization creates `control.db` and private fleet identity in the `control-d
 
 Open `https://runners.example.com`, replacing the domain. The bundled connector exposes the controller and its WebSocket API. The full sequence, including a first app deployment, is in [self-hosting](../docs/self-hosting.md).
 
-The current Mac deployment uses [Cloudflare D1 configuration storage](../docs/d1-storage.md).
-Initialize new fleets locally first, then migrate before selecting D1.
+Local SQLite is the default for a standalone controller. [Cloudflare D1 configuration storage](../docs/d1-storage.md) is optional for standalone deployments and required for shared app configuration in replicated mode. Initialize new fleets locally first, then migrate before selecting D1.
 
 ## Configuration
 
@@ -74,7 +73,7 @@ The Docker package reads `.env` through the root [Compose file](../compose.yaml)
 | `PUBLIC_URL` | Controller's public origin; defaults to `https://<CONTROL_HOST>`. Set it explicitly with your own proxy. |
 | `CONTROL_PORT` | Host-side loopback port in Compose; defaults to `8920`. |
 | `CONTROL_ENV_FILE` | Host-side path to a private environment file; Compose defaults to `.env`. |
-| `CONTROLLER_KIND`, `CONTROLLER_NAME` | Host identity in status/dashboard; use `mac` and your host name on macOS. |
+| `CONTROLLER_KIND`, `CONTROLLER_NAME` | Optional host kind and display name. Defaults are `self-hosted` and the controller hostname; no provider is inferred. |
 | `CONTROLLER_RUNTIME` | Reported execution runtime; the Docker image sets `docker`, the native launcher sets `native`. |
 | `CONTROLLER_TUNNEL_NAME` | Existing controller tunnel name when migrating. Preserve alongside `TUNNEL_PREFIX`. |
 | `CLIENT_IP_HEADER` | Forwarded client address header; defaults to `cf-connecting-ip`. |
@@ -101,7 +100,7 @@ docker compose up -d
 
 Adjust the local URL if you changed `CONTROL_PORT`. `/healthz` confirms HTTP liveness and reports `tunnelsReady`; Docker's health check also requires tunnel discovery and, with the bundled connector, a ready connection. Scheduling waits for recovery before placing workloads.
 
-Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to the selected store (D1 on the Mac deployment). Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
+Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to the selected store. Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
 
 ## Source and development
 

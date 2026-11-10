@@ -88,6 +88,11 @@ try {
     check("blank and misspelled native deployment policies fail during startup", () => {
       for (const value of ["", "tru", "yes"]) assert.throws(() => open(undefined, { REQUIRE_DEPLOY_AUTH: value }), /REQUIRE_DEPLOY_AUTH/);
     });
+    const missingFile = await request(control, "/api/projects/missingfile", { method: "PUT", admin: true,
+      body: { compose: 'services:\n  web:\n    build:\n      context: .\n      dockerfile: constructor\n', files: {} } });
+    check("inherited object properties cannot substitute for a supplied Dockerfile", () => {
+      assert.equal(missingFile.status, 400);
+    });
   }
 
   {

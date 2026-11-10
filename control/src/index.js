@@ -497,7 +497,7 @@ function buildSpec(body, { trusted = false } = {}) {
     if (/^[a-z][a-z0-9+.-]*:\/\//i.test(context) || context.startsWith("git@")) continue; // a git repo or URL
     const dockerfile = joinPath(context, String(build.dockerfile ?? "Dockerfile"));
     if (dockerfile === null) throw new HttpError(400, `service ${service} builds from outside the app's folder`);
-    if (!(dockerfile in files)) {
+    if (!Object.hasOwn(files, dockerfile)) {
       throw new HttpError(400, `service ${service} builds from ${dockerfile}, but no file with that path was sent`);
     }
   }

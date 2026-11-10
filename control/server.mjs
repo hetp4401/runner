@@ -144,9 +144,9 @@ const agentSockets = new Map();
 const status = control.status.bind(control);
 control.status = () => ({ ...status(), controlPlane: {
   ...(guard.enabled ? { replica: Number(env.CP_NODE_ID), replicas: Number(env.CP_REPLICAS), clusterView: '/#/fleet' } : {}),
-  mode: guard.enabled ? "raft" : env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : env.CONTROLLER_KIND === "mac" ? "native-v1" : "vps-v1",
+  mode: guard.enabled ? "raft" : env.CONTROLLER_RUNTIME === "docker" ? "docker-v1" : "native-v1",
   runtime: env.CONTROLLER_RUNTIME || "native",
-  owner: env.CONTROLLER_KIND || "vps", name: env.CONTROLLER_NAME || "VPS",
+  owner: env.CONTROLLER_KIND || "self-hosted", name: env.CONTROLLER_NAME || env.CONTROL_HOST || "Controller",
   configStorage: env.CONFIG_STORAGE === "d1" ? "cloudflare-d1" : "local-sqlite", enabled: true, agentsConnected: agentSockets.size,
   runtimeStorage: "memory", metricsHistoryMinutes: Number(env.MEMORY_HISTORY_MIN),
   tunnelStorage: "memory", tunnelsReady: control.tunnelsReady, tunnelsDiscovered: control.slots.size,
@@ -155,7 +155,9 @@ control.status = () => ({ ...status(), controlPlane: {
 } });
 const originalWake = control.wake.bind(control);
 function sendAgent(ws, message) {
-  ws.send(JSON.stringify(message));
+  if (ws.readyState !== ws.OPEN) return;
+  if (ws.bufferedAmount > 2_000_000) { ws.terminate(); return; }
+  ws.send(JSON.stringify(message), error => { if (error) ws.terminate(); });
   usage.agent.messagesOut++;
   if (message.type === "plan") usage.agent.plansOut++;
   else if (message.type === "wake") usage.agent.wakesOut++;
@@ -179,25 +181,38 @@ server.on("upgrade", (req, socket, head) => {
       if (!control.isJoinToken(req.headers.authorization)) return refuse(401);
       return wss.handleUpgrade(req, socket, head, (ws) => {
         usage.http.responsesOut++;
-        let run = null;
-        ws.on("message", async (raw) => {
+        let run = null, pendingReports = 0, reports = Promise.resolve();
+        ws.on("message", (raw) => {
           usage.agent.messagesIn++;
-          let message;
-          try {
-            if (sql.failed) throw new Error("configuration storage is unavailable");
-            message = JSON.parse(raw);
-            if (message.type !== "sync" || !Number.isSafeInteger(message.id)) throw new Error("invalid report");
-            usage.agent.syncIn++;
-            run = message.body?.run;
-            if (run) agentSockets.set(run, ws);
-            await guard.check();
-            control.setPace(Date.now());
-            const plan = control.sync(message.body, clientAddress(req, env));
-            const proof = await guard.check();
-            if (proof) plan.leadership = proof;
-            guard.report('report', message.body);
-            sendAgent(ws, { type: "plan", id: message.id, plan });
-          } catch (error) { if (ws.readyState === ws.OPEN) sendAgent(ws, { type: "error", id: message?.id, error: error.message }); }
+          if (pendingReports >= 8) { ws.close(1008, "too many pending reports"); return; }
+          pendingReports++;
+          // Preserve report order across asynchronous quorum checks and bound
+          // memory if a client sends faster than the controller can process.
+          reports = reports.then(async () => {
+            let message;
+            try {
+              if (ws.readyState !== ws.OPEN) return;
+              if (sql.failed) throw new Error("configuration storage is unavailable");
+              message = JSON.parse(raw);
+              if (!message || message.type !== "sync" || !Number.isSafeInteger(message.id) || message.id < 1 ||
+                  typeof message.body?.run !== "string" || !message.body.run || message.body.run.length > 200) throw new Error("invalid report");
+              if (run && message.body.run !== run) throw new Error("agent connection cannot change run identity");
+              usage.agent.syncIn++;
+              await guard.check();
+              if (ws.readyState !== ws.OPEN) return;
+              control.setPace(Date.now());
+              const plan = control.sync(message.body, clientAddress(req, env));
+              run = message.body.run;
+              const previous = agentSockets.get(run);
+              agentSockets.set(run, ws);
+              if (previous && previous !== ws) previous.close(1000, "agent reconnected");
+              const proof = await guard.check();
+              if (proof) plan.leadership = proof;
+              guard.report('report', message.body);
+              sendAgent(ws, { type: "plan", id: message.id, plan });
+            } catch (error) { if (ws.readyState === ws.OPEN) sendAgent(ws, { type: "error", id: message?.id, error: error.message }); }
+            finally { pendingReports--; }
+          });
         });
         ws.on("close", () => { if (agentSockets.get(run) === ws) agentSockets.delete(run); });
         ws.on("error", () => {});

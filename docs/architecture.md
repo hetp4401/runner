@@ -12,8 +12,8 @@ flowchart LR
     Tunnel --> CP[Node HTTP API and scheduler]
     CP --> RAM[(SQLite in RAM)]
   end
-  CP -->|configuration commits| D1[(Cloudflare D1)]
-  Providers[Provider adapters / GitHub workflows] --> Hosts[Linux agent hosts]
+  CP -->|configuration commits| Config[(Local SQLite or D1)]
+  Providers[Your compute / optional provider automation] --> Hosts[Linux agent hosts]
   Hosts <-->|outgoing authenticated WebSocket| CF
   Hosts --> Apps[Docker Compose apps]
   CF <-->|app tunnels| Apps
@@ -42,7 +42,7 @@ The [Mac runbook](mac-control.md) covers service operation and availability.
 ## State and recovery
 
 `control/src/d1-store.mjs` persists five configuration tables in Cloudflare D1 when
-`CONFIG_STORAGE=d1` (the active Mac deployment). `local-store.mjs` also supports
+`CONFIG_STORAGE=d1`. `local-store.mjs` also supports
 local SQLite for standalone installations. The tables are:
 `projects`, `versions`, `settings`, `app_passwords` and `app_env`. They contain the
 authoritative app definitions, source history, operator settings and secrets.
@@ -75,7 +75,7 @@ readiness and replacement capacity are distinct signals. Agents can continue
 serving approved workloads while the controller is unavailable.
 
 The controller accepts supplied capacity and the agent reports an origin tag.
-Neither contains GitHub account lists or desired machine counts. Provider
+Neither contains GitHub account lists, app-specific behavior or desired machine counts. Logical controller membership, machine tags, regions and source URLs are deployment configuration; there is no required Mac/fleet split. Provider
 adapters own those targets and create machines. GitHub's independent account
 schedules are documented in [provider adapters](providers.md).
 
@@ -95,3 +95,26 @@ Updating a controller image does not automatically restart all application
 containers. Agent upgrades are an explicit roll or provider job replacement;
 ordinary agent restarts use verified local code. See [controller](../control/README.md),
 [agent](../agent/README.md) and [tests](../control/test/README.md).
+
+## Connection and workload recovery boundaries
+
+Each agent WebSocket is bound to one validated run. Reports are processed in
+order, with at most eight queued requests per connection; a client that exceeds
+that limit reconnects. Invalid reports never count as connected agents, and a
+new valid connection replaces that run's previous socket. Slow receivers are
+disconnected before outgoing buffers grow without bound.
+
+Agents ignore unknown protocol extensions without losing their pending plan.
+Malformed replies close the connection and reject pending requests so the agent
+can reconnect while approved workloads keep running. A deployment waiting for a
+previous app to release its ports is checked against the latest accepted plan
+before it starts; cancelled work stays cancelled. Failed removals hold new work
+for another reconciliation attempt. Temporary state files are cleaned up after
+failed writes, while the previous complete inventory is retained.
+
+Ordinary app source updates still replace all copies together. Moving a replica
+waits for the replacement's readiness, but a source update is not a rolling
+release. Application data remains local to each host. For a replicated control
+plane, retain a quorum of live memory or use the explicit recovery procedure in
+[control replication](control-replication.md); an unavailable minority cannot
+bootstrap itself. Start with `CP_REPLICAS=1` when you do not need coordination.

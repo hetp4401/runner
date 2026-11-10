@@ -84,7 +84,7 @@ export ADMIN_PASSWORD='your-admin-password'
 bin/runnerctl roll
 ```
 
-An explicit roll verifies and stages a release before restarting. A failed download leaves the running release in place. Reinstall on each host to refresh the base image's Node and Docker tools as well as its agent code. A normal container restart uses its verified local code:
+For installed, managed agents without `START_CMD`, an explicit roll verifies and stages a release before restarting. A failed download leaves the running release in place. Agents with `START_CMD` instead ask their provider integration to start a replacement host; that integration must install the new release. Directly supervised agents must update their code through their supervisor. Reinstall on each host to refresh the base image's Node and Docker tools as well as its agent code. A normal container restart uses its verified local code:
 
 ```sh
 sudo docker restart runner-agent

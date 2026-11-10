@@ -13,6 +13,21 @@ The control plane runs in Docker on your server. Agents run on your Linux Docker
 
 Cloudflare documents the [Tunnel requirements and permissions](https://developers.cloudflare.com/tunnel/get-started/). A domain below your zone's apex needs certificate coverage for its replica subdomains; the apex-domain setup avoids needing an additional wildcard certificate.
 
+## Bring your own compute
+
+Use any mix of dedicated servers, cloud VMs and local Linux machines. Install one
+agent on each Docker host and give it your controller URL, join token, and a tag
+such as `lab`, `vps` or `standalone`. Use your own `REGION` labels for placement;
+`x-runner.spread-tags: true` can prefer different groups without requiring them.
+There is no required GitHub repository, account list, machine count or provider
+helper. External automation supplies machines; the controller schedules only the
+capacity that actually joins. Leave `LIFETIME_MIN` unset on permanent hosts.
+
+Cloudflare DNS and Tunnel are still required by the current networking layer.
+The default single controller uses local SQLite. Replication is optional and
+uses D1 for shared application configuration, with coordination in memory; see
+[replication and recovery](control-replication.md) before enabling it.
+
 ## Start a control plane
 
 Clone this repository and run these commands from its root:

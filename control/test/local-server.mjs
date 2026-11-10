@@ -120,6 +120,9 @@ try {
   const started = Date.now();
   const body = { agent: "test-agent", machine: agent.machine, run: "test-run", pool: "test", poolSize: 1, started, protocol: 2, ready: true, status: {}, metrics: { live: { t: started, h: { cpu: 5, memUsed: 100, memTotal: 1000 }, a: {} } } };
   await connect();
+  await assert.rejects(sync({ ...body, machine: 0, run: 'invalid-ghost' }));
+  assert.equal((await request('/status')).controlPlane.agentsConnected, 0);
+  console.log('ok invalid reports do not register ghost agent connections');
   const usageBeforeSync = await request("/usage");
   let plan = await sync(body);
   assert.equal(Object.keys(plan.desired).length, 2);
@@ -133,6 +136,18 @@ try {
   assert.equal(usageAfterSync.agent.plansOut - usageBeforeSync.agent.plansOut, 2);
   assert.equal(usageAfterSync.agent.messagesIn - usageBeforeSync.agent.messagesIn, 2);
   console.log("ok HTTP deploy and WebSocket plans include durable secrets and recovery receipts");
+  await assert.rejects(sync({ ...body, run: 'switched-run' }), /cannot change run identity/);
+  assert.equal((await request('/status')).controlPlane.agentsConnected, 1);
+  assert.equal((await request('/status')).runs.some(r => r.id === 'switched-run'), false);
+  await sync(body);
+  console.log('ok each agent connection remains bound to one validated run');
+  const flood = new WebSocket(`ws://127.0.0.1:${port}/api/agent`, { headers: { authorization: 'Bearer test-join' } });
+  flood.on('error', () => {}); await once(flood, 'open');
+  const closed = once(flood, 'close');
+  for (let id = 1; id <= 20; id++) flood.send(JSON.stringify({ type: 'sync', id, body: { ...body, run: 'flood-run' } }));
+  assert.equal((await closed)[0], 1008);
+  assert.equal((await request('/status')).controlPlane.agentsConnected, 1);
+  console.log('ok excessive concurrent reports are bounded and do not interrupt other agents');
   await request("/projects/web/env", { method: "PUT", body: { TOKEN: "updated-durable-secret" } });
   const changed = await request("/projects/web");
   await request("/projects/removed", { method: "DELETE" });

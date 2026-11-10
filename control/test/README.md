@@ -35,7 +35,8 @@ node control/test/sim/phase4.test.mjs   # failing copies, sick servers, the hot 
 node control/test/sim/phase5.test.mjs   # dark and lit replicas, cold departures, churn, wait reasons, the alert webhook
 node control/test/sim/regions.test.mjs  # regional placement, shortages, moves, eviction, deadlines, cross-region handovers
 node control/test/sim/hybrid.test.mjs   # D1 encryption/write suppression, receipts, witnesses and cold recovery
-node control/test/agent-link.mjs        # large reports, fragmented WebSocket replies, ping and wake
+node control/test/agent-link.mjs        # large reports, fragmented replies, malformed plans, reconnect and wake
+node control/test/agent-reconcile.mjs   # cancelled/revised work behind a slow or failed removal
 node control/test/d1-store.mjs          # atomic D1 commits, lost responses, revision conflicts, zero runtime I/O
 node control/test/sim/local-store.test.mjs # configuration-only SQLite, zero runtime writes, migration and cold recovery
 node control/test/sim/tunnels.test.mjs     # paginated discovery, API failure holds, DNS, lazy tokens and zero durable writes

@@ -56,6 +56,7 @@ let restartRequested = false;
 let wasReady = saved?.wasReady === true;
 let recovery = saved?.recovery || null;
 let cachedDesired = saved?.desired || {};
+let currentDesired = cachedDesired;
 let cachedPublicTunnels = saved?.publicTunnels || {};
 let publicOpen = false;
 // What this agent tells the control plane about its machine.
@@ -138,9 +139,11 @@ function saveState() {
   stateWrites = stateWrites.catch(() => {}).then(async () => {
     const path = `${base}/agent-state.json`;
     const temporary = `${path}.${randomUUID()}.tmp`;
-    const file = await fsp.open(temporary, "wx", 0o600);
-    try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
-    await fsp.rename(temporary, path);
+    try {
+      const file = await fsp.open(temporary, "wx", 0o600);
+      try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+      await fsp.rename(temporary, path);
+    } finally { await fsp.rm(temporary, { force: true }).catch(() => {}); }
     const directory = await fsp.open(base, "r");
     try { await directory.sync(); } finally { await directory.close(); }
   });
@@ -302,20 +305,29 @@ async function remove(name) {
 // wait for them: a project on its way out may still hold the ports the new one publishes (the same copy under a new
 // name, say), and compose would refuse to start it.
 const queued = new Set(); // new projects waiting for removals to finish
+const removing = new Map(); // removals still running from any accepted plan
 function reconcile(desired, { repairOnly = false } = {}) {
-  const removals = [];
+  if (!repairOnly) currentDesired = desired;
   for (const [name, p] of projects) {
-    if (!repairOnly && !(name in desired) && !p.busy) removals.push(remove(name).catch((e) => log(`${name}: ${e.message}`)));
+    if (!repairOnly && !Object.hasOwn(desired, name) && !p.busy && !removing.has(name)) {
+      removing.set(name, remove(name).then(() => true, e => { log(`${name}: ${e.message}`); return false; })
+        .finally(() => removing.delete(name)));
+    }
   }
+  const removals = [...removing.values()];
   for (const [name, want] of Object.entries(desired)) {
     const p = projects.get(name);
     if (p?.busy || queued.has(name)) continue;
     if (repairOnly && (!p || p.fingerprint !== fingerprint(want))) continue;
     if (!p) {
       queued.add(name);
-      Promise.all(removals).then(() => {
+      Promise.all(removals).then(removed => {
         queued.delete(name);
-        if (!projects.has(name)) return apply(name, want);
+        if (removed.some(ok => !ok)) return;
+        if ([...projects.keys()].some(key => !Object.hasOwn(currentDesired, key))) return;
+        // The controller may cancel or revise this app while another app's
+        // graceful removal is still holding its ports. Use the newest plan.
+        if (!projects.has(name) && Object.hasOwn(currentDesired, name)) return apply(name, currentDesired[name]);
       }).catch((e) => log(`${name}: ${e.message}`));
       continue;
     }
@@ -562,7 +574,7 @@ async function join() {
 // After a restart: projects from last time that are no longer wanted.
 async function removeLeftovers(desired) {
   for (const name of await readdir(dir).catch(() => [])) {
-    if (name in desired || projects.has(name)) continue;
+    if (Object.hasOwn(desired, name) || projects.has(name)) continue;
     log(`${name}: left over from before; removing`);
     try {
       const composeProject = await selectProject(name, null);

@@ -28,7 +28,7 @@ Configure each repository independently:
 | Secret `JOIN_TOKEN` | The same fleet join token; never a public variable. |
 | Variable `SERVER_TAG` | Distinct origin tag, such as `github`, `school` or `secondary`. |
 | Variable `MACHINE_COUNT` | Desired capacity owned by this provider adapter. |
-| Variable `AGENT_REPO` | Optional source repository, such as `hetp4401/runner`; defaults to this repository. |
+| Variable `AGENT_REPO` | Optional source repository, such as `your-org/runner`; defaults to this repository. |
 | Variable `REGION` | Optional explicit location label. |
 
 `POOL` and `POOL_SIZE` are compatibility aliases. The watchdog uses its own

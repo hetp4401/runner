@@ -45,6 +45,12 @@ const spec = v => ({name:'web',version:v,compose:`version ${v}`,files:{},port:80
 let passed=0;
 async function check(name,fn) { await fn(); console.log('PASS:',name); passed++; }
 
+await check('malformed URL escapes do not crash navigation', () => {
+  const h = harness(); h.context.location.hash = '#/apps/broken%ZZ?version=2';
+  assert.equal(h.run('parseHash().parts[1]'), 'broken%ZZ');
+  assert.equal(h.run('parseHash().q.get("version")'), '2');
+});
+
 await check('the main app link is global and replica rows keep their numbered URLs',()=>{
   const h=harness(); h.context.hooks.spec=(_name,v)=>Promise.resolve(spec(v));
   h.run('view=vApp("web"); view.status();');
