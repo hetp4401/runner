@@ -48,7 +48,6 @@ Example private configuration (replace paths and repository names):
 ```json
 {
   "control_url": "https://runners.example.com",
-  "status_url": "http://127.0.0.1:8920/api/status",
   "providers": [
     {"login": "your-account", "repo": "your-account/runner"}
   ],
@@ -59,7 +58,14 @@ Example private configuration (replace paths and repository names):
 
 Keep the credential file outside the checkout with mode 0600. It can contain a
 JSON mapping from login to token. Tokens need access to the relevant repository's
-variables and workflow dispatch. Test without dispatching:
+variables and workflow dispatch.
+
+Status checks use the stable control origin by default, with an explicit
+client identity accepted by the public edge. An optional `status_url` overrides
+the endpoint for private deployments. Do not use a replica's localhost address
+when the helper must keep working after that replica is stopped.
+
+Test without dispatching:
 
 ```sh
 python3 .github/scripts/capacity-fallback.py \
@@ -68,5 +74,5 @@ python3 .github/scripts/capacity-fallback.py \
 ```
 
 Omit `--once --dry-run` for a supervised adapter. On the Mac it may remain a
-separate LaunchAgent using the controller's loopback-published port. Do not put
+separate LaunchAgent using the stable public controller origin. Do not put
 these credentials in the controller image, app environment or public logs.

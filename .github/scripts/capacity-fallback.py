@@ -58,6 +58,18 @@ def recovering(status):
             or status.get("now", 0) < plane.get("recoveryUntil", 0))
 
 
+def read_status(config):
+    # Follow the fleet's stable origin unless an operator explicitly supplies a
+    # private endpoint. A replica-local default stops working after failover.
+    url = config.get("status_url") or config["control_url"].rstrip("/") + "/api/status"
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "runner-capacity-fallback",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
 def reconcile(provider, token, status, control_url, api=github, dry=False):
     result = {"repo": provider["repo"]}
     if recovering(status):
@@ -99,8 +111,7 @@ def main():
         result = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "providers": []}
         try:
             status_requests += 1
-            with urllib.request.urlopen(config["status_url"], timeout=15) as response:
-                status = json.load(response)
+            status = read_status(config)
             for provider in config["providers"]:
                 try:
                     if provider["login"] not in tokens:
