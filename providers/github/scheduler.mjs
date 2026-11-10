@@ -1,11 +1,5 @@
-import { reconcileCapacity, targetCount } from '../../.github/scripts/capacity.mjs';
-
-export const INTERVAL_MS = 10 * 60_000;
-export function refillSlot(now, phase) {
-  if (!/^[0-9]$/.test(String(phase))) throw new Error('CAPACITY_PHASE_MIN must be from 0 to 9');
-  const offset = Number(phase) * 60_000;
-  return Math.floor((now - offset) / INTERVAL_MS) * INTERVAL_MS + offset;
-}
+import { capacityInterval, reconcileCapacity, refillSlot, targetCount } from '../../.github/scripts/capacity.mjs';
+export { refillSlot } from '../../.github/scripts/capacity.mjs';
 
 // Only a verified primary calls this. The committed claim covers the API
 // attempt, including a lost response; no failover retries that same slot.
@@ -18,15 +12,17 @@ export async function replenish(provider, { api, authority, claim, now = Date.no
   const result = { repo: provider.repo, target, at: now() };
   if (!target) return { ...result, action: 'disabled' };
   if (vars.CAPACITY_TRIGGER !== 'provider') return { ...result, action: 'provider_not_enabled' };
-  const slot = refillSlot(now(), vars.CAPACITY_PHASE_MIN || '2');
-  if (now() - slot >= 120_000) return { ...result, action: 'waiting_for_phase', next: slot + INTERVAL_MS };
+  const interval = capacityInterval(vars);
+  const slot = refillSlot(now(), vars.CAPACITY_PHASE_MIN || '2', interval);
+  Object.assign(result, { slot, intervalMs: interval, next: slot + interval });
   const repository = await api(base);
   if (!repository.default_branch || repository.archived || repository.disabled) throw new Error('provider repository unavailable');
   const ref = repository.default_branch;
   const plan = await reconcileCapacity({ ...vars, GITHUB_REPOSITORY: provider.repo, MACHINE_REF: ref,
     GITHUB_EVENT_NAME: 'provider_preview', CAPACITY_DRY_RUN: '1' }, { api, now, log });
   Object.assign(result, { reserved: plan.active, missing: plan.missing, aging: plan.aging, slot });
-  if (!plan.launch) return { ...result, action: plan.retryAfterMs ? 'launch_spacing' : 'satisfied' };
+  if (!plan.launch) return { ...result, retryAfterMs: plan.retryAfterMs,
+    action: plan.retryAfterMs && (plan.missing || plan.aging) ? 'launch_spacing' : 'satisfied' };
   // This also avoids replay after an explicitly bootstrapped empty cluster.
   const runs = await api(base + '/actions/workflows/watchdog.yml/runs?event=workflow_dispatch&per_page=100');
   if (!Array.isArray(runs.workflow_runs)) throw new Error('invalid capacity request listing');

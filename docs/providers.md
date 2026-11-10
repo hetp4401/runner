@@ -55,13 +55,18 @@ workflow. Give accounts different minute offsets, for example:
 | Second | `5,15,25,35,45,55 * * * *` | 05, 15, 25, 35, 45, 55 |
 | Third | `8,18,28,38,48,58 * * * *` | 08, 18, 28, 38, 48, 58 |
 
-Each reconciliation starts at most one host, with at least ten minutes between
+In schedule mode, each reconciliation starts at most one host, with at least ten minutes between
 launch requests even if scheduled runs arrive together. Failed launches count
 toward that spacing. Pending jobs reserve capacity. A host running for at least
 210 minutes permits one extra host above the target to warm before departure;
 the provider never cancels healthy jobs to enforce its target. Actual running
 and pending jobs are capped at target plus one for new launch decisions,
 including during migration from overlapping legacy handovers.
+
+The [replicated provider app](replicated-provider.md) supports faster supply via
+`CAPACITY_INTERVAL_MIN=2`. Its primary claims one request per account per UTC
+interval, with scaled account offsets, and each workflow rechecks inventory.
+This lets a depleted pool recover without waiting ten minutes for every host.
 
 This spreads replenishment over time instead of creating a whole cohort with
 the same deadline. An empty pool deliberately ramps up one host per interval.

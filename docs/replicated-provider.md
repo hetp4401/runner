@@ -5,11 +5,12 @@ GitHub-hosted machines. It owns provider credentials and capacity targets;
 neither the control plane nor the generic agent calls account APIs. Other
 compute providers can continue supplying the same fleet independently.
 
-The provider reads each repository's target, inventory and minute offset. During
-that account's two-minute launch window, a primary may request its existing
-serialized capacity workflow. The workflow rechecks current inventory and starts
-at most one host, with at least ten minutes between host requests. Pending jobs
-reserve capacity. Aging hosts permit one overlap above the account target.
+The provider reads each repository's target, inventory, interval and phase. A
+primary may request its existing serialized capacity workflow once per fixed UTC
+interval. Set `CAPACITY_INTERVAL_MIN=2` for prompt recovery: each account can add
+one missing host every two minutes, without launching a whole cohort together.
+Pending jobs reserve capacity. Once the target is reserved, refill stops; aging
+hosts permit one overlap above the account target.
 
 ## Deployment
 
@@ -42,7 +43,14 @@ Supply these values in the app's private environment:
 Existing repository settings remain `CONTROL_URL`, `JOIN_TOKEN`, `SERVER_TAG`,
 `MACHINE_COUNT`, and optional `AGENT_REPO`. Add `CAPACITY_TRIGGER=provider` and
 `CAPACITY_PHASE_MIN` from `0` through `9`; distinct phases such as `2`, `5`, `8`
-interleave account requests. In provider mode, cron does not launch hosts.
+interleave account requests. `CAPACITY_INTERVAL_MIN` accepts `1`, `2`, `5`, or
+`10` (default `10`). The legacy phase setting scales with the interval: at two
+minutes, phases `2`, `5`, `8` open at seconds `24`, `60`, `96` of each interval.
+The whole interval remains eligible, so launch or polling delays do not close a
+narrow window. A half-interval minimum between actual machine requests prevents
+late adjacent slots from bunching, without shifting every later phase. Workflows
+recheck inventory and reject requests more than ten minutes old, allowing bounded
+queue delay. In provider mode, cron does not launch hosts.
 Removing provider mode restores normal repository-owned scheduled supply.
 Manual capacity workflow runs with an empty slot remain previews. Credentials
 are never returned by the provider's status API or passed to machine jobs.
@@ -54,7 +62,7 @@ identity and an opt-in monotonic work-claim operation. Control-plane election
 behavior and application configuration storage are unchanged.
 
 Before a GitHub write, the primary confirms a fresh quorum and commits a claim
-for `(repository, UTC ten-minute slot)`. Only a sequence newer than that
+for `(repository, UTC interval slot)`. Only a sequence newer than that
 repository's last claim can succeed. A second quorum confirmation checks the
 same primary term before submitting the request. A new primary receives the
 claim in its Raft state and cannot retry that slot. Requests already accepted
