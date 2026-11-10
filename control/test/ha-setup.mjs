@@ -55,4 +55,14 @@ try {
     async () => { throw new Error('leadership lost'); }), /leadership lost/);
   assert.equal(calls.some(call => call.method !== 'GET'), false);
   console.log('ok stale leadership cannot publish a primary DNS change');
+  const migrated = [];
+  const legacyAPI = async (_env, path, init = {}) => {
+    if (path.includes('/cfd_tunnel?')) return [{ id: 'old-control', name: 'control' }];
+    if (init.method === 'PATCH') { migrated.push(JSON.parse(init.body)); return {}; }
+    return [{ id: 'dns', type: 'CNAME', content: 'old-control.cfargotunnel.com', comment: 'legacy control install' }];
+  };
+  await route(tunnelEnv, tunnelEnv.CONTROL_HOST, tunnel.id, 'runner control ' + tunnelEnv.CONTROL_HOST, legacyAPI);
+  assert.equal(migrated[0].content, 'persistent-tunnel.cfargotunnel.com');
+  await assert.rejects(route(tunnelEnv, 'someone.example.com', tunnel.id, 'other', legacyAPI), /owned by another/);
+  console.log('ok first takeover can adopt only the configured legacy standalone tunnel');
 } finally { fixture.kill('SIGTERM'); }

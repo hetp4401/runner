@@ -25,8 +25,15 @@ export async function route(env, hostname, tunnel, comment, api = cloudflare, be
   const path = '/zones/' + env.ZONE + '/dns_records';
   const records = await api(env, path + '?name=' + encodeURIComponent(hostname) + '&per_page=100');
   const content = tunnel + '.cfargotunnel.com';
-  if (records.length > 1 || records.some(r => r.type !== 'CNAME' || (r.content !== content && r.comment !== comment))) {
-    throw new Error('hostname is owned by another DNS record');
+  if (records.length > 1 || records.some(r => r.type !== 'CNAME')) throw new Error('hostname is owned by another DNS record');
+  if (records.some(r => r.content !== content && r.comment !== comment)) {
+    // Older standalone installs used a different DNS comment. Adopt only the
+    // explicitly configured standalone tunnel, never an unrelated hostname.
+    if (hostname !== env.CONTROL_HOST || comment !== 'runner control ' + env.CONTROL_HOST) throw new Error('hostname is owned by another DNS record');
+    const previous = (await api(env, '/accounts/' + env.ACCOUNT_ID + '/cfd_tunnel?name=' +
+      encodeURIComponent(env.CONTROLLER_TUNNEL_NAME) + '&is_deleted=false'))
+      .filter(t => t.name === env.CONTROLLER_TUNNEL_NAME && !t.deleted_at);
+    if (previous.length !== 1 || records[0].content !== previous[0].id + '.cfargotunnel.com') throw new Error('hostname is owned by another DNS record');
   }
   const record = { type: 'CNAME', name: hostname, content, proxied: true, comment };
   if (!records.length) {
