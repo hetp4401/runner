@@ -13,4 +13,5 @@
 **/.wrangler
 control/build
 data
+rust/target
 .DS_Store

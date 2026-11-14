@@ -1,0 +1,3 @@
+[build]
+# The development Mac also hosts the fleet. Bound compiler concurrency and RAM.
+jobs = 2

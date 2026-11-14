@@ -1,0 +1,7 @@
+# Offline migration and rollback tooling; the normal Compose service uses Rust.
+services:
+  control:
+    image: runner-control:legacy
+    build:
+      context: .
+      dockerfile: control/legacy.Dockerfile

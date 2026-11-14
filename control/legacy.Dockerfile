@@ -1,0 +1,28 @@
+FROM golang:1.24-bookworm AS raft
+WORKDIR /src
+COPY control/raft/go.mod control/raft/go.sum ./
+RUN go mod download
+COPY control/raft/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /runner-raft .
+FROM cloudflare/cloudflared:latest AS tunnel
+FROM node:24-bookworm-slim AS control
+ENV NODE_ENV=production DATA_DIR=/data BIND_HOST=0.0.0.0 PORT=8920 CONTROLLER_RUNTIME=docker
+WORKDIR /app/control
+COPY control/package.json control/package-lock.json ./
+RUN apt-get update && apt-get install -y --no-install-recommends util-linux && rm -rf /var/lib/apt/lists/* \
+    && npm ci --omit=dev && npm cache clean --force
+COPY --from=tunnel /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY --from=raft /runner-raft /usr/local/bin/runner-raft
+COPY --from=tunnel /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY control/src ./src
+COPY control/server.mjs control/d1-migrate.mjs control/docker-entrypoint.mjs control/healthcheck.mjs control/agent.Dockerfile control/agent-launcher.mjs ./
+COPY control/ha-server.mjs control/cluster-init.mjs ./
+COPY --chmod=755 control/docker-entrypoint.sh ./
+COPY agent /app/agent
+RUN mkdir -p /data /run/runner && chown node:node /data /run/runner
+USER node
+VOLUME ["/data"]
+EXPOSE 8920
+HEALTHCHECK --interval=30s --timeout=8s --start-period=60s CMD node healthcheck.mjs
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["start"]

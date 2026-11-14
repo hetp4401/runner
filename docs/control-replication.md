@@ -5,8 +5,8 @@ The same Docker image runs alone or as a member of a Raft cluster.
 Replicated mode accepts an odd number of at least three. Two and all even
 values are rejected. Application replica counts are independent.
 
-Coordination is entirely in memory. The implementation uses
-[`go.etcd.io/raft/v3`](https://github.com/etcd-io/raft), pre-voting, quorum checks,
+Coordination is entirely in memory. The native Rust controller embeds `raft-rs`,
+with the existing etcd Raft wire protocol, pre-voting, quorum checks,
 and quorum-confirmed ReadIndex requests. D1 stores application configuration;
 it does not store terms, votes, membership changes, authority, transitions, or
 Raft log entries. No Cloudflare service beyond the existing D1 configuration
@@ -152,13 +152,13 @@ maintenance unless the operator chooses to restore them.
 
 ## Authority and routing
 
-Only the primary starts a scheduler child. Scheduling, agent plans, API changes,
+Only the primary starts the scheduler actor in its process. Scheduling, agent plans, API changes,
 and Cloudflare effects require fresh quorum confirmation. Leadership loss stops
-the child and closes its agent WebSockets. Standbys forward dashboard/API traffic
+the actor and closes its agent WebSockets. Standbys forward dashboard/API traffic
 to the primary, including traffic arriving through old DNS routes. The primary
 reconciles the existing shared hostname to its tunnel.
 
-The D1 I/O worker confirms authority immediately before submitting each
+The D1 adapter confirms authority immediately before submitting each
 configuration transaction. The transaction also checks the ordinary application
 configuration revision atomically, so a stale edit cannot overwrite a newer
 commit. No leadership record is written to D1. Agents verify plan authority
@@ -188,7 +188,8 @@ raw runtime reports are not public. Old `/cluster` links redirect to Fleet.
 
 ## Verification
 
-With Go 1.24 or newer and Node 24:
+The native build and test commands are in the [Rust guide](../rust/README.md).
+The retained reference tests use Go 1.24 or newer and Node 24:
 
 ```sh
 go -C control/raft build -o /tmp/runners-raft-memory-test .

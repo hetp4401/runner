@@ -24,7 +24,7 @@ account credentials or account-specific pool targets in its source.
 - The controller's HTTPS URL, its fleet join token, and an origin tag such as `vps`, `lab` or `standalone`.
 - Outbound HTTPS to the controller and registries, plus Cloudflare Tunnel connectivity.
 
-The installer builds an image containing Node and Docker Compose. You do not need Node or npm on the host for this installation, and the agent source uses Node built-ins without npm packages. Direct source execution uses Node.js 24 and Docker Compose v2 on Linux. See [requirements](../docs/requirements.md) for network ports and host checks.
+The installer builds an image containing a native Rust binary and Docker CLI/Compose. No language runtime or compiler stays resident. For direct execution on Linux, `rust/run-agent.sh` extracts the binary from the pinned release image and replaces itself with that process. GitHub machine jobs use this path. See [requirements](../docs/requirements.md) and the [Rust guide](../rust/README.md).
 
 ## Install
 
@@ -84,7 +84,7 @@ export ADMIN_PASSWORD='your-admin-password'
 bin/runnerctl roll
 ```
 
-For installed, managed agents without `START_CMD`, an explicit roll verifies and stages a release before restarting. A failed download leaves the running release in place. Agents with `START_CMD` instead ask their provider integration to start a replacement host; that integration must install the new release. Directly supervised agents must update their code through their supervisor. Reinstall on each host to refresh the base image's Node and Docker tools as well as its agent code. A normal container restart uses its verified local code:
+For installed, managed agents without `START_CMD`, an explicit roll verifies and stages a release before restarting. A failed download leaves the running release in place. Agents with `START_CMD` instead ask their provider integration to start a replacement host; that integration must install the new release. Directly supervised agents must update their code through their supervisor. Reinstall on each host to refresh the base image's Docker tools as well as its agent code. A normal container restart uses its verified local code:
 
 ```sh
 sudo docker restart runner-agent
