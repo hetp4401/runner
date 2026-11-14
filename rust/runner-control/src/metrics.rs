@@ -414,8 +414,8 @@ impl Control {
             Ok(())
         };
         self.store.scan(
-            &format!("SELECT t,data FROM {table} WHERE t>=? AND t<=? ORDER BY t"),
-            &[json!(from), json!(end)],
+            &format!("SELECT t,data FROM {table} WHERE t>=? AND t<? ORDER BY t"),
+            &[json!(from), json!(end.saturating_add(step))],
             |row| {
                 let time = n(&row, "t");
                 let b = time - time % step;

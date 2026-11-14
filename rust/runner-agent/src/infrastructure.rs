@@ -343,22 +343,12 @@ impl PublicTunnels {
     ) -> anyhow::Result<()> {
         let empty = serde_json::Map::new();
         let plan = plan.as_object().unwrap_or(&empty);
-        let list = self
-            .host
-            .commands
-            .docker(&args![
-                "ps",
-                "-aq",
-                "--filter",
-                format!("label={OWNER_LABEL}={}", self.host.owner),
-                "--filter",
-                "label=io.runners.component=public-tunnel"
-            ])
-            .await?;
-        ensure!(list.ok, "cannot list public tunnel containers");
         let mut containers: BTreeMap<String, Value> = self
             .host
-            .inspect(list.out.split_whitespace().map(String::from).collect())
+            .labeled(&[
+                format!("{OWNER_LABEL}={}", self.host.owner),
+                "io.runners.component=public-tunnel".into(),
+            ])
             .await?
             .into_iter()
             .filter(|c| self.owns(c))

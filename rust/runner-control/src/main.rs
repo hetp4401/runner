@@ -112,12 +112,20 @@ async fn main() -> anyhow::Result<()> {
     });
     eprintln!("Rust controller listening on {bind}");
     let shutdown = cancel.clone();
-    let result = axum::serve(
+    let serving = axum::serve(
         listener,
         server::router(node).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async move { shutdown.cancelled().await })
-    .await;
+    .with_graceful_shutdown(async move { shutdown.cancelled().await });
+    use std::future::IntoFuture;
+    let serving = serving.into_future();
+    tokio::pin!(serving);
+    let result = tokio::select! {
+        result = &mut serving => result,
+        _ = cancel.cancelled() => {
+            tokio::time::timeout(Duration::from_secs(8), &mut serving).await.unwrap_or(Ok(()))
+        }
+    };
     cancel.cancel();
     signals.abort();
     let _ = tokio::time::timeout(Duration::from_secs(8), connector).await;

@@ -251,9 +251,9 @@ async fn handle(
         let ws = ws
             .read_buffer_size(16 << 10)
             .write_buffer_size(0)
-            .max_write_buffer_size(2 << 20)
-            .max_message_size(1_000_000)
-            .max_frame_size(1_000_000);
+            .max_write_buffer_size(17 << 20)
+            .max_message_size(1 << 20)
+            .max_frame_size(1 << 20);
         if path == "/api/agent" {
             if !bearer(&node, request.headers()) {
                 return Err(http(401, "unauthorized"));
@@ -391,7 +391,7 @@ async fn agent_socket(
         let envelope=serde_json::from_str::<Envelope<'_>>(&raw);let envelope=match envelope{Ok(e) if e.kind=="sync"&&e.id>0&&e.id<=9_007_199_254_740_991=>e,_=>{send(&mut socket,json!({"type":"error","error":"invalid report"})).await?;continue;}};let id=envelope.id;let identity:Identity=serde_json::from_str(envelope.body.get())?;if identity.run.is_empty()||identity.run.len()>200{break;}if subscription.as_ref().is_some_and(|s|s.identity()!=identity.run){break;}
         let permit=match node.bodies.clone().try_acquire_owned(){Ok(p)=>p,Err(_)=>{send(&mut socket,json!({"type":"error","id":id,"error":"controller busy; retry shortly"})).await?;continue;}};let body=bytes::Bytes::copy_from_slice(envelope.body.get().as_bytes());drop(raw);
         let result=service.request(api::Request{method:Method::POST,path:"/api/sync".into(),query:BTreeMap::new(),headers:headers.clone(),origin:origin.clone(),ip:ip.clone(),body,permit:Some(permit)}).await;
-        match result{Ok(Output::Json(plan))=>{if subscription.is_none(){subscription=Some(service.hub.subscribe(&identity.run,true)?);}send(&mut socket,json!({"type":"plan","id":id,"plan":plan})).await?;},Err(error)=>{let message=error.downcast_ref::<HttpError>().map(|e|e.message.as_str()).unwrap_or("scheduler unavailable");send(&mut socket,json!({"type":"error","id":id,"error":message})).await?;},_=>break}
+        match result{Ok(Output::Json(plan))=>{if subscription.is_none(){subscription=Some(service.hub.subscribe(&identity.run,true)?);}send(&mut socket,Value::Object(serde_json::Map::from_iter([("type".into(),json!("plan")),("id".into(),json!(id)),("plan".into(),plan)]))).await?;},Err(error)=>{let message=error.downcast_ref::<HttpError>().map(|e|e.message.as_str()).unwrap_or("scheduler unavailable");send(&mut socket,json!({"type":"error","id":id,"error":message})).await?;},_=>break}
     }Ok::<_,anyhow::Error>(())}.await;
     let _ = outcome;
     let _ = tokio::time::timeout(Duration::from_secs(1), socket.close()).await;
@@ -582,7 +582,7 @@ async fn proxy_socket(
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .read_buffer_size(16 << 10)
         .write_buffer_size(0)
-        .max_write_buffer_size(2 << 20)
+        .max_write_buffer_size(17 << 20)
         .max_message_size(Some(1_000_000))
         .max_frame_size(Some(1_000_000));
     let (upstream, _) = tokio::time::timeout(
@@ -595,9 +595,9 @@ async fn proxy_socket(
     Ok(ws
         .read_buffer_size(16 << 10)
         .write_buffer_size(0)
-        .max_write_buffer_size(2 << 20)
-        .max_message_size(1_000_000)
-        .max_frame_size(1_000_000)
+        .max_write_buffer_size(17 << 20)
+        .max_message_size(1 << 20)
+        .max_frame_size(1 << 20)
         .on_upgrade(move |socket| async move {
             use tokio_tungstenite::tungstenite::Message as M;
             let (mut upstream_write, mut upstream_read) = upstream.split();

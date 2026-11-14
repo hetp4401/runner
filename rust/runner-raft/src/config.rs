@@ -26,7 +26,7 @@ impl Config {
                 .map(|v| v.parse::<u64>().with_context(|| format!("invalid {k}")))
                 .unwrap_or(Ok(fallback))
         };
-        let members: Vec<Member> = serde_json::from_str(&env("CP_MEMBERS", ""))
+        let mut members: Vec<Member> = serde_json::from_str(&env("CP_MEMBERS", ""))
             .context("CP_MEMBERS must be a JSON member array")?;
         ensure!(
             members.len() >= 3 && members.len() <= 51 && members.len() % 2 == 1,
@@ -34,7 +34,8 @@ impl Config {
         );
         let id = number("CP_NODE_ID", 0)?;
         let mut peers = BTreeMap::new();
-        for member in &members {
+        for member in &mut members {
+            member.url = member.url.trim_end_matches('/').to_owned();
             ensure!(
                 member.id > 0
                     && valid_origin(&member.url)
@@ -50,12 +51,16 @@ impl Config {
                 peers.contains_key(&id) && valid_origin(&address),
                 "invalid peer override"
             );
-            peers.insert(id, address);
+            peers.insert(id, address.trim_end_matches('/').to_owned());
         }
         let cluster = env("CP_CLUSTER_ID", "");
         let secret = env("CP_CLUSTER_TOKEN", "");
         ensure!(
-            !cluster.is_empty() && secret.len() >= 32,
+            !cluster.is_empty()
+                && cluster.len() <= 200
+                && secret.len() >= 32
+                && secret.len() <= 4096
+                && secret.bytes().all(|b| (33..=126).contains(&b)),
             "cluster identity and secret are required"
         );
         ensure!(

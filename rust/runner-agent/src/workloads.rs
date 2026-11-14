@@ -43,9 +43,11 @@ impl DockerHost {
         Ok(Some(response_json(response, 4 << 20).await?))
     }
     pub async fn containers(&self, project: &str) -> anyhow::Result<Vec<Value>> {
-        let filters = serde_json::to_string(
-            &json!({"label":[format!("com.docker.compose.project={project}")]}),
-        )?;
+        self.labeled(&[format!("com.docker.compose.project={project}")])
+            .await
+    }
+    pub async fn labeled(&self, labels: &[String]) -> anyhow::Result<Vec<Value>> {
+        let filters = serde_json::to_string(&json!({"label":labels}))?;
         let list: Vec<Value> = response_json(
             self.engine
                 .get("http://localhost/containers/json")
