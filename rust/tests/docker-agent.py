@@ -118,7 +118,7 @@ try:
     first = workload_id()
     assert first
     checks.append('packaged agent creates and observes a real Compose workload')
-    until(lambda: latest().get('metrics', {}).get('live', {}).get('h', {}).get('memTotal', 0) > 0, 'host metrics missing')
+    until(lambda: ((latest().get('metrics') or {}).get('live') or {}).get('h', {}).get('memTotal', 0) > 0, 'host metrics missing')
     stats = json.loads(docker('stats', '--no-stream', '--format', '{{json .}}', agent_name))
     rss = int(docker('exec', agent_name, 'sh', '-c', "awk '/^VmRSS:/{print $2*1024}' /proc/1/status"))
     assert 0 < rss < 64 * 1024 * 1024, rss
@@ -149,7 +149,7 @@ try:
     until(lambda: not workload_id(), 'removed workload kept running')
     assert json.loads(docker('inspect', owner + '-tunnel'))[0]['State']['Running']
     checks.append('removing a workload keeps infrastructure running')
-    print(json.dumps({'checks': checks, 'agentRssBytes': rss, 'containerMemory': stats['MemUsage']}))
+    print(json.dumps({'checks': checks, 'agentRssBytes': rss, 'agentImageBytes': int(docker('image', 'inspect', '--format', '{{.Size}}', image)), 'containerMemory': stats['MemUsage']}))
 except BaseException:
     # Only containers created by this isolated fixture are inspected or logged.
     for name in [agent_name, owner + '-router', owner + '-tunnel']:

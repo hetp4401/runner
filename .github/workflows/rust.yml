@@ -72,6 +72,7 @@ jobs:
         run: |
           docker build -f rust/control.Dockerfile --build-arg REVISION="$GITHUB_SHA" -t runner-control:rust-test .
           docker run --rm runner-control:rust-test --version
+          RUNNER_DATA=$(mktemp -d) RUNNER_RUST_IMAGE=runner-control:rust-test sh rust/run-agent.sh --version
           python3 rust/tests/docker-smoke.py
           python3 rust/tests/docker-agent.py
           python3 rust/tests/installer-rollback.py

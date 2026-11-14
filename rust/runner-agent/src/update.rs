@@ -73,14 +73,14 @@ fn hash_file(path: &Path) -> anyhow::Result<String> {
 }
 pub async fn install(
     base: &Path,
-    origin: &str,
+    agent_url: &str,
     client: &reqwest::Client,
 ) -> anyhow::Result<String> {
     let manifest: Manifest = runner_core::response_json(
         client
             .get(format!(
-                "{}/agent/rust/manifest.json",
-                origin.trim_end_matches('/')
+                "{}/rust/manifest.json",
+                agent_url.trim_end_matches('/')
             ))
             .send()
             .await?,
@@ -122,7 +122,11 @@ pub async fn install(
             private_directory(&releases.join(format!(".download-{}", runner_core::random_id())))?;
         let result = async {
             let mut response = client
-                .get(format!("{}{}", origin.trim_end_matches('/'), artifact.path))
+                .get(format!(
+                    "{}{}",
+                    agent_url.trim_end_matches('/'),
+                    artifact.path.strip_prefix("/agent").unwrap()
+                ))
                 .timeout(Duration::from_secs(120))
                 .send()
                 .await?;

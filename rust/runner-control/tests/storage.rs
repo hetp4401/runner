@@ -154,7 +154,28 @@ async fn d1_commits_are_atomic_fenced_and_confirmed_without_replay() -> anyhow::
     c.save_app_password("web", "test-password", now)?;
     c.store.commit().await?;
     assert_eq!(c.store.d1.as_ref().unwrap().usage.revision, 1);
+    let cache_directory = cache_root_path.join(".native-config-cache");
+    let active_cache = std::fs::read_dir(&cache_directory)?
+        .filter_map(Result::ok)
+        .find(|e| e.path().extension().is_some_and(|s| s == "sqlite"))
+        .unwrap()
+        .path();
+    let old = std::fs::FileTimes::new()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120));
+    std::fs::File::open(&active_cache)?.set_times(old)?;
+    let abandoned_cache = cache_directory.join("runner-config-abandoned.sqlite");
+    std::fs::File::create(&abandoned_cache)?.set_times(old)?;
+    std::fs::File::create(abandoned_cache.with_extension("lock"))?;
     let loaded = Store::open(&env).await?;
+    assert!(
+        active_cache.exists(),
+        "a running process must retain its cache"
+    );
+    assert!(
+        !abandoned_cache.exists(),
+        "abandoned caches must be collected"
+    );
+    assert!(!abandoned_cache.with_extension("lock").exists());
     let mut stale = Control::new(loaded, env.clone(), now)?;
     assert_eq!(stale.app_env["web"]["TOKEN"], "private-value");
     assert!(stale.app_passwords.contains_key("web"));
@@ -172,7 +193,6 @@ async fn d1_commits_are_atomic_fenced_and_confirmed_without_replay() -> anyhow::
         before,
         "runtime changes must not hit D1"
     );
-    let cache_directory = cache_root_path.join(".native-config-cache");
     for entry in std::fs::read_dir(&cache_directory)? {
         use std::os::unix::fs::PermissionsExt;
         let entry = entry?;

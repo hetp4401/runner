@@ -641,7 +641,14 @@ async fn controller(
                         {
                             update::install(
                                 &context.host.base,
-                                &context.control,
+                                &context
+                                    .environment
+                                    .get("AGENT_URL")
+                                    .filter(|s| !s.is_empty())
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        format!("{}/agent", context.control.trim_end_matches('/'))
+                                    }),
                                 &context.host.client,
                             )
                             .await
