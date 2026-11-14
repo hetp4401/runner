@@ -1,0 +1,27 @@
+#![recursion_limit = "256"]
+// The scheduler and HA manager share one process and one bounded state owner.
+pub mod api;
+pub mod artifacts;
+pub mod authority;
+pub mod bootstrap;
+pub mod client_ip;
+pub mod cloud;
+pub mod control;
+pub mod departures;
+pub mod error;
+pub mod hub;
+pub mod metrics;
+pub mod model;
+pub mod node;
+pub mod observations;
+pub mod placement;
+pub mod projects;
+pub mod rebalance;
+pub mod recovery;
+pub mod server;
+pub mod service;
+pub mod spec;
+pub mod status;
+pub mod storage;
+pub mod sync;
+pub mod tail;

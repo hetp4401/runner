@@ -1,0 +1,77 @@
+name: Rust runtime
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/rust-low-memory]
+    paths: ['rust/**', 'control/src/app.html', '.github/workflows/rust.yml']
+permissions:
+  contents: read
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test and build native static binaries
+        run: docker buildx build -f rust/build.Dockerfile --build-arg REVISION="$GITHUB_SHA" --target binaries --output type=local,dest=rust/dist/binaries/${{ matrix.arch }} .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-binaries-${{ matrix.arch }}
+          path: rust/dist/binaries/${{ matrix.arch }}/
+          retention-days: 7
+          compression-level: 0
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rust-binaries-*
+          path: rust/dist/downloads
+      - name: Package native and compatible legacy downloads
+        run: |
+          mkdir -p rust/dist/binaries rust/dist/rootfs/data rust/dist/rootfs/run/runner rust/dist/rootfs/etc
+          mv rust/dist/downloads/rust-binaries-amd64 rust/dist/binaries/amd64
+          mv rust/dist/downloads/rust-binaries-arm64 rust/dist/binaries/arm64
+          printf 'runner:x:1000:1000:Runner:/data:/nonexistent\n' > rust/dist/rootfs/etc/passwd
+          printf 'runner:x:1000:\n' > rust/dist/rootfs/etc/group
+          chmod 700 rust/dist/rootfs/data rust/dist/rootfs/run/runner
+          python3 rust/build-assets.py --binaries rust/dist/binaries --output rust/dist/assets
+      - name: Build and smoke test the controller image
+        run: |
+          docker build -f rust/control.Dockerfile --build-arg REVISION="$GITHUB_SHA" -t runner-control:rust-test .
+          docker run --rm runner-control:rust-test --version
+          python3 rust/tests/docker-smoke.py
+      - name: Publish versioned multi-architecture controller
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --name rust-release --driver docker-container --use
+          docker buildx build --platform linux/amd64,linux/arm64 -f rust/control.Dockerfile --build-arg REVISION="$GITHUB_SHA" -t "ghcr.io/${GITHUB_REPOSITORY,,}/control:rust-$GITHUB_SHA" --push .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-runtime-assets
+          path: rust/dist/assets/
+          retention-days: 7
+          compression-level: 0

@@ -1,0 +1,958 @@
+[
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080,
+      "replicas": 1,
+      "files": {},
+      "revision": "60ff6f2e3d0ac8fe3b141f2e7db39b187e463ac64467cc04083ef428298b68c6",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"nginx\",\"ports\":[\"8080:80\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [
+      "port 8080"
+    ],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: nginx\n    ports: [\"8080:80\"]\n",
+      "port": 8080,
+      "replicas": 1,
+      "files": {},
+      "revision": "60ff6f2e3d0ac8fe3b141f2e7db39b187e463ac64467cc04083ef428298b68c6",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"nginx\",\"ports\":[\"8080:80\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [
+      "port 8080"
+    ],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n",
+      "port": 8081,
+      "replicas": 3
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "x-runner:\n  port: 8081\n  replicas: 3\nservices:\n  app:\n    build: .\n    ports: [\"8081:8081\"]\n    restart: unless-stopped\n",
+      "port": 8081,
+      "replicas": 3,
+      "files": {
+        "Dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "x-runner:\n  port: 8081\n  replicas: 3\nservices:\n  app:\n    build: .\n    ports: [\"8081:8081\"]\n    restart: unless-stopped\n",
+      "port": 8081,
+      "replicas": 3,
+      "files": {
+        "Dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n"
+      },
+      "revision": "304a7cdbfd1f9975e6c57e39f4e9ef37b642d0ce0115a94840ab74436f13b57b",
+      "managedCompose": "{\"x-runner\":{\"port\":8081,\"replicas\":3},\"services\":{\"app\":{\"build\":\".\",\"ports\":[\"8081:8081\"],\"restart\":\"unless-stopped\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [
+      "port 8081"
+    ],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n",
+      "port": 8081,
+      "replicas": 3
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "x-runner:\n  port: 8081\n  replicas: 3\nservices:\n  app:\n    build: .\n    ports: [\"8081:8081\"]\n    restart: unless-stopped\n",
+      "port": 8081,
+      "replicas": 3,
+      "files": {
+        "Dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "x-runner:\n  port: 8081\n  replicas: 3\nservices:\n  app:\n    build: .\n    ports: [\"8081:8081\"]\n    restart: unless-stopped\n",
+      "port": 8081,
+      "replicas": 3,
+      "files": {
+        "Dockerfile": "FROM busybox\nCMD [\"sleep\", \"infinity\"]\n"
+      },
+      "revision": "304a7cdbfd1f9975e6c57e39f4e9ef37b642d0ce0115a94840ab74436f13b57b",
+      "managedCompose": "{\"x-runner\":{\"port\":8081,\"replicas\":3},\"services\":{\"app\":{\"build\":\".\",\"ports\":[\"8081:8081\"],\"restart\":\"unless-stopped\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [
+      "port 8081"
+    ],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      }
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      },
+      "revision": "94447b881dd252c060e0e679de5fca410f6372b8b83e5df1efc001caf672da7a",
+      "managedCompose": "{\"services\":{\"app\":{\"build\":\"./web\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      }
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    build: ./web\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "web/Dockerfile": "FROM busybox"
+      },
+      "revision": "94447b881dd252c060e0e679de5fca410f6372b8b83e5df1efc001caf672da7a",
+      "managedCompose": "{\"services\":{\"app\":{\"build\":\"./web\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n"
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "d7aba9350389b44d3927e20a38a5d76204c9c1fa583dbd722db957d2086a3ac8",
+      "managedCompose": "{\"x-runner\":{\"ready\":\"/healthz\",\"regions\":[\"us-west\",\"home-lab\"],\"spread-tags\":true},\"services\":{\"app\":{\"image\":\"nginx\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": "/healthz",
+      "spreadTags": true,
+      "region": null,
+      "regions": [
+        "us-west",
+        "home-lab"
+      ]
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "x-runner:\n  ready: /healthz\n  regions: [us-west, home-lab]\n  spread-tags: true\nservices:\n  app:\n    image: nginx\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "d7aba9350389b44d3927e20a38a5d76204c9c1fa583dbd722db957d2086a3ac8",
+      "managedCompose": "{\"x-runner\":{\"ready\":\"/healthz\",\"regions\":[\"us-west\",\"home-lab\"],\"spread-tags\":true},\"services\":{\"app\":{\"image\":\"nginx\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": "/healthz",
+      "spreadTags": true,
+      "region": null,
+      "regions": [
+        "us-west",
+        "home-lab"
+      ]
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "files": {
+        "data/value": "a",
+        "config": "b",
+        "A.txt": "UP",
+        "a.txt": "lo"
+      }
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      },
+      "revision": "fcfa76fa0b67c9d9ac7a614ae767c16d339eac840a256254872ef488288882ce",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"volumes\":[\"${RUNNER_APP_DATA}/.:/app:ro\",\"${RUNNER_APP_DATA}/data:/data\",\"${RUNNER_APP_DATA}/config:/config:ro\"]}}}",
+      "dataFiles": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      },
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": [
+        {
+          "path": ".",
+          "readOnly": true
+        },
+        {
+          "path": "data",
+          "readOnly": false
+        },
+        {
+          "path": "config",
+          "readOnly": true
+        }
+      ]
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "files": {
+        "data/value": "a",
+        "config": "b",
+        "A.txt": "UP",
+        "a.txt": "lo"
+      }
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      }
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"./:/app:ro\", \"./data:/data\", \"./config:/config:ro\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      },
+      "revision": "fcfa76fa0b67c9d9ac7a614ae767c16d339eac840a256254872ef488288882ce",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"volumes\":[\"${RUNNER_APP_DATA}/.:/app:ro\",\"${RUNNER_APP_DATA}/data:/data\",\"${RUNNER_APP_DATA}/config:/config:ro\"]}}}",
+      "dataFiles": {
+        "A.txt": "UP",
+        "a.txt": "lo",
+        "config": "b",
+        "data/value": "a"
+      },
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": [
+        {
+          "path": ".",
+          "readOnly": true
+        },
+        {
+          "path": "data",
+          "readOnly": false
+        },
+        {
+          "path": "config",
+          "readOnly": true
+        }
+      ]
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n"
+    },
+    "trusted": false,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "8f60db24ddc2173af3664fe6a25beca3f590cdcd4ab1fae8e123295373034598",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"depends_on\":{\"init\":{\"condition\":\"service_completed_successfully\"}}},\"init\":{\"image\":\"busybox\"},\"optional\":{\"image\":\"busybox\",\"profiles\":[\"optional\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app",
+        "init"
+      ],
+      "oneshotServices": [
+        "init"
+      ],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    depends_on:\n      init:\n        condition: service_completed_successfully\n  init:\n    image: busybox\n  optional:\n    image: busybox\n    profiles: [optional]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "8f60db24ddc2173af3664fe6a25beca3f590cdcd4ab1fae8e123295373034598",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"depends_on\":{\"init\":{\"condition\":\"service_completed_successfully\"}}},\"init\":{\"image\":\"busybox\"},\"optional\":{\"image\":\"busybox\",\"profiles\":[\"optional\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app",
+        "init"
+      ],
+      "oneshotServices": [
+        "init"
+      ],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {},
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "send a compose file, a Dockerfile, or both"
+  },
+  {
+    "body": {},
+    "trusted": true,
+    "ok": false,
+    "status": 400,
+    "error": "send a compose file, a Dockerfile, or both"
+  },
+  {
+    "body": null,
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "send a JSON object"
+  },
+  {
+    "body": null,
+    "trusted": true,
+    "ok": false,
+    "status": 400,
+    "error": "send a JSON object"
+  },
+  {
+    "body": {
+      "files": []
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "files must be an object of path: content"
+  },
+  {
+    "body": {
+      "files": []
+    },
+    "trusted": true,
+    "ok": false,
+    "status": 400,
+    "error": "files must be an object of path: content"
+  },
+  {
+    "body": {
+      "compose": "services: {}"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "the compose file needs a services: section"
+  },
+  {
+    "body": {
+      "compose": "services: {}"
+    },
+    "trusted": true,
+    "ok": false,
+    "status": 400,
+    "error": "the compose file needs a services: section"
+  },
+  {
+    "body": {
+      "compose": []
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "compose must be the compose file as text"
+  },
+  {
+    "body": {
+      "compose": []
+    },
+    "trusted": true,
+    "ok": false,
+    "status": 400,
+    "error": "compose must be the compose file as text"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    privileged: true\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.privileged"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    privileged: true\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    privileged: true\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    privileged: true\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "645c139624738e6eb1d3ab67e78d517e09dcfb413a023e0856b9c2ac5cc9d164",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"privileged\":true}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    network_mode: host\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.network_mode (host)"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    network_mode: host\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    network_mode: host\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    network_mode: host\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "ba79a1c6734d864d31cd613c4f7a44049e9acab979c6d2a66bc9845e4fec28cb",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"network_mode\":\"host\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": "services.app.network_mode: host",
+    "nodup": "services.app.network_mode: host"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"/etc:/etc\"]\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.volumes (/etc is outside the app's folder)"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"/etc:/etc\"]\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"/etc:/etc\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    volumes: [\"/etc:/etc\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "1220335b3f00b29638a7e61cb712db1bc3be0405def1ca42c8320992a0fac331",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"volumes\":[\"/etc:/etc\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    ports: [\"19080:80\"]\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.ports (\"19080:80\": that port is the server's)"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    ports: [\"19080:80\"]\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    ports: [\"19080:80\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    ports: [\"19080:80\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "55f67cf5f75d0141e7d7203a8a5692d003e3c04188871d2b60e787bc732c5a5f",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"ports\":[\"19080:80\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [
+      "port 19080"
+    ],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    env_file: ../private\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.env_file (../private must be one of the app's own files)"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    env_file: ../private\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    env_file: ../private\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    env_file: ../private\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "1e3085735a067e1a91b0ca912df1ff615cb08d8b87774df0655fad036e97e5e8",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"env_file\":\"../private\"}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    extra_hosts: [\"host:host-gateway\"]\n"
+    },
+    "trusted": false,
+    "ok": false,
+    "status": 400,
+    "error": "without the admin password, an app gets an ordinary container only, so its compose file can't use: services.app.extra_hosts (host-gateway reaches the server)"
+  },
+  {
+    "body": {
+      "compose": "services:\n  app:\n    image: busybox\n    extra_hosts: [\"host:host-gateway\"]\n"
+    },
+    "trusted": true,
+    "ok": true,
+    "spec": {
+      "compose": "services:\n  app:\n    image: busybox\n    extra_hosts: [\"host:host-gateway\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {}
+    },
+    "plan": {
+      "app": "example",
+      "replica": 2,
+      "v": 3,
+      "compose": "services:\n  app:\n    image: busybox\n    extra_hosts: [\"host:host-gateway\"]\n",
+      "port": null,
+      "replicas": 1,
+      "files": {},
+      "revision": "6428c48f1eba27444cbb11dac608ab7dcf2147a31563132b840aba8f154cfc32",
+      "managedCompose": "{\"services\":{\"app\":{\"image\":\"busybox\",\"extra_hosts\":[\"host:host-gateway\"]}}}",
+      "dataFiles": {},
+      "services": [
+        "app"
+      ],
+      "oneshotServices": [],
+      "bindSources": []
+    },
+    "claims": [],
+    "policy": {
+      "ready": null,
+      "spreadTags": false,
+      "region": null,
+      "regions": []
+    },
+    "fixed": null,
+    "nodup": null
+  }
+]

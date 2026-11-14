@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { fork, spawn } from 'node:child_process';
+import { fork, spawn, execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { D1Client } from '../src/d1-client.mjs';
 import { bootstrapManifest } from '../cluster-init.mjs';
 import { D1Store } from '../src/d1-store.mjs';
 import { PlanAuthority } from '../../agent/runtime.mjs';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const root = await mkdtemp(tmpdir() + '/runner-ha-');
+const root = await realpath(await mkdtemp(tmpdir() + '/runner-ha-'));
 const fixture = fork(new URL('./d1-fixture.mjs', import.meta.url), { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
 const [{ port: d1Port }] = await once(fixture, 'message');
 const listen = async server => { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return server.address().port; };
@@ -20,7 +21,14 @@ const cloudflare = http.createServer((req, res) => {
 });
 const cfPort = await listen(cloudflare), members = [], endpoints = new Map(), proxies = [], processes = new Map(), logs = new Map();
 let isolated = new Set(), checks = 0;
-const check = (name, fn) => { fn(); checks++; console.log('ok ' + name); };
+const memorySamples=[];
+const check = (name, fn) => { fn(); checks++; console.log('ok ' + name);
+  if(process.env.HA_MEMORY_RESULT){
+    const rows=execFileSync('ps',['-axo','pid=,ppid=,rss='],{encoding:'utf8'}).trim().split('\n').map(line=>{const[pid,parent,rssKiB]=line.trim().split(/\s+/).map(Number);return{pid,parent,rssKiB};});
+    const replicas=[...processes.values()].map(p=>{const selected=new Set([p.child.pid]);let count;do{count=selected.size;for(const row of rows)if(selected.has(row.parent))selected.add(row.pid);}while(selected.size!==count);const processes=rows.filter(row=>selected.has(row.pid));return{id:p.id,name:p.name,rssKiB:processes.reduce((sum,p)=>sum+p.rssKiB,0),processes};});
+    memorySamples.push({name,replicas});
+  }
+};
 for (let id = 1; id <= 7; id++) {
   const proxy = http.createServer((req, res) => {
     const from = Number(req.headers['x-cp-from']);
@@ -37,7 +45,7 @@ const env = { ...process.env, CONFIG_STORAGE: 'd1', ACCOUNT_ID: 'test', D1_DATAB
   CONTROL_HOST: 'runners.test.example', DOMAIN: 'test.example', ZONE: 'test', CF_API_TOKEN: 'test-token',
   CF_API_BASE: 'http://127.0.0.1:' + cfPort, DNS: 'off', AUTO_TUNNEL: '0', BIND_HOST: '127.0.0.1',
   CP_REPLICAS: '7', CP_CLUSTER_ID: 'test-cluster-generation', CP_CLUSTER_TOKEN: 'test-cluster-token-at-least-32-characters',
-  CP_MEMBERS: JSON.stringify(members), CP_RAFT_BINARY: '/tmp/runners-raft-memory-test',
+  CP_MEMBERS: JSON.stringify(members), CP_RAFT_BINARY: process.env.CP_RAFT_BINARY || '/tmp/runners-raft-memory-test',
   CP_RAFT_TICK_MS: '100', CP_RAFT_ELECTION_TICKS: '12', CP_RAFT_HEARTBEAT_TICKS: '2',
   STATE_SIGNING_KEY: 'test-signing-key', JOIN_TOKEN: 'test-join-token', ADMIN_PASSWORD: 'test-admin',
   RECOVERY_MS: '0', QUIET_MS: '0' };
@@ -45,7 +53,9 @@ const client = new D1Client(env);
 const db = { query(sql) { return client.query(sql).flatMap(result => result.results); } };
 async function start(id, name = String(id)) {
   const port = await freePort(), raftPort = await freePort(), childPort = await freePort();
-  const child = spawn(process.execPath, [new URL('../ha-server.mjs', import.meta.url).pathname], {
+  const rustIds = new Set((process.env.RUST_CONTROL_IDS || '').split(',').filter(Boolean).map(Number));
+  const native = process.env.RUST_CONTROL_BINARY && (!rustIds.size || rustIds.has(id));
+  const child = spawn(native ? process.env.RUST_CONTROL_BINARY : process.execPath, native ? [] : [new URL('../ha-server.mjs', import.meta.url).pathname], {
     env: { ...env, PORT: String(port), CP_RAFT_PORT: String(raftPort), CP_CHILD_PORT: String(childPort),
       CP_NODE_ID: String(id), DATA_DIR: root + '/' + name }, stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -166,6 +176,7 @@ try {
   for (const [name, log] of logs) console.error('replica ' + name + ': ' + log);
   throw error;
 } finally {
+  if(process.env.HA_MEMORY_RESULT)writeFileSync(process.env.HA_MEMORY_RESULT,JSON.stringify({checks,memorySamples},null,2)+'\n');
   staleStore?.close();
   client.close();
   await Promise.all([...processes.keys()].map(stop));
