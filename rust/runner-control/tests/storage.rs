@@ -139,7 +139,13 @@ async fn fixture() -> (
 }
 #[tokio::test(flavor = "current_thread")]
 async fn d1_commits_are_atomic_fenced_and_confirmed_without_replay() -> anyhow::Result<()> {
-    let (env, fixture, server) = fixture().await;
+    let (mut env, fixture, server) = fixture().await;
+    let cache_root = tempfile::tempdir()?;
+    let cache_root_path = cache_root.path().canonicalize()?;
+    env.insert(
+        "DATA_DIR".into(),
+        cache_root_path.to_string_lossy().into_owned(),
+    );
     let now = 1_800_000_000_000;
     let store = Store::open(&env).await?;
     let mut c = Control::new(store, env.clone(), now)?;
@@ -166,6 +172,40 @@ async fn d1_commits_are_atomic_fenced_and_confirmed_without_replay() -> anyhow::
         before,
         "runtime changes must not hit D1"
     );
+    let cache_directory = cache_root_path.join(".native-config-cache");
+    for entry in std::fs::read_dir(&cache_directory)? {
+        use std::os::unix::fs::PermissionsExt;
+        let entry = entry?;
+        assert_eq!(entry.metadata()?.permissions().mode() & 0o077, 0);
+        if entry.path().extension().is_some_and(|s| s == "sqlite") {
+            let disk = Connection::open_with_flags(
+                entry.path(),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let tables = disk
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(
+                tables,
+                [
+                    "app_env",
+                    "app_passwords",
+                    "projects",
+                    "settings",
+                    "versions"
+                ]
+            );
+            assert_eq!(
+                disk.query_row(
+                    "SELECT count(*) FROM settings WHERE key='last_hot_move'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )?,
+                0
+            );
+        }
+    }
     c.store.begin()?;
     c.put_env("web", &json!({"TOKEN":"changed"}), now + 1)?;
     c.store.commit().await?;
@@ -212,6 +252,13 @@ async fn d1_commits_are_atomic_fenced_and_confirmed_without_replay() -> anyhow::
         "changed"
     );
     assert!(c.store.rows("SELECT * FROM projects", &[]).is_err());
+    drop(stale);
+    drop(c);
+    assert_eq!(
+        std::fs::read_dir(cache_directory)?.count(),
+        0,
+        "disposable configuration caches must be removed on close"
+    );
     server.abort();
     Ok(())
 }

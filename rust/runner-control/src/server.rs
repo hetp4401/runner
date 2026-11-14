@@ -583,8 +583,8 @@ async fn proxy_socket(
         .read_buffer_size(16 << 10)
         .write_buffer_size(0)
         .max_write_buffer_size(17 << 20)
-        .max_message_size(Some(1_000_000))
-        .max_frame_size(Some(1_000_000));
+        .max_message_size(Some(16_000_000))
+        .max_frame_size(Some(16_000_000));
     let (upstream, _) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async_with_config(outgoing, Some(config), true),

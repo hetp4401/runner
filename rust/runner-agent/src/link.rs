@@ -112,8 +112,14 @@ async fn run(
             match result {
                 Ok(connection) => socket = Some(connection),
                 Err(error) => {
-                    let unavailable = error.downcast_ref::<tokio_tungstenite::tungstenite::Error>().is_some_and(|e|
-                        matches!(e,tokio_tungstenite::tungstenite::Error::Http(response) if response.status().as_u16() == 404));
+                    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+                    let unavailable = error.downcast_ref::<Error>().is_some_and(|e| match e {
+                        Error::Http(response) => {
+                            matches!(response.status().as_u16(), 400 | 404 | 405 | 426 | 501)
+                        }
+                        Error::Protocol(ProtocolError::WrongHttpVersion) => true,
+                        _ => false,
+                    });
                     if unavailable {
                         retry_at = Instant::now() + Duration::from_secs(60);
                         let _ = report.reply.send(Ok(None));

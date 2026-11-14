@@ -24,7 +24,11 @@ The processes use a single async runtime thread. Queues have count or byte limit
 
 Every configuration commit and issued plan checks current leadership. A lost D1 response is confirmed by its unique commit ID instead of replayed. Quorum loss stops the scheduler. Runtime observations and metrics remain in memory and never become durable election or assignment records.
 
+D1 remains the source of truth. Historical application specifications use a private, disposable SQLite cache under `DATA_DIR/.native-config-cache`, with a 1 MiB page cache. Each startup reads D1 afresh; this cache is never used for recovery. Its files are removed on close, and abandoned caches are cleaned after crashes without touching caches held by another process. Scheduling, metrics, assignments, and consensus remain in memory. YAML aliases have limits on expanded size and nesting before an object tree can grow excessively.
+
 An isolated seven-replica test on an Apple Silicon Mac measured approximately 41 MiB total RSS for Rust versus 295 MiB for the original Node/Go processes after one application deployment. This excludes Cloudflare connectors and production history; production measurements are still required.
+
+A read-only preflight loaded 18 real applications and 283 saved versions with zero D1 writes. Moving historical specifications out of the resident SQLite heap reduced that preflight from about 65 MiB to 24 MiB RSS. This measures configuration loading, not a fully active production controller. The Linux image smoke test measured approximately 6.4 MiB idle controller RSS and a 63 MB complete image; it includes Cloudflare's executable and agent downloads, with no compiler or Node runtime.
 
 ## Migration order
 
@@ -34,4 +38,4 @@ Replace controllers one at a time, preserving the existing seven-member configur
 
 The native installer builds and verifies the new agent image before cutover and restores both release pointers and the previous container on failure. It does not delete application containers or volumes. Existing cached JavaScript releases remain available for rollback; native agent updates retain two recent native releases and the running executable.
 
-The application test suites include deployed-controller specification and scheduling fixtures, API/authentication and live-log tests, D1 failure tests, and agent ownership and lifecycle checks. `control/test/ha-service.mjs` supports `RUST_CONTROL_BINARY` and optional `RUST_CONTROL_IDS` for full-native and mixed-version seven-member tests. `HA_MEMORY_RESULT` records the complete controller process trees for comparison.
+The application test suites include deployed-controller specification and scheduling fixtures, 439 metrics events across all five chart ranges, API/authentication and live-log tests, D1 failure tests, and agent ownership and lifecycle checks. `control/test/ha-service.mjs` supports `RUST_CONTROL_BINARY` and optional `RUST_CONTROL_IDS` for full-native and mixed-version seven-member tests. `HA_MEMORY_RESULT` records the complete controller process trees for comparison. The read-only `check-config` example accepts a configuration JSON object on stdin and reports counts and memory without exposing credentials.
