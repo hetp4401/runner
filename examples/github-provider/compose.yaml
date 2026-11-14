@@ -1,0 +1,17 @@
+x-runner:
+  replicas: 7
+  spread-tags: true
+  port: 8924
+  ready: /readyz
+services:
+  provider:
+    image: ${PROVIDER_IMAGE}
+    env_file: .env
+    ports: ["8924:8924"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]

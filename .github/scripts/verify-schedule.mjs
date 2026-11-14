@@ -8,8 +8,9 @@ export async function verifyScheduledOrigin(env, api) {
   if (!api && !env.GH_TOKEN) throw new Error("GH_TOKEN is required");
   api ||= githubClient(env.GH_TOKEN, env.GITHUB_API_URL);
   const run = await api(`/repos/${env.GITHUB_REPOSITORY}/actions/runs/${env.SCHEDULE_RUN}`);
-  if (run.event !== "schedule" || run.path !== ".github/workflows/watchdog.yml" || run.head_branch !== env.GITHUB_REF_NAME)
-    throw new Error("host requests must come from this branch's scheduled watchdog");
+  const provider = run.event === "workflow_dispatch" && /^Machine schedule \(refill [1-9]\d{12}\)$/.test(run.display_title || "");
+  if (!(run.event === "schedule" || provider) || run.path !== ".github/workflows/watchdog.yml" || run.head_branch !== env.GITHUB_REF_NAME)
+    throw new Error("host requests must come from this branch's scheduled watchdog or replicated provider");
   return true;
 }
 

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,6 +44,22 @@ type registry struct {
 	Generation string              `json:"generation"`
 	Slots      map[uint64]uint64   `json:"slots"`
 	Nodes      map[uint64]identity `json:"nodes"`
+	Claims     map[string]claim    `json:"claims,omitempty"`
+}
+
+// Optional monotonic work claims, replicated and snapshotted only in memory.
+// A claim commits before an external effect. Failed/ambiguous effects are not
+// retried under the same sequence, favoring at-most-once attempts over delivery.
+type claim struct {
+	Key      string `json:"key"`
+	Sequence uint64 `json:"sequence"`
+	Owner    uint64 `json:"owner"`
+	Term     uint64 `json:"term"`
+	Attempt  string `json:"attempt"`
+}
+type claimWait struct {
+	ctx   context.Context
+	reply chan controlReply
 }
 type manifest struct {
 	Generation string     `json:"generation"`
@@ -82,6 +99,7 @@ type controlRequest struct {
 	kind  string
 	data  []byte
 	reply chan controlReply
+	ctx   context.Context
 }
 type controlReply struct {
 	value any
@@ -115,6 +133,8 @@ type core struct {
 	transfer             chan uint64
 	delivered            chan delivery
 	pending              map[string]verification
+	claimPending         map[string]claimWait
+	allowClaims          bool
 	learnerSeen          map[uint64]time.Time
 	mu                   sync.RWMutex
 	status               view
@@ -159,7 +179,7 @@ func number(k string, fallback int) int {
 	return v
 }
 func emptyRegistry() registry {
-	return registry{Slots: map[uint64]uint64{}, Nodes: map[uint64]identity{}}
+	return registry{Slots: map[uint64]uint64{}, Nodes: map[uint64]identity{}, Claims: map[string]claim{}}
 }
 func cloneRegistry(s registry) registry {
 	out := emptyRegistry()
@@ -169,6 +189,9 @@ func cloneRegistry(s registry) registry {
 	}
 	for k, v := range s.Nodes {
 		out.Nodes[k] = v
+	}
+	for k, v := range s.Claims {
+		out.Claims[k] = v
 	}
 	return out
 }
@@ -349,11 +372,61 @@ func (c *core) promote() {
 		return
 	}
 }
+
+var claimKey = regexp.MustCompile(`^[a-zA-Z0-9_./:-]{1,200}$`)
+
+func (c *core) proposeClaim(request controlRequest) (any, error, bool) {
+	if !c.allowClaims {
+		return nil, errors.New("work claims are disabled"), false
+	}
+	v := c.snapshot()
+	if c.rn == nil || !v.IdentityValid || v.LeaderNode != c.self.Node || v.Role != "StateLeader" {
+		return nil, errors.New("not the current leader"), false
+	}
+	var data claim
+	if json.Unmarshal(request.data, &data) != nil || !claimKey.MatchString(data.Key) || data.Sequence < 1 || data.Sequence > 1<<52 || data.Term != v.Term {
+		return nil, errors.New("invalid claim or obsolete term"), false
+	}
+	if before, exists := c.state.Claims[data.Key]; exists && data.Sequence <= before.Sequence {
+		return map[string]any{"accepted": false, "claim": before}, nil, false
+	}
+	if len(c.claimPending) >= 128 || (c.state.Claims[data.Key].Sequence == 0 && len(c.state.Claims) >= 1024) {
+		return nil, errors.New("work claim limit reached"), false
+	}
+	data.Owner, data.Term, data.Attempt = c.self.Node, v.Term, randomID()
+	raw, _ := json.Marshal(data)
+	if err := c.rn.Propose(raw); err != nil {
+		return nil, err, false
+	}
+	c.claimPending[data.Attempt] = claimWait{request.ctx, request.reply}
+	return nil, nil, true
+}
+
 func (c *core) apply(entry pb.Entry) error {
 	switch entry.Type {
 	case pb.EntryNormal:
 		if len(entry.Data) > 0 {
-			return errors.New("application payloads are not allowed in leadership Raft")
+			if !c.allowClaims {
+				return errors.New("application payloads are not allowed in leadership Raft")
+			}
+			var data claim
+			if json.Unmarshal(entry.Data, &data) != nil || !claimKey.MatchString(data.Key) || data.Sequence < 1 || data.Sequence > 1<<52 || data.Owner == 0 || data.Term != entry.Term || len(data.Attempt) != 32 {
+				return errors.New("invalid committed work claim")
+			}
+			if c.state.Claims == nil {
+				c.state.Claims = map[string]claim{}
+			}
+			before := c.state.Claims[data.Key]
+			accepted := data.Sequence > before.Sequence && (before.Sequence > 0 || len(c.state.Claims) < 1024)
+			if accepted {
+				c.state.Claims[data.Key] = data
+			}
+			if pending, ok := c.claimPending[data.Attempt]; ok {
+				delete(c.claimPending, data.Attempt)
+				if pending.ctx.Err() == nil {
+					pending.reply <- controlReply{map[string]any{"accepted": accepted, "claim": c.state.Claims[data.Key]}, nil}
+				}
+			}
 		}
 	case pb.EntryConfChangeV2:
 		var cc pb.ConfChangeV2
@@ -410,7 +483,7 @@ func (c *core) ready() error {
 			if e := c.mem.ApplySnapshot(rd.Snapshot); e != nil {
 				return e
 			}
-			c.state = state
+			c.state = cloneRegistry(state)
 			c.conf = rd.Snapshot.Metadata.ConfState
 			c.applied = rd.Snapshot.Metadata.Index
 			if !known(c.conf, c.self.Node) {
@@ -637,14 +710,19 @@ func (c *core) run(ctx context.Context) error {
 		case request := <-c.commands:
 			var value any
 			var err error
+			deferred := false
 			switch request.kind {
 			case "bootstrap":
 				err = c.bootstrap(request.data)
 				value = map[string]bool{"ok": err == nil}
 			case "join":
 				value, err = c.join(request.data)
+			case "claim":
+				value, err, deferred = c.proposeClaim(request)
 			}
-			request.reply <- controlReply{value, err}
+			if !deferred {
+				request.reply <- controlReply{value, err}
+			}
 		case adopted := <-c.adopt:
 			if c.rn == nil {
 				if e := c.initialize(adopted.state, nil); e != nil {
@@ -659,6 +737,11 @@ func (c *core) run(ctx context.Context) error {
 			for id, p := range c.pending {
 				if p.ctx.Err() != nil {
 					delete(c.pending, id)
+				}
+			}
+			for id, p := range c.claimPending {
+				if p.ctx.Err() != nil {
+					delete(c.claimPending, id)
 				}
 			}
 		case m := <-c.incoming:
@@ -728,6 +811,10 @@ func (c *core) run(ctx context.Context) error {
 			// A proposal may be overwritten after losing leadership. The new
 			// leader's Raft log, rather than this local hint, serializes changes.
 			c.confPending = false
+			for id, p := range c.claimPending {
+				p.reply <- controlReply{nil, errors.New("leadership changed before claim confirmation")}
+				delete(c.claimPending, id)
+			}
 		}
 		c.publish()
 	}
@@ -749,7 +836,7 @@ func (c *core) handler(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/status":
 		jsonReply(w, current)
-	case "/bootstrap", "/join":
+	case "/bootstrap", "/join", "/claim":
 		if r.Method != "POST" {
 			http.Error(w, "POST required", 405)
 			return
@@ -759,10 +846,12 @@ func (c *core) handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid request", 400)
 			return
 		}
-		request := controlRequest{strings.TrimPrefix(r.URL.Path, "/"), raw, make(chan controlReply, 1)}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		request := controlRequest{strings.TrimPrefix(r.URL.Path, "/"), raw, make(chan controlReply, 1), ctx}
 		select {
 		case c.commands <- request:
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
 		}
 		select {
@@ -772,7 +861,8 @@ func (c *core) handler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				jsonReply(w, result.value)
 			}
-		case <-r.Context().Done():
+		case <-ctx.Done():
+			http.Error(w, "consensus confirmation unavailable", 503)
 		}
 	case "/pull":
 		node, _ := strconv.ParseUint(r.URL.Query().Get("node"), 10, 64)
@@ -879,6 +969,7 @@ func start() error {
 		return errors.New("cluster identity and secret are required")
 	}
 	c := &core{self: identity{randomNode(), id, randomID()}, members: members, peers: peers, secret: secret, cluster: cluster, state: emptyRegistry(),
+		allowClaims: os.Getenv("CP_RAFT_ALLOW_CLAIMS") == "1", claimPending: map[string]claimWait{},
 		incoming: make(chan pb.Message, 512), verify: make(chan verification, 128), commands: make(chan controlRequest, 16), adopt: make(chan adopted, 8), transfer: make(chan uint64, 4),
 		delivered: make(chan delivery, 1024), pending: map[string]verification{}, learnerSeen: map[uint64]time.Time{}, mail: map[uint64][]envelope{}, http: &http.Client{Timeout: 4 * time.Second}}
 	c.publish()
