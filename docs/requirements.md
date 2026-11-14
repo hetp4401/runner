@@ -10,11 +10,11 @@ The system has two modules: one control plane per fleet, and one agent on each D
 | Docker | Running Docker Engine and Compose v2. | Running Docker Engine with `/var/run/docker.sock` accessible. |
 | Host permissions | Permission to build/run the controller and manage its data volume. | Root for installation; Docker socket and host networking for the agent. |
 | Host tools | Git for cloning the source. | `curl`, `tar`, `sha256sum` and `flock`, plus a POSIX shell and standard shell tools. |
-| Runtime | Node.js 24 and npm dependencies are included in the image. | Node and Docker Compose are included in the installed image; the agent uses Node built-ins. |
+| Runtime | Native Rust controller and bundled Cloudflare connector; no Node or Go runtime. | Native Rust agent and Docker CLI/Compose. |
 | Credentials | Cloudflare management credential and private fleet identity. | Controller URL, join token and required server tag. |
 | Persistent storage | `control-data` volume and private `.env`. | Absolute host directory, default `/var/lib/runner`, plus workload volumes/images. |
 
-For direct source execution and tests, use Node.js 24. The controller uses `node:sqlite`; Node 14 and 20 cannot run it. Run `npm ci --omit=dev` in `control/` for controller runtime dependencies. A directly executed agent also needs Docker Compose v2 on its Linux host.
+Rust source builds and tests require Rust 1.100 or newer. The release image and agent installer need no compiler on the host. The retained legacy implementation, offline D1 migration tool and differential reference tests use Node.js 24. A directly executed agent also needs Docker Compose v2 on its Linux host.
 
 The provided Mac supervisor requires Python 3, Colima and Docker CLI/Compose.
 Its Apple Silicon profile uses Apple's virtualization framework, 2 CPUs, 2 GiB

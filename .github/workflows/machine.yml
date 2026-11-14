@@ -56,7 +56,7 @@ jobs:
               -d "{\"agent\": \"$(cat "$RUNNER_DATA/agent-id")\"}" "$CONTROL_URL/api/drain" ) &
           # Stop before GitHub kills the job at 6 hours; the deadline and backstop drain announce departure.
           # exec: the agent is the step's own process, so a cancelled run's signal reaches it too (timeout passes it on and keeps its exit status).
-          exec timeout -k 2m --preserve-status 355m node agent/agent.mjs
+          exec timeout -k 2m --preserve-status 355m sh rust/run-agent.sh
 
       # The agent's own containers only: what the apps log is theirs, and these run logs are public.
       - name: Router and tunnel logs

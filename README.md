@@ -1,5 +1,7 @@
 # Runner: control plane and agent
 
+The default controller and Linux agent run as native Rust binaries. The controller includes consensus in its own process, replacing its Node process and separate Go Raft helper. Cloudflare's connector remains a separate upstream executable. See the [Rust runtime guide](rust/README.md) for source builds, measured memory use and the agent-first migration order. The root Dockerfile selects a tested, immutable multi-architecture release; the previous implementation remains available through `control/legacy.Dockerfile` for compatibility tests and offline migration tools.
+
 A self-hosted control plane schedules Docker apps across Linux machines. Each app requests a replica count and can constrain placement to regions. Cloudflare Tunnel publishes replicas through your domain. The control plane runs in Docker and stores app specs, source versions, secrets and operator settings in local SQLite or optional Cloudflare D1. Runtime state and tunnel credentials stay in memory. Agents retain signed recovery receipts.
 
 Run one agent on each Linux Docker host. A standalone host keeps its slot across restarts. Every agent has a required `SERVER_TAG` naming its origin group, or `standalone`. Tags are metadata: the CP accepts supplied servers and has no desired server counts. An explicit `START_CMD` can start that agent's own replacement during a requested handover. Agents report their region, label and any known deadline (`LIFETIME_MIN`). A host about to shut down can send `POST /api/drain` for an orderly handover. See [How it works](#how-it-works) for the entities and their responsibilities.
@@ -54,7 +56,7 @@ Join each Linux Docker machine using the generated join token:
 curl -fsSL https://runners.example.com/install.sh | sudo JOIN_TOKEN='your-token' SERVER_TAG=standalone sh
 ```
 
-Installation downloads and verifies the CP's bundled agent release, then builds a local image containing the agent, Node and Docker Compose. Normal agent restarts use that local image or a verified cached release and need no code download. Agents need no Cloudflare management credential. The CP container does not need the Docker socket. See [the complete self-hosting guide](docs/self-hosting.md) for permissions, deployment access, persistence and upgrades.
+Installation downloads and verifies the CP's bundled agent release, then builds a local image containing the Rust binary and Docker CLI/Compose. Normal agent restarts use that local image or a verified cached release and need no code download. Agents need no Cloudflare management credential. The CP container does not need the Docker socket. See [the complete self-hosting guide](docs/self-hosting.md) for permissions, deployment access, persistence and upgrades.
 
 ## Projects
 

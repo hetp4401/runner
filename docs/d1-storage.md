@@ -11,12 +11,12 @@ schema version, controller origin, readiness and commit revision. Cloudflare
 credentials, the admin/join/signing secrets and fleet namespace stay in the
 private environment and `identity.json`.
 
-At startup the CP loads D1 into an in-memory SQLite working database and verifies
-referenced versions. Runtime tables, heartbeats, placements, health, metrics,
+At startup the Rust CP loads D1 into a private, disposable SQLite configuration cache and verifies
+referenced versions. The cache has a 1 MiB page budget and is rebuilt from D1 on every startup; it is never a recovery source. Runtime tables, heartbeats, placements, health, metrics,
 events, discovered tunnels and cooldowns stay in RAM. Normal fleet traffic and
 unchanged settings make no D1 requests. Changed configuration rows commit as one
-D1 transaction before the API acknowledges the edit. A worker thread handles
-HTTPS while the scheduler waits; configuration edits can briefly pause request
+D1 transaction before the API acknowledges the edit. Asynchronous HTTPS runs
+while the scheduler waits; configuration edits can briefly pause request
 processing. Network requests have a 30-second timeout.
 
 A revision guard prevents a stale controller from overwriting newer config.
@@ -60,7 +60,10 @@ and sends rows directly to D1 without creating export files.
    contents for every configuration table, then marks D1 ready:
 
    ```sh
-   docker compose run --rm --no-deps --entrypoint flock control \
+   # The offline migration tool is retained in the legacy image. It never runs
+   # beside the live Rust scheduler.
+   docker compose -f compose.yaml -f control/legacy.compose.yaml build control
+   docker compose -f compose.yaml -f control/legacy.compose.yaml run --rm --no-deps --entrypoint flock control \
      --exclusive --nonblock /data/controller.lock \
      node d1-migrate.mjs /data/control.db
    ```

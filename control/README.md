@@ -4,18 +4,18 @@ The control plane accepts app definitions, schedules their replicas across conne
 
 Every public app automatically gets a global hostname and a hostname for each replica. The dashboard uses the global URL as the main link and retains numbered replica links. See [public addresses](../docs/public-addresses.md) for failover and upgrades.
 
-The controller runs independently of the agent hosts. It includes a matching agent release. New hosts install from its `/install.sh` endpoint. Build from the repository root: the image needs `control/` and `agent/`.
+The controller runs independently of the agent hosts. Its Rust binary embeds the scheduler, HTTP server and consensus member. It includes matching native agent downloads; new hosts install from `/install.sh`. The root Dockerfile selects a tested release by immutable image digest. See the [Rust guide](../rust/README.md) for source builds and migration.
 
 ## Requirements
 
 - Docker Engine with Docker Compose v2 and persistent storage on the controller host.
 - An active Cloudflare DNS zone and a credential permitted to manage that zone's DNS and the account's tunnels.
 - Outbound HTTPS and Cloudflare Tunnel connectivity.
-- Node.js 24 and npm only when running directly or developing outside Docker. The image includes its runtime and dependencies.
+- Rust 1.100 or newer only for source development. The final image contains native executables and certificates, with no compiler or Node runtime.
 
 For a controller on a Mac, use the [Docker operations guide](../docs/mac-control.md)
 for Colima, launchd startup and migration. The [native alternative](../docs/native-control.md)
-uses Node.js 24, Python 3 and `cloudflared` directly. Both run the same controller.
+describes the legacy Node.js installation. New deployments use the Rust container.
 
 See [requirements](../docs/requirements.md) for exact credential scopes, ports and host tools. The controller container runs as UID 1000 and does not mount the Docker socket.
 
@@ -103,6 +103,8 @@ Adjust the local URL if you changed `CONTROL_PORT`. `/healthz` confirms HTTP liv
 Keep the data volume and private `.env` across upgrades. Configuration changes commit immediately to the selected store. Agents continue serving their approved workloads while the controller is stopped, but new deployments and scheduling wait for it. Do not run `init` for an upgrade or use `docker compose down -v` when retaining fleet state. See [VPS operations](../docs/vps-control.md) for service and migration procedures.
 
 ## Source and development
+
+The current implementation is in [`rust/runner-control`](../rust/runner-control) and [`rust/runner-raft`](../rust/runner-raft). The files and Node commands below describe the retained compatibility implementation and differential test reference. Offline D1 migration still uses that operator tool, as described in the [D1 guide](../docs/d1-storage.md).
 
 | File | Responsibility |
 | --- | --- |
