@@ -219,8 +219,21 @@ impl D1 {
     }
 }
 type Fingerprints = BTreeMap<String, (String, Vec<Value>)>;
+struct ConfigCache {
+    file: tempfile::NamedTempFile,
+    _lock: std::fs::File,
+    lock_path: std::path::PathBuf,
+}
+impl Drop for ConfigCache {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
 pub struct Store {
     db: Connection,
+    // Dropped after SQLite closes. Historical D1 configuration can spill to a
+    // private disposable cache; TEMP runtime tables always remain in memory.
+    config_cache: Option<ConfigCache>,
     pub d1: Option<D1>,
     known: BTreeMap<String, Fingerprints>,
     dirty: BTreeSet<String>,
@@ -234,7 +247,9 @@ impl Store {
     }
     pub fn diagnostics(&self) -> Value {
         match &self.d1 {
-            Some(d1) => json!({"backend":"d1","failed":self.failed,"usage":d1.usage}),
+            Some(d1) => {
+                json!({"backend":"d1","failed":self.failed,"usage":d1.usage,"configurationCache":"private disposable file","cacheBytes":self.config_cache.as_ref().and_then(|f| f.file.as_file().metadata().ok()).map(|m| m.len())})
+            }
             None => json!({"backend":"sqlite","failed":self.failed}),
         }
     }
@@ -253,6 +268,7 @@ impl Store {
         }
         let mut store = Self {
             db,
+            config_cache: None,
             d1: None,
             known: BTreeMap::new(),
             dirty: BTreeSet::new(),
@@ -265,7 +281,7 @@ impl Store {
     }
     pub async fn open(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
         if env.get("CONFIG_STORAGE").is_some_and(|s| s == "d1") {
-            let mut store = Self::memory()?;
+            let mut store = Self::d1_cache(env)?;
             let mut d1 = D1::new(env)?;
             let meta = d1.metadata().await?;
             ensure!(
@@ -359,6 +375,89 @@ impl Store {
             store.validate()?;
             Ok(store)
         }
+    }
+    fn d1_cache(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        };
+        let directory = if let Some(data) = env.get("DATA_DIR") {
+            std::path::PathBuf::from(data).join(".native-config-cache")
+        } else {
+            std::env::temp_dir()
+                .canonicalize()?
+                .join(format!("runner-config-{}", unsafe { libc::geteuid() }))
+        };
+        runner_core::fs::private_directory(&directory)?;
+        ensure!(
+            std::fs::metadata(&directory)?.uid() == unsafe { libc::geteuid() },
+            "configuration cache belongs to another user"
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        // Abrupt exits can leave an old cache behind. Only our private regular
+        // files, older than a minute and not locked by a running process, qualify.
+        for entry in std::fs::read_dir(&directory)?.filter_map(Result::ok) {
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .is_some_and(|n| n.starts_with("runner-config-") && n.ends_with(".sqlite"))
+            {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            let lock_path = entry.path().with_extension("lock");
+            let Ok(lock) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&lock_path)
+            else {
+                continue;
+            };
+            if metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata
+                    .modified()?
+                    .elapsed()
+                    .is_ok_and(|age| age.as_secs() >= 60)
+                && unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0
+            {
+                let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_file(lock_path);
+            }
+        }
+        let file = tempfile::Builder::new()
+            .prefix("runner-config-")
+            .suffix(".sqlite")
+            .tempfile_in(directory)?;
+        // Use a separate lock: BSD flock on the database itself conflicts with
+        // SQLite's own transaction locks.
+        let lock_path = file.path().with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)?;
+        let cache = ConfigCache {
+            file,
+            _lock: lock,
+            lock_path,
+        };
+        ensure!(
+            unsafe { libc::flock(cache._lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "cannot lock configuration cache"
+        );
+        let db = Connection::open(cache.file.path())?;
+        // D1 is authoritative. This file is always rebuilt from D1, never used
+        // for crash recovery; in-memory journals retain transaction rollback.
+        db.execute_batch("PRAGMA journal_mode=MEMORY; PRAGMA synchronous=OFF;")?;
+        let mut store = Self::connection(db, true)?;
+        store.config_cache = Some(cache);
+        Ok(store)
     }
     fn runtime_schema(&mut self) -> anyhow::Result<()> {
         // The durable settings table remains in main; transient values shadow it.

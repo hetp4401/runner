@@ -119,7 +119,7 @@ pub fn equivalent_plan(before: &Value, next: &Value) -> bool {
         if text.len() > 1_000_000 {
             return None;
         }
-        let mut parsed: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+        let mut parsed = runner_core::yaml::parse(text).ok()?;
         parsed.apply_merge().ok()?;
         Some(parsed)
     };

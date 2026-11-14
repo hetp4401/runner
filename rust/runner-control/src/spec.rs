@@ -74,7 +74,7 @@ fn inside(path: &Value) -> bool {
     })
 }
 pub fn parse(compose: &str) -> anyhow::Result<Value> {
-    let mut doc: serde_yaml::Value = serde_yaml::from_str(compose).map_err(|e| {
+    let mut doc = runner_core::yaml::parse(compose).map_err(|e| {
         http(
             400,
             format!(

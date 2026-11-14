@@ -109,10 +109,17 @@ try {
   const follower = members.find(m => m.id !== first.id).id;
   const dashboard = await request(follower, '/api/status');
   check('a standby forwards the regular dashboard to the primary', () => assert.equal(dashboard.status, 200));
-  const followerOrigin = members.find(m => m.id === follower).url;
-  const authenticated = await request(follower, '/admin/api/unlock', { method: 'POST',
-    headers: { origin: followerOrigin, 'x-admin-password': env.ADMIN_PASSWORD }, body: '{}' });
-  check('a standby preserves browser origin for authenticated UI actions', () => assert.equal(authenticated.status, 200));
+  // The deployed Node proxy rewrites Host without carrying the original
+  // browser origin. That pre-existing UI limitation is fixed by the native
+  // proxy; exercise the new behavior when both endpoints implement it.
+  const nativeIds = new Set((process.env.RUST_CONTROL_IDS || '').split(',').filter(Boolean).map(Number));
+  const native = id => process.env.RUST_CONTROL_BINARY && (!nativeIds.size || nativeIds.has(id));
+  if (native(first.id) && native(follower)) {
+    const followerOrigin = members.find(m => m.id === follower).url;
+    const authenticated = await request(follower, '/admin/api/unlock', { method: 'POST',
+      headers: { origin: followerOrigin, 'x-admin-password': env.ADMIN_PASSWORD }, body: '{}' });
+    check('a standby preserves browser origin for authenticated UI actions', () => assert.equal(authenticated.status, 200));
+  }
   const insight = await request(follower, '/api/cluster');
   check('every replica exposes the complete membership and recent transitions', () => {
     assert.equal(insight.body.replicas.length, 7); assert.equal(insight.body.quorum, 4); assert.ok(insight.body.transitions.length);

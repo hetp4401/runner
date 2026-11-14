@@ -150,6 +150,15 @@ try:
     assert json.loads(docker('inspect', owner + '-tunnel'))[0]['State']['Running']
     checks.append('removing a workload keeps infrastructure running')
     print(json.dumps({'checks': checks, 'agentRssBytes': rss, 'containerMemory': stats['MemUsage']}))
+except BaseException:
+    # Only containers created by this isolated fixture are inspected or logged.
+    for name in [agent_name, owner + '-router', owner + '-tunnel']:
+        try:
+            print(name, docker('inspect', '--format', '{{json .State}}', name), flush=True)
+            print(docker('logs', '--tail', '35', name), flush=True)
+        except subprocess.CalledProcessError:
+            pass
+    raise
 finally:
     subprocess.run(['docker', 'rm', '-f', agent_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     ids = owned_ids()
@@ -161,4 +170,7 @@ finally:
     server.shutdown()
     server.server_close()
     subprocess.run(['docker', 'image', 'rm', image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # The real agent creates private root-owned deployment folders. Restore
+    # ownership only inside this fixture's uniquely allocated directory.
+    subprocess.run(['sudo', 'chown', '-R', '--no-dereference', f'{os.getuid()}:{os.getgid()}', temporary.name], check=True)
     temporary.cleanup()

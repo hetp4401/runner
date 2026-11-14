@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod bounded;
 pub mod fs;
+pub mod yaml;
 
 pub fn json_size(value: &impl serde::Serialize) -> anyhow::Result<usize> {
     struct Counter(usize);

@@ -1,16 +1,23 @@
 name: Rust runtime
 on:
   workflow_dispatch:
+    inputs:
+      binary_run_id:
+        description: Optional existing binary-build run for packaging tests only; no image is published
+        required: false
+        type: string
   push:
     branches: [codex/rust-low-memory]
     paths: ['rust/**', 'control/src/app.html', '.github/workflows/rust.yml']
 permissions:
   contents: read
+  actions: read
 concurrency:
-  group: rust-${{ github.ref }}
+  group: rust-${{ github.ref }}-${{ inputs.binary_run_id || 'build' }}
   cancel-in-progress: true
 jobs:
   build:
+    if: ${{ !inputs.binary_run_id }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,10 +42,12 @@ jobs:
           compression-level: 0
   package:
     needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || inputs.binary_run_id) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
+      actions: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -48,6 +57,8 @@ jobs:
         with:
           pattern: rust-binaries-*
           path: rust/dist/downloads
+          run-id: ${{ inputs.binary_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Package native and compatible legacy downloads
         run: |
           mkdir -p rust/dist/binaries rust/dist/rootfs/data rust/dist/rootfs/run/runner rust/dist/rootfs/etc
@@ -65,6 +76,7 @@ jobs:
           python3 rust/tests/docker-agent.py
           python3 rust/tests/installer-rollback.py
       - name: Publish versioned multi-architecture controller
+        if: ${{ !inputs.binary_run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
