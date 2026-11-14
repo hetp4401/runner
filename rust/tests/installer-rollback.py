@@ -56,7 +56,8 @@ try:
     for pointer in ['current.json', 'rust-current.json']:
         (data / 'agent-code' / pointer).write_text(json.dumps({'revision': pointer}))
     old = docker('run', '-d', '--name', 'runner-agent', '--label', 'io.runners.test=' + prefix,
-                 '-e', 'CONTROL_URL=' + origin, 'busybox:1.37', 'sleep', '3600')
+                 '-e', 'CONTROL_URL=' + origin, 'busybox:1.37', 'sh', '-c',
+                 'trap "exit 0" TERM INT; while :; do sleep 1 & wait $!; done')
     script = Path(temporary.name) / 'install.sh'
     script.write_text((root / 'rust/install-agent.sh').read_text().replace('@ORIGIN@', shlex.quote(origin)).replace('@AGENT_URL@', shlex.quote(origin + '/agent')))
     for phase in ['checksum', 'startup']:
@@ -70,7 +71,7 @@ try:
         if phase == 'startup':
             assert 'previous agent was restored' in result.stderr
         bad_digest = False
-    print(json.dumps({'checks': ['bad checksum never stops the old agent', 'failed replacement restores the previous container and both release pointers']}))
+    print(json.dumps({'checks': ['bad checksum never stops the old agent', 'crash-looping replacement restores the previous container and both release pointers']}))
 finally:
     ids = docker('ps', '-aq', '--filter', 'label=io.runners.test=' + prefix).split()
     if ids:

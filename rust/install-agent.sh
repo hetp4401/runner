@@ -101,8 +101,12 @@ docker run -d --name runner-agent --restart unless-stopped --stop-timeout 180 --
   -e RUNNER_INSTALL_REVISION="$PACKAGE" -e RUNNER_CODE_MANAGED=1 \
   -e SERVER_TAG -e MACHINE -e ROUTER_PORT -e REGION \
   -e LABEL="${LABEL:-$(hostname)}" "$IMAGE"
-sleep 2
-[ "$(docker inspect --format '{{.State.Running}}' runner-agent)" = true ] || exit 1
+# A crash loop can briefly report Running=true between automatic restarts.
+# Retain the previous container until the new process remains up with no restart.
+for check in 1 2 3 4 5; do
+  sleep 1
+  [ "$(docker inspect --format '{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}' runner-agent)" = 'true false 0' ] || exit 1
+done
 SUCCESS=1
 if [ -n "$OLD_ID" ]; then docker rm "$OLD_ID" >/dev/null; fi
 echo "Installed the Rust agent. Follow it with: docker logs -f runner-agent"
